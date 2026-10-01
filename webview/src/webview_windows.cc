@@ -792,7 +792,7 @@ WebView2Backend::WebView2Backend() {
 
   // backend-common's I/O thread (file dialogs, drag-out, clipboard change
   // events; its own STA thread, see laufey_io.h).
-  laufey_common::WinIoInit();
+  // CI experiment B: no WinIoInit in the constructor.
 
   // 256 random bits from two v4 GUIDs (CoCreateGuid draws them from the
   // system RNG).

@@ -116,6 +116,7 @@ void WinIoInit() {
 }
 
 bool WinRunOnIoThread(std::function<void()> task) {
+  WinIoInit();
   if (!g_io_hwnd)
     return false;
   if (GetCurrentThreadId() == g_io_thread) {
@@ -630,6 +631,7 @@ uint32_t ShowFileDialogWin(ParentResolver parent,
                            const laufey_file_dialog_options_t* options,
                            laufey_file_dialog_result_fn callback,
                            void* user_data) {
+  WinIoInit();
   if (!g_io_hwnd) {
     if (callback)
       callback(user_data, 0, LAUFEY_FILE_DIALOG_FAILED, nullptr, 0);
