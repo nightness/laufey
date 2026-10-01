@@ -24,6 +24,9 @@ jobs:
           - { os: macos-14, backend: cef, rep: 2 }
           - { os: macos-14, backend: cef, rep: 3 }
           - { os: macos-14, backend: cef, rep: 4 }
+          - { os: macos-14, backend: cef, rep: 5 }
+          - { os: macos-14, backend: webview, rep: 1 }
+          - { os: macos-14, backend: webview, rep: 2 }
           - { os: windows-latest, backend: webview, rep: 1 }
           - { os: windows-latest, backend: webview, rep: 2 }
           - { os: windows-latest, backend: webview, rep: 3 }
