@@ -28,6 +28,22 @@
 // WebView2 headers
 #include "WebView2.h"
 #include "WebView2EnvironmentOptions.h"
+#include <chrono>
+#include <cstdio>
+// CI EXPERIMENT: UI-thread timeline.
+static double UiTraceMs() {
+  static const auto t0 = std::chrono::steady_clock::now();
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+#define UITRACE(...)                                  \
+  do {                                                \
+    fprintf(stderr, "[uitrace] %8.1f ", UiTraceMs()); \
+    fprintf(stderr, __VA_ARGS__);                     \
+    fprintf(stderr, "\n");                            \
+    fflush(stderr);                                   \
+  } while (0)
 
 #include <shlwapi.h>
 
@@ -754,7 +770,11 @@ LRESULT CALLBACK WebView2Backend::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_UI_TASK: {
       UiTaskData* taskData = reinterpret_cast<UiTaskData*>(lParam);
       if (taskData) {
+        double t = UiTraceMs();
         taskData->task(taskData->data);
+        double d = UiTraceMs() - t;
+        if (d > 30)
+          UITRACE("ui task took %.1f ms", d);
         delete taskData;
       }
       return 0;
@@ -896,9 +916,11 @@ void WebView2Backend::CreateWindowEx(uint32_t window_id, int width, int height,
     ex_style |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
   }
 
+  UITRACE("create window %u begin", window_id);
   HWND hwnd = CreateWindowExW(
       ex_style, L"LaufeyWebView2", L"", style, CW_USEDEFAULT, CW_USEDEFAULT,
       width, height, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+  UITRACE("create window %u hwnd done", window_id);
 
   {
     std::lock_guard<std::recursive_mutex> lock(g_hwnd_mutex);
@@ -927,6 +949,7 @@ void WebView2Backend::CreateWindowEx(uint32_t window_id, int width, int height,
                          : SW_SHOW);
     UpdateWindow(hwnd);
   }
+  UITRACE("create window %u end", window_id);
 }
 
 void WebView2Backend::RegisterSchemeHandler(const std::string& scheme) {
@@ -1006,6 +1029,7 @@ void WebView2Backend::CreateEnvironmentForWindow(
   static const std::wstring user_data_folder =
       laufey_common::Utf8ToWide(laufey_common::AppDataSubdir("WebView2"));
 
+  UITRACE("env create %u call", window_id);
   HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
       nullptr, user_data_folder.empty() ? nullptr : user_data_folder.c_str(),
       options.Get(),
@@ -1031,7 +1055,9 @@ void WebView2Backend::CreateEnvironmentForWindow(
                         << std::hex << result << std::dec << ")" << std::endl;
               return result;
             }
+            UITRACE("env ready %u", window_id);
             OnEnvironmentReady(window_id, hwnd, env, schemes);
+            UITRACE("controller requested %u", window_id);
             return S_OK;
           })
           .Get());
@@ -1054,6 +1080,7 @@ void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
               std::cerr << "Failed to create WebView2 controller" << std::endl;
               return result;
             }
+            UITRACE("controller ready %u", window_id);
 
             std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
             auto* state = GetWindow(window_id);
@@ -1412,6 +1439,7 @@ void WebView2Backend::Quit() {
 // WindowProc re-entry safe.
 void WebView2Backend::SetWindowSize(uint32_t window_id, int width, int height) {
   if (GetCurrentThreadId() != ui_thread_id_) {
+    UITRACE("set size %u posted", window_id);
     RunOnUiThread([this, window_id, width, height] {
       SetWindowSize(window_id, width, height);
     });
@@ -1422,8 +1450,10 @@ void WebView2Backend::SetWindowSize(uint32_t window_id, int width, int height) {
   if (state) {
     // SetWindowPos ignores WM_GETMINMAXINFO; clamp to the constraints here.
     laufey_common::ClampSizeForWindow(window_id, &width, &height);
+    UITRACE("set size %u %dx%d", window_id, width, height);
     SetWindowPos(state->hwnd, nullptr, 0, 0, width, height,
                  SWP_NOMOVE | SWP_NOZORDER);
+    UITRACE("set size %u done", window_id);
   }
 }
 
@@ -2053,7 +2083,12 @@ void WebView2Backend::Run() {
   MSG msg;
   while (GetMessage(&msg, nullptr, 0, 0)) {
     TranslateMessage(&msg);
+    double dt0 = UiTraceMs();
     DispatchMessage(&msg);
+    double dd = UiTraceMs() - dt0;
+    if (dd > 100)
+      UITRACE("dispatch msg 0x%x hwnd %p took %.1f ms", msg.message,
+              (void*)msg.hwnd, dd);
   }
 }
 
