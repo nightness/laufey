@@ -1104,8 +1104,7 @@ void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
                 "  });\n"
                 "})();\n";
             std::wstring wDropScript(dropScript.begin(), dropScript.end());
-            state->webview->AddScriptToExecuteOnDocumentCreated(
-                wDropScript.c_str(), nullptr);
+            (void)wDropScript;  // CI experiment A: observer not injected
 
             uint32_t wid = window_id;
             state->webview->add_WebMessageReceived(
