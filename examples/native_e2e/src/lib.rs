@@ -30,6 +30,7 @@
 mod auth_thread_checks;
 mod body_echo;
 mod io_checks;
+mod lna_checks;
 mod menu_notification_checks;
 mod os_view;
 mod stream_checks;
@@ -298,6 +299,11 @@ fn arg_int(args: &[Value], i: usize) -> i32 {
 /// fetch to the echo server, then reports through the `schemeReport` binding.
 /// Every step is wrapped so one failure still lets the others report.
 fn scheme_page_html(echo_url: &str) -> String {
+  let ws_probe = if echo_url.is_empty() {
+    String::new()
+  } else {
+    lna_checks::ws_probe_js("websocket", &lna_checks::ws_url(echo_url))
+  };
   format!(
     r#"<!doctype html><html><head><meta charset="utf-8"><title>scheme</title></head><body>
 <script>
@@ -359,6 +365,9 @@ async function report(problem) {{
       const res = await fetch(echoUrl, {{ mode: 'cors' }});
       r.echoBody = await res.text();
     }} catch (e) {{ r.echoBody = 'error: ' + (e && e.message); }}
+    // A WebSocket to the same loopback server (lna_checks.rs), reported
+    // through schemeProbe("websocket", ...).
+    {ws_probe}
   }} else {{
     r.echoBody = 'skipped';
   }}
@@ -381,6 +390,17 @@ const APP_PAGE_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8">
     await new Promise(r => setTimeout(r, 50));
   }
 })();
+</script></body></html>"#;
+
+/// The page served at `laufey-e2e://app/ticker`: a page timer that reports
+/// to the runtime through the `menuTick` binding every 100 ms.
+const TICKER_PAGE_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>ticker</title></head><body>
+<script>
+setInterval(() => {
+  if (typeof Laufey !== 'undefined' && typeof Laufey.menuTick === 'function') {
+    Laufey.menuTick().catch(() => {});
+  }
+}, 100);
 </script></body></html>"#;
 
 fn respond(req: SchemeRequest, status: i32, content_type: &str, body: &[u8]) {
@@ -434,6 +454,15 @@ fn serve_scheme_request(
         req.exchange.finish();
       });
     }
+    // A page whose timer calls the runtime every 100 ms (see
+    // menu_notification_checks.rs: it must keep ticking while a context
+    // menu is open).
+    "laufey-e2e://app/ticker" => respond(
+      req,
+      200,
+      "text/html; charset=utf-8",
+      TICKER_PAGE_HTML.as_bytes(),
+    ),
     "app://e2e/" | "app://e2e" => respond(
       req,
       200,
@@ -477,47 +506,59 @@ fn fetch_probe_js(label: &str, url: &str) -> String {
 /// A minimal loopback HTTP server that echoes the request's `Origin` header
 /// (`origin=<value>` or `origin=none`) with `Access-Control-Allow-Origin: *`,
 /// so a cross-origin fetch from the custom-scheme page proves which origin
-/// the engine sends. Returns the URL to fetch, or `None` if no socket could
-/// be bound (the check is then N/A).
+/// the engine sends, and answers `GET /ws` as a WebSocket (lna_checks.rs).
+/// Returns the URL to fetch, or `None` if no socket could be bound (the
+/// check is then N/A).
 fn start_origin_echo_server() -> Option<String> {
   let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
   let port = listener.local_addr().ok()?.port();
   std::thread::spawn(move || {
     for stream in listener.incoming() {
-      let Ok(mut stream) = stream else { continue };
-      let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-      let mut buf = Vec::new();
-      let mut chunk = [0u8; 4096];
-      // Read headers only (GET, no body).
-      while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-        match stream.read(&mut chunk) {
-          Ok(0) | Err(_) => break,
-          Ok(n) => buf.extend_from_slice(&chunk[..n]),
-        }
-      }
-      let text = String::from_utf8_lossy(&buf);
-      let origin = text
-        .lines()
-        .find_map(|l| {
-          let (name, value) = l.split_once(':')?;
-          name
-            .trim()
-            .eq_ignore_ascii_case("origin")
-            .then(|| value.trim().to_string())
-        })
-        .unwrap_or_else(|| "none".to_string());
-      let body = format!("origin={origin}");
-      let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
-         access-control-allow-origin: *\r\ncontent-length: {}\r\n\
-         connection: close\r\n\r\n{}",
-        body.len(),
-        body
-      );
-      let _ = stream.write_all(response.as_bytes());
+      let Ok(stream) = stream else { continue };
+      // A thread per connection: an idle connection Chromium opened ahead
+      // of time must not hold up the next request.
+      std::thread::spawn(move || serve_echo_connection(stream));
     }
   });
   Some(format!("http://127.0.0.1:{port}/echo"))
+}
+
+fn serve_echo_connection(mut stream: std::net::TcpStream) {
+  let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+  let mut buf = Vec::new();
+  let mut chunk = [0u8; 4096];
+  // Read headers only (GET, no body).
+  while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+    match stream.read(&mut chunk) {
+      Ok(0) | Err(_) => break,
+      Ok(n) => buf.extend_from_slice(&chunk[..n]),
+    }
+  }
+  let text = String::from_utf8_lossy(&buf).into_owned();
+  // GET /ws: a WebSocket (lna_checks.rs).
+  if text.starts_with("GET /ws ") {
+    lna_checks::serve_ws(stream, &text);
+    return;
+  }
+  let origin = text
+    .lines()
+    .find_map(|l| {
+      let (name, value) = l.split_once(':')?;
+      name
+        .trim()
+        .eq_ignore_ascii_case("origin")
+        .then(|| value.trim().to_string())
+    })
+    .unwrap_or_else(|| "none".to_string());
+  let body = format!("origin={origin}");
+  let response = format!(
+    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+     access-control-allow-origin: *\r\ncontent-length: {}\r\n\
+     connection: close\r\n\r\n{}",
+    body.len(),
+    body
+  );
+  let _ = stream.write_all(response.as_bytes());
 }
 
 /// Request-body round trip over `app://` (see body_echo.rs). Opens its own
@@ -670,6 +711,7 @@ fn e2e_main() {
     // (both end the process, so they can't share the main battery's run).
     if std::env::var("LAUFEY_E2E_ONLY").as_deref() == Ok("lifetime") {
       lifetime_checks().await;
+      return;
     }
     // LAUFEY_E2E_ONLY=io: drag and drop, file dialogs and the rich clipboard
     // (API 39); runs on every backend, webview/linux included.
@@ -711,6 +753,12 @@ fn e2e_main() {
     // real window manager, where the rest of the battery assumes none).
     if std::env::var("LAUFEY_E2E_ONLY").as_deref() == Ok("window-api") {
       window_api_checks().await;
+      finish();
+    }
+    // LAUFEY_E2E_ONLY=lna: only the Local Network Access checks
+    // (lna_checks.rs), on their own page.
+    if std::env::var("LAUFEY_E2E_ONLY").as_deref() == Ok("lna") {
+      lna_checks::run(echo_url.as_deref()).await;
       finish();
     }
     let scheme_report: Arc<Mutex<Option<SchemeReport>>> =
@@ -1562,6 +1610,28 @@ fn e2e_main() {
       }
     }
 
+    // ---- Local Network Access (lna_checks.rs) -----------------------------
+    if scheme_supported {
+      let got = {
+        wait_for(
+          || scheme_probes.lock().unwrap().contains_key("websocket"),
+          100,
+          100,
+        )
+        .await;
+        scheme_probes
+          .lock()
+          .unwrap()
+          .get("websocket")
+          .cloned()
+          .unwrap_or_default()
+      };
+      lna_checks::check_app_origin_websocket(echo_url.as_deref(), &got);
+    } else {
+      na("a WebSocket to loopback (backend has no web engine)");
+    }
+    lna_checks::other_origin_blocked(echo_url.as_deref()).await;
+
     // ---- request body over the custom scheme -----------------------------
     let body_win = body_round_trip(&body_received).await;
     let stream_win = stream_checks::run(&stream_state).await;
@@ -1766,6 +1836,9 @@ fn e2e_main() {
     let _ = (&win, &body_win, &stream_win);
     finish();
   });
+  // Only the lifetime checks get here: the runtime ends like a real one,
+  // without waiting for tasks that never finish (the event pump).
+  rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
 // ---- Window state, constraints, screens, chrome (API >= 38) ---------------
@@ -2300,8 +2373,15 @@ async fn hidpi_checks(w: &Window, title: &str, scale: f64) {
     // does the page catch up, and does another resize reach it?
     for ms in [1000u64, 3000, 6000] {
       tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+      // Whether Chromium sees the page as hidden (an occluded window's
+      // renderer makes no frames, and a resize waits for the last one's
+      // acknowledgement), and its scale.
+      let hidden =
+        page_number(w, "document.visibilityState === 'hidden' ? 1 : 0").await;
+      let dpr = page_number(w, "window.devicePixelRatio").await;
       eprintln!(
-        "[e2e]   HiDPI diag: +{ms} ms page {:?} get_size {:?} visible {}",
+        "[e2e]   HiDPI diag: +{ms} ms page {:?} get_size {:?} visible {} \
+         page hidden {hidden:?} dpr {dpr:?}",
         page_inner_size(w).await,
         w.get_size(),
         w.get_visible()
@@ -2454,7 +2534,7 @@ async fn tray_click_with_no_window() {
 /// LAUFEY_E2E_ONLY=lifetime. Ends the process: keep-alive with no window,
 /// then quit(), which must end the event loop (the backend then calls the
 /// runtime's shutdown, observed here through `should_shutdown`).
-async fn lifetime_checks() -> ! {
+async fn lifetime_checks() {
   let caps = laufey::window_capabilities();
   if caps.keep_alive() {
     laufey::set_quit_on_last_window_closed(false);
@@ -2487,14 +2567,78 @@ async fn lifetime_checks() -> ! {
   // first (which a closed last window above can schedule).
   let open_at_quit = Window::new(300, 200).title("native-e2e-lifetime-3");
   let _ = wait_for(|| open_at_quit.get_size().0 != 0, 100, 50).await;
+  // quit() from any thread: from the UI thread and, at the same time, from
+  // this one (a tokio worker, like a runtime's own thread). The UI loop must
+  // end on the UI thread either way, and the runtime be shut down once.
+  let from_ui = laufey::spawn_on_ui_thread(laufey::quit);
   laufey::quit();
   let ended = wait_for(laufey::should_shutdown, 300, 50).await;
   check(
     "quit() ends the event loop (runtime shutdown begins)",
     ended,
   );
-  // Report before the backend's teardown can race the exit code.
-  finish();
+  let _ =
+    tokio::time::timeout(std::time::Duration::from_secs(2), from_ui).await;
+  tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+  let calls = SHUTDOWN_CALLS.load(Ordering::SeqCst);
+  check(
+    &format!("the runtime is shut down exactly once (got {calls})"),
+    calls == 1,
+  );
+  // Then return instead of exiting: the backend must join this thread and
+  // end the process itself. On Unix an atexit guard checks that the process
+  // only exits after laufey_runtime_start returned (see exit_guard).
+  let failed = FAILED.load(Ordering::SeqCst);
+  eprintln!("[e2e] OVERALL {}", if failed { "FAIL" } else { "PASS" });
+  let _ = std::io::Write::flush(&mut std::io::stderr());
+  if failed {
+    unsafe { libc_exit(1) };
+  }
+  exit_guard::arm();
+}
+
+/// The runtime's own end of the app lifetime (LAUFEY_E2E_ONLY=lifetime): the
+/// backend calls laufey_runtime_shutdown, joins the runtime thread (whose
+/// laufey_runtime_start then returns) and only then ends the process.
+static SHUTDOWN_CALLS: std::sync::atomic::AtomicU32 =
+  std::sync::atomic::AtomicU32::new(0);
+static RUNTIME_RETURNED: AtomicBool = AtomicBool::new(false);
+
+mod exit_guard {
+  use std::sync::atomic::Ordering;
+
+  /// Unix: at process exit, FAIL unless laufey_runtime_start has returned
+  /// (the backend waited for the runtime thread) and the runtime was shut
+  /// down exactly once. A backend that returns from main, or calls exit(),
+  /// under a running runtime fails here instead of exiting 0.
+  #[cfg(unix)]
+  pub fn arm() {
+    extern "C" fn guard() {
+      let returned = super::RUNTIME_RETURNED.load(Ordering::SeqCst);
+      let calls = super::SHUTDOWN_CALLS.load(Ordering::SeqCst);
+      if returned && calls == 1 {
+        eprintln!(
+          "[e2e] PASS the process exits after the runtime returned \
+           (shutdown called once)"
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        return;
+      }
+      eprintln!(
+        "[e2e] FAIL the process exited under the runtime \
+         (laufey_runtime_start returned: {returned}, shutdown calls: {calls})"
+      );
+      let _ = std::io::Write::flush(&mut std::io::stderr());
+      unsafe { super::libc_exit(1) };
+    }
+    extern "C" {
+      fn atexit(f: extern "C" fn()) -> i32;
+    }
+    unsafe { atexit(guard) };
+  }
+
+  #[cfg(not(unix))]
+  pub fn arm() {}
 }
 
 /// The `code` of an error envelope, or "ok" for a credential.
@@ -2701,4 +2845,28 @@ extern "C" {
   fn libc_exit(code: i32) -> !;
 }
 
-laufey::main!(e2e_main);
+// laufey::main!(e2e_main), with the lifetime checks' bookkeeping: how often
+// the backend shuts the runtime down, and whether laufey_runtime_start has
+// returned.
+#[no_mangle]
+/// # Safety
+/// `api` must be either null or a valid pointer to a `LaufeyBackendApi`
+/// with static lifetime supplied by the host runtime.
+pub unsafe extern "C" fn laufey_runtime_init(
+  api: *const laufey::LaufeyBackendApi,
+) -> std::ffi::c_int {
+  unsafe { laufey::init_api(api) }
+}
+
+#[no_mangle]
+pub extern "C" fn laufey_runtime_start() -> std::ffi::c_int {
+  e2e_main();
+  RUNTIME_RETURNED.store(true, Ordering::SeqCst);
+  0
+}
+
+#[no_mangle]
+pub extern "C" fn laufey_runtime_shutdown() {
+  SHUTDOWN_CALLS.fetch_add(1, Ordering::SeqCst);
+  laufey::shutdown();
+}

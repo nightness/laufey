@@ -3,7 +3,7 @@
 # Run the backend-agnostic native_e2e_runtime under a given backend and
 # propagate its PASS/FAIL exit code. See docs/e2e-testing.md.
 #
-#   scripts/native-e2e-run.sh <winit|webview|cef> [--layer1|--scheme-body|--lifetime|--window-api|--hidpi|--io|--system|--devtools-off|--menus-notifications|--auth-thread]
+#   scripts/native-e2e-run.sh <winit|webview|cef> [--layer1|--scheme-body|--lifetime|--lna|--window-api|--hidpi|--io|--system|--devtools-off|--menus-notifications|--auth-thread]
 #
 # --layer1 (Linux only) wraps the run in the D-Bus StatusNotifier/dbusmenu
 # observer (native_e2e_driver) under a private session bus: it checks the
@@ -11,6 +11,9 @@
 # Event that must reach the app, and fails unless the battery passed.
 # --scheme-body runs only the custom-scheme request-body round trip (for
 # backends where the full battery can't run in CI).
+# --lna runs only the Local Network Access checks (lna_checks.rs): the
+# custom-scheme page's fetch and WebSocket to a loopback server, and (CEF) a
+# page on another origin that must not reach loopback.
 # --lifetime runs only the app-lifetime checks (keep-alive with no window,
 # then quit() ending the event loop); they end the process, so they can't
 # share the main battery's run.
@@ -46,7 +49,7 @@
 # elsewhere). Ends with quit().
 set -euo pipefail
 
-backend="${1:?usage: native-e2e-run.sh <winit|webview|cef> [--layer1|--scheme-body|--lifetime|--window-api|--hidpi|--io|--system|--devtools-off|--menus-notifications|--auth-thread]}"
+backend="${1:?usage: native-e2e-run.sh <winit|webview|cef> [--layer1|--scheme-body|--lifetime|--lna|--window-api|--hidpi|--io|--system|--devtools-off|--menus-notifications|--auth-thread]}"
 mode="${2:-}"
 
 # Locate the runtime cdylib (.so / .dylib / .dll).
@@ -74,6 +77,9 @@ if [ "$mode" = "--scheme-body" ]; then
 fi
 if [ "$mode" = "--lifetime" ]; then
   export LAUFEY_E2E_ONLY=lifetime
+fi
+if [ "$mode" = "--lna" ]; then
+  export LAUFEY_E2E_ONLY=lna
 fi
 if [ "$mode" = "--window-api" ] || [ "$mode" = "--hidpi" ]; then
   export LAUFEY_E2E_ONLY=window-api
@@ -134,14 +140,16 @@ case "$backend" in
 esac
 [ -n "$bin" ] || { echo "backend binary for '$backend' not found (build it first)"; exit 1; }
 
-# The custom-scheme check fetches a loopback echo server from the
-# laufey-e2e:// page. Chromium's Local Network Access checks treat that as a
-# public origin reaching the local network and hold the request for a
-# permission prompt the CEF host never shows, so the fetch would hang; the
-# check is about the Origin header, not LNA, so switch LNA off for the run.
+# Local Network Access (CEF; lna_checks.rs). The battery's custom-scheme page
+# reaches its loopback echo server (fetch and WebSocket) with Chromium's
+# checks ON: laufey grants local network access to the app's own declared
+# schemes. The negative check needs a page on an origin that is neither the
+# app's nor loopback: a loopback port this run declares public, which must be
+# known at launch. Skipped when that port is taken.
 args=()
 if [ "$backend" = "cef" ]; then
-  args+=(--disable-features=LocalNetworkAccessChecks)
+  export LAUFEY_E2E_PUBLIC_PORT="${LAUFEY_E2E_PUBLIC_PORT:-$((40000 + RANDOM % 20000))}"
+  args+=("--ip-address-space-overrides=127.0.0.1:${LAUFEY_E2E_PUBLIC_PORT}=public")
   # Chromium's password store would ask the private session bus's keyring
   # to unlock: gnome-keyring then shows gcr-prompter, which grabs the
   # pointer and keyboard for the rest of the run, so real X input (xdotool)

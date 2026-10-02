@@ -12,6 +12,12 @@
 //! - A context menu shown with the close callback is dismissed through the
 //!   test hook: the close callback fires exactly once, with no click; an
 //!   empty menu reports its close at once.
+//! - While a context menu is open the app keeps running: a page timer keeps
+//!   reaching the runtime through a binding, and a synchronous UI-thread
+//!   call (a window getter, `run_on_ui_thread`) returns. (CEF on Windows
+//!   used to stop running its tasks inside TrackPopupMenu's modal loop.)
+//! - Windows: an item chosen from the keyboard (SendInput Down + Return
+//!   while the web content has the focus) fires its click.
 //!
 //! Notifications:
 //! - Responses: a click before any response handler is buffered and
@@ -26,6 +32,7 @@
 //! - Windows: the COM activator answers a CoCreateInstance + Activate (what
 //!   Windows does for a click on a toast), and the response arrives.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -69,6 +76,7 @@ pub async fn run() {
   }
   if parts.contains("context") {
     context_menu_checks(&w, &mcaps).await;
+    context_menu_live_checks(&mcaps).await;
   }
   if parts.contains("notify") {
     notification_checks(&ncaps).await;
@@ -329,6 +337,242 @@ async fn context_menu_checks(w: &Window, caps: &laufey::MenuCapabilities) {
     "no context menu is open afterwards",
     !laufey::test_dismiss_context_menu(),
   );
+}
+
+/// Runs `f` on a thread of its own and waits up to `secs` for it: `None` if
+/// it hasn't returned by then (the thread is left to finish later).
+async fn returns_within<T: Send + 'static>(
+  secs: u64,
+  f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  std::thread::spawn(move || {
+    let _ = tx.send(f());
+  });
+  tokio::time::timeout(Duration::from_secs(secs), rx)
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+}
+
+fn live_menu_items() -> Vec<MenuItem> {
+  vec![
+    MenuItem::Item {
+      label: "First".into(),
+      id: Some("live-first".into()),
+      accelerator: None,
+      enabled: true,
+      checked: false,
+      icon: None,
+      tooltip: None,
+    },
+    MenuItem::Item {
+      label: "Second".into(),
+      id: Some("live-second".into()),
+      accelerator: None,
+      enabled: true,
+      checked: false,
+      icon: None,
+      tooltip: None,
+    },
+  ]
+}
+
+/// The app keeps running while a context menu is open (the menu's modal
+/// loop must not starve the backend's own task queue), and on Windows an
+/// item can be chosen from the keyboard.
+async fn context_menu_live_checks(caps: &laufey::MenuCapabilities) {
+  if !caps.context_closed() {
+    na("the app runs while a context menu is open (no close callback)");
+    return;
+  }
+  let ticks = Arc::new(AtomicUsize::new(0));
+  let w = {
+    let t = ticks.clone();
+    Window::new(480, 360)
+      .title("native-e2e-menu-live")
+      .bind("menuTick", move |call| {
+        t.fetch_add(1, Ordering::SeqCst);
+        call.resolve(laufey::Value::Bool(true));
+      })
+      .load("laufey-e2e://app/ticker")
+  };
+  w.show();
+  let engine = laufey::scheme_handlers_supported();
+  let page_ticks =
+    engine && wait_for(|| ticks.load(Ordering::SeqCst) >= 3, 100, 100).await;
+  if engine {
+    check("the ticker page's timer reaches the runtime", page_ticks);
+  }
+
+  let closed = Arc::new(AtomicUsize::new(0));
+  let clicked = Arc::new(Mutex::new(Vec::<String>::new()));
+  let show_menu = |closed: &Arc<AtomicUsize>,
+                   clicked: &Arc<Mutex<Vec<String>>>| {
+    let (c, k) = (closed.clone(), clicked.clone());
+    w.show_context_menu_with_close(
+      40,
+      40,
+      &live_menu_items(),
+      move |id| k.lock().unwrap().push(id.to_string()),
+      move || {
+        c.fetch_add(1, Ordering::SeqCst);
+      },
+    );
+  };
+  show_menu(&closed, &clicked);
+  tokio::time::sleep(Duration::from_millis(500)).await;
+  if closed.load(Ordering::SeqCst) > 0 {
+    // No interactive desktop: the OS refused the menu.
+    na("the app runs while a context menu is open (the menu didn't open)");
+    return;
+  }
+  #[cfg(windows)]
+  check(
+    "the context menu is up (its popup window is visible)",
+    win::popup_menu_open(),
+  );
+
+  // A page timer keeps reaching the runtime through the backend.
+  if page_ticks {
+    let before = ticks.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let during = ticks.load(Ordering::SeqCst) - before;
+    check(
+      &format!(
+        "a page timer keeps reaching the runtime while a context menu is \
+         open ({during} ticks in 1.5 s)"
+      ),
+      during >= 3,
+    );
+  }
+  // Synchronous calls that hop to the UI thread return.
+  let id = w.id();
+  let size = returns_within(5, move || Window::from_id(id).get_size()).await;
+  check(
+    &format!(
+      "a synchronous window call returns while a context menu is open \
+       ({size:?})"
+    ),
+    size.is_some(),
+  );
+  let task = returns_within(5, || laufey::try_run_on_ui_thread(|| 7)).await;
+  match task {
+    Some(Err(e)) => na(&format!(
+      "run_on_ui_thread while a context menu is open ({e})"
+    )),
+    _ => check(
+      &format!(
+        "run_on_ui_thread returns while a context menu is open ({task:?})"
+      ),
+      matches!(task, Some(Ok(7))),
+    ),
+  }
+  let still_open = closed.load(Ordering::SeqCst) == 0;
+  check("the context menu stayed open during the checks", still_open);
+  let dismissed = wait_for(
+    || laufey::test_dismiss_context_menu() || closed.load(Ordering::SeqCst) > 0,
+    150,
+    20,
+  )
+  .await;
+  check(
+    "the context menu closes afterwards (exactly once)",
+    dismissed
+      && wait_for(|| closed.load(Ordering::SeqCst) == 1, 150, 20).await
+      && clicked.lock().unwrap().is_empty(),
+  );
+
+  keyboard_choice_check(&w, show_menu).await;
+}
+
+/// Windows: a context menu is driven from the keyboard, injected with
+/// SendInput, the way a person does it: Escape dismisses it, then Down +
+/// Return chooses the first item of the next one. Before each menu the test
+/// brings the window to the front the way an automation script (or a
+/// person) does: an Alt press around SetForegroundWindow, the usual way to
+/// be allowed to take the foreground, which leaves the window in menu mode
+/// (a lone Alt release selects the system menu).
+async fn keyboard_choice_check<F>(w: &Window, show_menu: F)
+where
+  F: Fn(&Arc<AtomicUsize>, &Arc<Mutex<Vec<String>>>),
+{
+  #[cfg(windows)]
+  {
+    let mut hwnd = w.get_window_handle();
+    if hwnd.is_null() {
+      hwnd = win::find_window("native-e2e-menu-live");
+    }
+    if hwnd.is_null() {
+      na("a context menu driven from the keyboard (no window handle)");
+      return;
+    }
+    for (keys, label, want) in [
+      (
+        &[win::VK_ESCAPE][..],
+        "Escape dismisses the context menu",
+        None,
+      ),
+      (
+        &[win::VK_DOWN, win::VK_RETURN][..],
+        "Down + Return chooses the first context-menu item",
+        Some("live-first"),
+      ),
+    ] {
+      w.focus();
+      win::activate_with_alt(hwnd);
+      tokio::time::sleep(Duration::from_millis(500)).await;
+      let closed = Arc::new(AtomicUsize::new(0));
+      let clicked = Arc::new(Mutex::new(Vec::<String>::new()));
+      show_menu(&closed, &clicked);
+      let up = wait_for(win::popup_menu_open, 50, 50).await;
+      tokio::time::sleep(Duration::from_millis(500)).await;
+      let early = closed.load(Ordering::SeqCst);
+      check(
+        &format!("{label}: the menu is up (popup {up}, closed early {early})"),
+        up && early == 0,
+      );
+      for &k in keys {
+        check("SendInput injected the key", win::press(k));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+      }
+      let done = wait_for(|| closed.load(Ordering::SeqCst) > 0, 100, 30).await;
+      let got = clicked.lock().unwrap().clone();
+      check(
+        &format!("{label} (closed {done}, clicks {got:?})"),
+        done
+          && match want {
+            Some(id) => got.iter().any(|c| c == id),
+            None => got.is_empty(),
+          },
+      );
+      if !done {
+        // Leave no menu behind for the checks that follow.
+        wait_for(
+          || {
+            laufey::test_dismiss_context_menu()
+              || closed.load(Ordering::SeqCst) > 0
+          },
+          150,
+          20,
+        )
+        .await;
+      }
+      check(
+        &format!("{label}: the menu reports its close once"),
+        wait_for(|| closed.load(Ordering::SeqCst) == 1, 150, 20).await,
+      );
+      tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+  }
+  #[cfg(not(windows))]
+  {
+    let _ = (w, show_menu);
+    na(
+      "a context menu driven from the keyboard (OS key injection is \
+       Windows-only here)",
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +946,7 @@ pub(crate) mod win {
     fn GetWindowTextW(hwnd: *mut c_void, buf: *mut u16, len: i32) -> i32;
     fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn ClientToScreen(hwnd: *mut c_void, point: *mut Point) -> i32;
+    fn GetClassNameW(hwnd: *mut c_void, buf: *mut u16, len: i32) -> i32;
   }
 
   #[link(name = "ole32")]
@@ -857,6 +1102,68 @@ pub(crate) mod win {
         GetForegroundWindow()
       );
       false
+    }
+  }
+
+  /// Whether a popup menu window ("#32768") of this process is visible.
+  pub fn popup_menu_open() -> bool {
+    struct Search {
+      pid: u32,
+      found: bool,
+    }
+    unsafe extern "system" fn visit(hwnd: *mut c_void, lparam: isize) -> i32 {
+      let search = &mut *(lparam as *mut Search);
+      let mut pid = 0u32;
+      GetWindowThreadProcessId(hwnd, &mut pid);
+      if pid != search.pid || IsWindowVisible(hwnd) == 0 {
+        return 1;
+      }
+      let mut buf = [0u16; 16];
+      let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+      let class: Vec<u16> = "#32768".encode_utf16().collect();
+      if n > 0 && buf[..n as usize] == class[..] {
+        search.found = true;
+        return 0;
+      }
+      1
+    }
+    let mut search = Search {
+      pid: std::process::id(),
+      found: false,
+    };
+    unsafe { EnumWindows(visit, &mut search as *mut Search as isize) };
+    search.found
+  }
+
+  pub const VK_ESCAPE: u16 = 0x1B;
+  pub const VK_DOWN: u16 = 0x28;
+  pub const VK_RETURN: u16 = 0x0D;
+  const VK_MENU: u16 = 0x12;
+
+  /// Press and release one key.
+  pub fn press(vk: u16) -> bool {
+    let seq = [key(vk, false), key(vk, true)];
+    let sent = unsafe {
+      SendInput(
+        seq.len() as u32,
+        seq.as_ptr(),
+        std::mem::size_of::<Input>() as i32,
+      )
+    };
+    sent as usize == seq.len()
+  }
+
+  /// Bring `hwnd`'s window to the front with an Alt press around
+  /// SetForegroundWindow: the input lets this process take the foreground.
+  pub fn activate_with_alt(hwnd: *mut c_void) {
+    let root = unsafe { GetAncestor(hwnd, 2) }; // GA_ROOT
+    let target = if root.is_null() { hwnd } else { root };
+    let down = [key(VK_MENU, false)];
+    let up = [key(VK_MENU, true)];
+    unsafe {
+      SendInput(1, down.as_ptr(), std::mem::size_of::<Input>() as i32);
+      SetForegroundWindow(target);
+      SendInput(1, up.as_ptr(), std::mem::size_of::<Input>() as i32);
     }
   }
 

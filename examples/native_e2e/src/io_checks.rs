@@ -14,6 +14,11 @@
 //!   `cancel_file_dialog`, refused while another is open (busy), and accepted
 //!   with a path the hook types in (save, open a file, open a directory),
 //!   each result coming back through the dialog's own completion path.
+//! - Abort stress: dialogs of every kind (open / save / folder, modal and
+//!   app-level, with filters and multi-select) cancelled through
+//!   `cancel_file_dialog` at delays from "at once" to well after the dialog
+//!   window is up; each one settles cancelled exactly once and, on Windows,
+//!   its window is gone afterwards.
 //! - Drag out: refused without a held mouse button and for a bad path (a
 //!   real drag needs a person, or OS input injection, and is not run here).
 
@@ -55,6 +60,7 @@ pub async fn run() {
   file_drop_checks(&w, &caps).await;
   xdnd_drop_check(&caps).await;
   dialog_checks(&w, &caps).await;
+  dialog_abort_stress(&w, &caps).await;
   drag_out_checks(&w, &caps).await;
 }
 
@@ -438,26 +444,16 @@ async fn xdnd_drop_check(caps: &laufey::WindowCapabilities) {
     eprintln!("[e2e]   xdnd source: {line}");
     drag_ended |= line == "drag-end";
   }
-  // Known bug (CEF on Linux, CEF 149): the page sees the drag (the injected
-  // observer reports every phase) but CefDragHandler::OnDragEnter is never
-  // called for it, so LaufeyHandler has no paths and drops the phases;
-  // nothing reaches on_file_drop. Reported, not hidden: this stops being
-  // N/A, and must pass, as soon as any phase arrives.
-  let backend = std::env::var("LAUFEY_E2E_BACKEND").unwrap_or_default();
-  if backend == "cef" && drag_ended && ev.is_empty() {
-    na(
-      "a real XDND drop (known bug on CEF/Linux: OnDragEnter is never \
-        called for an external drag, so no phase reaches on_file_drop; see \
-        docs/e2e-testing.md)",
-    );
-  } else {
-    check(
-      "a real XDND drag entering the window reports ENTER",
-      entered,
-    );
-    check("moving over the window reports OVER at the pointer", over);
-    check("a real XDND drop reaches on_file_drop", dropped);
-  }
+  // CEF used to report nothing here: CEF 149 calls OnDragEnter only for
+  // Alloy-style browsers, so the paths now come from the XDND source itself
+  // (cef/src/drag_paths_linux.cc).
+  eprintln!("[e2e]   xdnd: the source saw the drag end: {drag_ended}");
+  check(
+    "a real XDND drag entering the window reports ENTER",
+    entered,
+  );
+  check("moving over the window reports OVER at the pointer", over);
+  check("a real XDND drop reaches on_file_drop", dropped);
   if dropped {
     let drop = ev.iter().find(|e| e.phase == FileDragPhase::Drop).unwrap();
     check(
@@ -650,6 +646,153 @@ async fn dialog_checks(w: &Window, caps: &laufey::WindowCapabilities) {
   );
 
   let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cancel_file_dialog` (what an embedder's abort calls) closes a dialog of
+/// any kind whenever it arrives: before the dialog is shown, while it is
+/// being built, or long after its window is up. Each one settles cancelled
+/// exactly once (the outcome channel would report a second settle as a
+/// failure on the next dialog: the slot would be busy), and the slot is
+/// free right after. On Windows the dialog's window must also be gone.
+async fn dialog_abort_stress(w: &Window, caps: &laufey::WindowCapabilities) {
+  if !caps.file_dialogs() {
+    na("file dialog abort stress (backend has no file dialogs)");
+    return;
+  }
+  let modal_parent = if caps.file_dialog_modal() { w.id() } else { 0 };
+  // LAUFEY_E2E_ABORT_ROUNDS: more rounds when hunting a race by hand.
+  let rounds: usize = std::env::var("LAUFEY_E2E_ABORT_ROUNDS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(12);
+  let delays_ms = [0u64, 50, 250, 700, 1500, 2000];
+  let mut settled = 0usize;
+  for i in 0..rounds {
+    let delay = delays_ms[i % delays_ms.len()];
+    let kind = i % 3; // open file(s), save, folder
+    let modal = (i / 3) % 2 == 1;
+    let title = format!("laufey e2e abort {i}");
+    let mut options = FileDialogOptions {
+      title: Some(title.clone()),
+      ..Default::default()
+    };
+    match kind {
+      0 => {
+        options.multiple = true;
+        options.filters = vec![FileFilter {
+          name: "Text".into(),
+          extensions: vec!["txt".into()],
+        }];
+      }
+      1 => {
+        options.kind = FileDialogKind::Save;
+        options.default_path = Some("e2e.txt".into());
+      }
+      _ => options.directories = true,
+    }
+    let label = format!(
+      "{} dialog ({}), aborted after {delay} ms",
+      ["open", "save", "folder"][kind],
+      if modal { "modal" } else { "app-level" }
+    );
+    let d =
+      laufey::show_file_dialog(if modal { modal_parent } else { 0 }, &options);
+    if d.id == 0 {
+      check(&format!("{label}: the dialog opens"), false);
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(delay)).await;
+    #[cfg(windows)]
+    let window_seen = delay >= 1500 && win_dialog::exists(&title);
+    let found = laufey::cancel_file_dialog(d.id);
+    let outcome =
+      tokio::time::timeout(Duration::from_secs(10), d.outcome).await;
+    let ok = matches!(outcome, Ok(FileDialogOutcome::Cancelled));
+    check(
+      &format!("{label}: settles cancelled ({found}, {outcome:?})"),
+      found && ok,
+    );
+    if !ok {
+      // A dialog that never settled holds the slot: the rest can't run.
+      break;
+    }
+    settled += 1;
+    #[cfg(windows)]
+    {
+      if delay >= 1500 {
+        eprintln!("[e2e]   {label}: its window was up: {window_seen}");
+      }
+      check(
+        &format!("{label}: its window is gone"),
+        wait_for(|| !win_dialog::exists(&title), 50, 100).await,
+      );
+    }
+    // Exactly once: the slot is free at once, so a new dialog opens (and is
+    // cancelled before it shows).
+    let next = laufey::show_file_dialog(0, &FileDialogOptions::default());
+    let freed = next.id != 0;
+    if freed {
+      laufey::cancel_file_dialog(next.id);
+    }
+    let next_outcome =
+      tokio::time::timeout(Duration::from_secs(10), next.outcome).await;
+    check(
+      &format!("{label}: settles once and frees the slot"),
+      freed && matches!(next_outcome, Ok(FileDialogOutcome::Cancelled)),
+    );
+  }
+  check(
+    &format!("every aborted dialog settled ({settled}/{rounds})"),
+    settled == rounds,
+  );
+}
+
+/// Windows: whether a visible window of this process has `title` (the file
+/// dialog's own top-level window).
+#[cfg(windows)]
+mod win_dialog {
+  use std::ffi::c_void;
+
+  #[link(name = "user32")]
+  extern "system" {
+    fn EnumWindows(
+      cb: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+      lparam: isize,
+    ) -> i32;
+    fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
+    fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+    fn GetWindowTextW(hwnd: *mut c_void, buf: *mut u16, len: i32) -> i32;
+  }
+
+  pub fn exists(title: &str) -> bool {
+    struct Search {
+      pid: u32,
+      title: Vec<u16>,
+      found: bool,
+    }
+    unsafe extern "system" fn visit(hwnd: *mut c_void, lparam: isize) -> i32 {
+      let search = &mut *(lparam as *mut Search);
+      let mut pid = 0u32;
+      GetWindowThreadProcessId(hwnd, &mut pid);
+      if pid != search.pid || IsWindowVisible(hwnd) == 0 {
+        return 1;
+      }
+      let mut buf = [0u16; 256];
+      let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+      if n > 0 && buf[..n as usize] == search.title[..] {
+        search.found = true;
+        return 0;
+      }
+      1
+    }
+    let mut search = Search {
+      pid: std::process::id(),
+      title: title.encode_utf16().collect(),
+      found: false,
+    };
+    unsafe { EnumWindows(visit, &mut search as *mut Search as isize) };
+    search.found
+  }
 }
 
 fn accept_check(

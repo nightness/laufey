@@ -388,6 +388,15 @@ jobs:
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --scheme-body
 
+      # The custom-scheme page's fetch and WebSocket to a loopback server
+      # (lna_checks.rs). Part of Layer 0 on the other legs, where CEF also
+      # checks that a page on any other origin stays blocked.
+      - name: Local Network Access — custom-scheme page to loopback
+        if: ${{ matrix.layer0_excluded }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --lna
+
       # Layer 1 (Linux, cef): the D-Bus StatusNotifier/dbusmenu observer
       # plays the desktop shell, checks the real appindicator tray from
       # outside, fires a dbusmenu Event that must reach the app's on_click,
