@@ -2,7 +2,6 @@
 
 #include <iostream>
 #include <string>
-#include <vector>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
@@ -764,16 +763,7 @@ class LaufeyCombinedApp : public CefApp, public CefBrowserProcessHandler {
 };
 
 int main(int argc, char* argv[]) {
-  // CEF gets its own copy of argv. Chromium sets the process title by
-  // rewriting the argv strings in place (setproctitle), which garbles the
-  // arguments the runtime later reads with std::env::args() or its
-  // equivalent (they point at the original argv).
-  std::vector<std::string> cef_arg_storage(argv, argv + argc);
-  std::vector<char*> cef_argv;
-  for (std::string& arg : cef_arg_storage)
-    cef_argv.push_back(&arg[0]);
-  cef_argv.push_back(nullptr);
-  CefMainArgs main_args(argc, cef_argv.data());
+  CefMainArgs main_args(argc, argv);
 
   // Single-exe model: check if we are a subprocess first
   CefRefPtr<LaufeyCombinedApp> app(new LaufeyCombinedApp());
