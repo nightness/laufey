@@ -1799,6 +1799,10 @@ async fn window_api_checks() {
     // Experiment: set_size at various delays after creating a window; does
     // the page follow?
     let mut lost = 0;
+    // Keeps the app alive while the probe windows close.
+    let keeper = Window::new(200, 150).title("keeper");
+    keeper.show();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     for round in 0..3 {
       for delay in [0u64, 20, 50, 100, 200, 300, 400, 600] {
         let x = Window::new(520, 420).title("early-resize");
