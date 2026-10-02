@@ -42,6 +42,8 @@ const UI_BUSY_MS: u64 = 1500;
 const CAP_LEN: usize = 80 * 1024 * 1024;
 /// The backends' cap on bytes queued for a page that isn't reading.
 const CAP_BYTES: usize = 64 * 1024 * 1024;
+/// What WebView2 posts to a page ahead of its reads (kCreditWindow).
+const CREDIT_WINDOW: usize = 4 * 1024 * 1024;
 
 /// The scenarios the page runs; each reports once.
 const LABELS: [&str; 8] =
@@ -523,7 +525,10 @@ pub async fn run(state: &State) -> Option<Window> {
       &format!(
         "a write fails once 64 MiB are held for a page that isn't reading (bytes accepted before the failure: {cap:?})"
       ),
-      matches!(cap, Some(Some(n)) if (CAP_BYTES / 2..=CAP_BYTES + 1024 * 1024).contains(&n)),
+      // Up to the 64 MiB held plus WebView2's 4 MiB credit window already
+      // posted to the page (wv2_scheme_stream.cc kCreditWindow), which the
+      // page received but never read: 68 MiB on windows-11-arm.
+      matches!(cap, Some(Some(n)) if (CAP_BYTES / 2..=CAP_BYTES + CREDIT_WINDOW + 1024 * 1024).contains(&n)),
     );
   } else {
     na("the queued-bytes cap (WKWebView hands every write to WebKit)");

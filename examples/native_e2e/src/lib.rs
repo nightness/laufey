@@ -2293,6 +2293,35 @@ async fn hidpi_checks(w: &Window, title: &str, scale: f64) {
     sized,
   );
   check_page_size("HiDPI: the page area is the DIP size", w, want).await;
+  if std::env::var_os("LAUFEY_E2E_HIDPI_DIAG").is_some() {
+    // Experiment: is a lost early resize slow or gone?
+    let t0 = std::time::Instant::now();
+    let mut last = None;
+    while t0.elapsed() < std::time::Duration::from_secs(10) {
+      let got = page_inner_size(w).await;
+      if got != last {
+        eprintln!(
+          "[e2e] DIAG {} ms: page {got:?} size {:?}",
+          t0.elapsed().as_millis(),
+          w.get_size()
+        );
+        last = got;
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    w.set_size(601, 401);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    eprintln!(
+      "[e2e] DIAG after 601x401: page {:?}",
+      page_inner_size(w).await
+    );
+    w.set_size(600, 400);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    eprintln!(
+      "[e2e] DIAG after 600x400: page {:?}",
+      page_inner_size(w).await
+    );
+  }
 
   // Positions are DIPs too.
   w.set_position(100, 80);
