@@ -463,6 +463,16 @@ fn serve_scheme_request(
       "text/html; charset=utf-8",
       TICKER_PAGE_HTML.as_bytes(),
     ),
+    // An empty page titled <title>, the whole window a drop area (the real
+    // drop checks in io_checks.rs).
+    p if p.starts_with("laufey-e2e://app/titled/") => {
+      let title = &p["laufey-e2e://app/titled/".len()..];
+      let html = format!(
+        "<!doctype html><title>{title}</title>\
+         <body style='margin:0;height:100vh'>drop</body>"
+      );
+      respond(req, 200, "text/html; charset=utf-8", html.as_bytes())
+    }
     "app://e2e/" | "app://e2e" => respond(
       req,
       200,

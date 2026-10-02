@@ -368,7 +368,7 @@ jobs:
       # hold the runner for the 6-hour job limit. native-e2e-run.sh's own
       # watchdog (5 min) fires first and prints the hung process's stacks.
       - name: Layer 0 — readback / events / clipboard / menu+tray clicks
-        if: ${{ !matrix.layer0_excluded }}
+        if: ${{ !cancelled() && (!matrix.layer0_excluded) }}
         timeout-minutes: 10
         shell: bash
         env:
@@ -383,7 +383,7 @@ jobs:
       # fetch / EventSource / XHR and stop when cancelled. Part of Layer 0 on
       # the other legs.
       - name: Custom-scheme request bodies and streaming responses
-        if: ${{ matrix.layer0_excluded }}
+        if: ${{ !cancelled() && (matrix.layer0_excluded) }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --scheme-body
@@ -392,7 +392,7 @@ jobs:
       # (lna_checks.rs). Part of Layer 0 on the other legs, where CEF also
       # checks that a page on any other origin stays blocked.
       - name: Local Network Access — custom-scheme page to loopback
-        if: ${{ matrix.layer0_excluded }}
+        if: ${{ !cancelled() && (matrix.layer0_excluded) }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --lna
@@ -402,7 +402,7 @@ jobs:
       # outside, fires a dbusmenu Event that must reach the app's on_click,
       # and fails unless the whole battery passed under it.
       - name: Layer 1 — D-Bus tray / menu observer (Linux, cef)
-        if: runner.os == 'Linux' && matrix.backend == 'cef'
+        if: ${{ !cancelled() && (runner.os == 'Linux' && matrix.backend == 'cef') }}
         timeout-minutes: 10
         shell: bash
         env:
@@ -413,6 +413,7 @@ jobs:
       # on their own, on every leg. On Linux under a window manager
       # (openbox): maximize / minimize / fullscreen must apply, not N/A.
       - name: Window API — state, constraints, screens (a WM on Linux)
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --window-api
@@ -421,6 +422,7 @@ jobs:
       # the event loop. Ends the process, so it runs on its own. Every leg,
       # webview/linux included (no clipboard involved).
       - name: App lifetime — keep-alive and quit
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --lifetime
@@ -431,6 +433,7 @@ jobs:
       # webview/linux included (every call hops to the GTK thread). See
       # docs/e2e-testing.md §17.
       - name: I/O — drag and drop, file dialogs, clipboard
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --io
@@ -442,11 +445,13 @@ jobs:
       # the DevTools checks again with LAUFEY_INSPECTABLE=0 (nothing opens).
       # Every leg; Winit reports N/A. See docs/e2e-testing.md.
       - name: System — global shortcuts, launch at login, DevTools
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --system
 
       - name: System — DevTools disabled (LAUFEY_INSPECTABLE=0)
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --devtools-off
@@ -459,6 +464,7 @@ jobs:
       # server on Linux and the toast COM activator on Windows. Every leg;
       # Winit reports N/A. See docs/e2e-testing.md.
       - name: Menus and notifications
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --menus-notifications
@@ -470,6 +476,7 @@ jobs:
       # window close, the consent prompt). Every leg; ends with quit(). See
       # docs/e2e-testing.md.
       - name: UI-thread tasks and auth sessions
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --auth-thread
@@ -478,7 +485,7 @@ jobs:
       # activator registration the step above wrote, and the click reaches
       # the response handler as the launch.
       - name: Notifications — cold-start click (Windows)
-        if: runner.os == 'Windows' && matrix.backend != 'winit'
+        if: ${{ !cancelled() && (runner.os == 'Windows' && matrix.backend != 'winit') }}
         timeout-minutes: 10
         shell: pwsh
         run: scripts/notification-coldstart-e2e.ps1 ${{ matrix.backend }}
@@ -487,7 +494,7 @@ jobs:
       # across relaunches, isolation between apps, unchanged defaults. See
       # docs/app-data.md.
       - name: Storage — per-app persistence / isolation
-        if: matrix.backend != 'winit'
+        if: ${{ !cancelled() && (matrix.backend != 'winit') }}
         timeout-minutes: 15
         shell: bash
         run: scripts/storage-e2e-run.sh ${{ matrix.backend }}
@@ -497,7 +504,7 @@ jobs:
       # through LaunchServices (open_url). See docs/deep-links.md. Winit has
       # no single-instance lock.
       - name: Single instance / opened files
-        if: matrix.backend != 'winit'
+        if: ${{ !cancelled() && (matrix.backend != 'winit') }}
         timeout-minutes: 15
         shell: bash
         run: scripts/single-instance-e2e-run.sh ${{ matrix.backend }}
@@ -512,12 +519,12 @@ jobs:
       # the job: the Windows display stays scaled.
       - name: Raise the display scale (Windows)
         id: scale
-        if: runner.os == 'Windows' && matrix.backend != 'winit'
+        if: ${{ !cancelled() && (runner.os == 'Windows' && matrix.backend != 'winit') }}
         shell: pwsh
         run: scripts/windows-display-scale.ps1 -Percent 200
 
       - name: HiDPI
-        if: runner.os == 'Linux' || (runner.os == 'Windows' && matrix.backend != 'winit' && steps.scale.outputs.scale != '1')
+        if: ${{ !cancelled() && (runner.os == 'Linux' || (runner.os == 'Windows' && matrix.backend != 'winit' && steps.scale.outputs.scale != '1')) }}
         timeout-minutes: 10
         shell: bash
         env:

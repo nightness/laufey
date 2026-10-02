@@ -327,6 +327,17 @@ if(LAUFEY_BUILD_TESTS)
                          SKIP_RETURN_CODE 77)
   endif()
 
+  if(WIN32)
+    # The OLE drag source the Windows native e2e drags real files out of
+    # with SendInput (scripts/native-e2e-run.sh --io).
+    add_executable(laufey_ole_drag_source tests/ole_drag_source.cc)
+    target_link_libraries(laufey_ole_drag_source PRIVATE ole32 shell32 user32)
+    if(MSVC)
+      target_link_options(laufey_ole_drag_source PRIVATE
+        /ENTRY:wmainCRTStartup)
+    endif()
+  endif()
+
   if(APPLE)
     # ASAuthorization error mapping (synthetic NSErrors, no ceremony).
     add_executable(laufey_passkey_mac_test tests/passkey_mac_test.mm)

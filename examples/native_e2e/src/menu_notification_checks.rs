@@ -532,6 +532,24 @@ where
         &format!("{label}: the menu is up (popup {up}, closed early {early})"),
         up && early == 0,
       );
+      if up && early == 0 && !win::is_foreground(hwnd) {
+        // Some runners never let this process take the foreground (the
+        // accelerator check above is N/A there too), and keys then go to
+        // whatever window has it.
+        na(&format!(
+          "{label} (the window could not take the foreground on this desktop)"
+        ));
+        wait_for(
+          || {
+            laufey::test_dismiss_context_menu()
+              || closed.load(Ordering::SeqCst) > 0
+          },
+          150,
+          20,
+        )
+        .await;
+        continue;
+      }
       for &k in keys {
         check("SendInput injected the key", win::press(k));
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1102,6 +1120,15 @@ pub(crate) mod win {
         GetForegroundWindow()
       );
       false
+    }
+  }
+
+  /// Whether `hwnd`'s top-level window is the foreground window.
+  pub fn is_foreground(hwnd: *mut c_void) -> bool {
+    unsafe {
+      let root = GetAncestor(hwnd, 2); // GA_ROOT
+      let target = if root.is_null() { hwnd } else { root };
+      !target.is_null() && GetForegroundWindow() == target
     }
   }
 

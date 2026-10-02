@@ -204,6 +204,15 @@ if is_linux; then
   # Room for a 2x window.
   if [ "$mode" = "--hidpi" ]; then screen="2560x1600x24"; fi
 fi
+# Windows: the OLE drag source the --io battery drags real files out of
+# (laufey_ole_drag_source, built with the backend's tests).
+if [ "$mode" = "--io" ]; then
+  src="$(ls webview/build/backend-common/laufey_ole_drag_source.exe \
+    cef/build/backend-common/laufey_ole_drag_source.exe 2>/dev/null | head -1 || true)"
+  if [ -n "$src" ]; then
+    export LAUFEY_E2E_OLE_SOURCE="$PWD/$src"
+  fi
+fi
 
 # Layer 0: stream the output (so a hang shows how far the battery got) and
 # keep a copy, so an unexpected native termination cannot masquerade as
