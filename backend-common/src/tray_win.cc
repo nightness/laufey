@@ -1,8 +1,13 @@
 // Copyright 2025 Divy Srivastava. All rights reserved. MIT license.
 //
-// Shell_NotifyIcon-backed tray / status-bar icon. Hidden message-only
-// window receives WM_LAUFEY_TRAYICON callbacks and dispatches click /
-// double-click / right-click-menu events. WIC handles PNG → HICON
+// Shell_NotifyIcon-backed tray / status-bar icon. A hidden top-level window
+// receives WM_LAUFEY_TRAYICON callbacks and dispatches click /
+// double-click / right-click-menu events. It is top-level rather than
+// message-only because it owns the tray menu: the menu's owner must be the
+// foreground window while the menu is open, or the menu doesn't close when
+// the user clicks elsewhere (KB135788), and a message-only window can't be
+// the foreground window (it also gets no broadcasts such as
+// WM_SETTINGCHANGE). WIC handles PNG → HICON
 // decode. Light vs dark icons are resolved against the
 // AppsUseLightTheme registry value and re-applied on
 // WM_SETTINGCHANGE (ImmersiveColorSet).
@@ -11,6 +16,7 @@
 // a UI thread (CEF's TID_UI) should marshal before calling.
 
 #include "laufey_backend_common.h"
+#include "laufey_menu.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -148,10 +154,19 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (!menu) return 0;
     POINT pt;
     GetCursorPos(&pt);
+    // KB135788: the owner is the foreground window while the menu is open
+    // (so a click elsewhere closes it), and a message posted to it once the
+    // menu has closed makes the next menu open (and close) properly.
     SetForegroundWindow(hwnd);
-    UINT cmd = TrackPopupMenu(menu,
-                              TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                              pt.x, pt.y, 0, hwnd, nullptr);
+    UINT cmd = 0;
+    {
+      // TrackPopupMenu runs its own modal loop on this (the UI) thread
+      // until the menu closes; let the backend's tasks run inside it.
+      ScopedNativeModalLoop modal_loop;
+      cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                           pt.x, pt.y, 0, hwnd, nullptr);
+    }
+    PostMessageW(hwnd, WM_NULL, 0, 0);
     if (!cmd) return 0;
     laufey_menu_click_fn fn = nullptr;
     void* data = nullptr;
@@ -179,9 +194,11 @@ HWND EnsureTrayMessageWindow() {
   wc.hInstance = GetModuleHandleW(nullptr);
   wc.lpszClassName = L"LaufeyCommonTrayWindow";
   RegisterClassExW(&wc);
+  // Never shown: WS_POPUP with no size; WS_EX_TOOLWINDOW keeps it off the
+  // taskbar and out of Alt+Tab.
   g_tray_msg_hwnd =
-      CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
-                      nullptr, wc.hInstance, nullptr);
+      CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"", WS_POPUP, 0, 0,
+                      0, 0, nullptr, nullptr, wc.hInstance, nullptr);
   return g_tray_msg_hwnd;
 }
 

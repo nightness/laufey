@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
@@ -17,6 +18,12 @@
 #include "include/wrapper/cef_helpers.h"
 
 #include "app.h"
+#include "custom_schemes.h"
+#include "laufey_backend_common.h"
+#include "laufey_launch_config.h"
+#include "laufey_auth_session.h"
+#include "laufey_notifications.h"
+#include "laufey_single_instance.h"
 #include "renderer_app.h"
 #include "runtime_loader.h"
 
@@ -633,6 +640,9 @@ static int run_headless(const std::string& runtimePath) {
     return 1;
   }
 
+  // No UI loop in a headless worker: UI tasks are answered "not run" at
+  // once instead of waiting for a loop that never runs.
+  laufey_common::UiLoopEnded();
   if (!loader->Start()) {
     std::cerr << "Failed to start headless worker runtime." << std::endl;
     return 1;
@@ -672,6 +682,26 @@ class LaufeyCombinedApp : public CefApp, public CefBrowserProcessHandler {
 
   CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override {
     return renderer_app_->GetRenderProcessHandler();
+  }
+
+  // "app" plus the schemes declared with --laufey-custom-schemes /
+  // LAUFEY_CUSTOM_SCHEMES become standard, secure, fetch/CORS-enabled schemes
+  // in every process (single-exe model: this runs in the browser and in each
+  // subprocess). See custom_schemes.h.
+  void OnRegisterCustomSchemes(
+      CefRawPtr<CefSchemeRegistrar> registrar) override {
+    laufey_schemes::RegisterAll(registrar);
+  }
+
+  void OnBeforeChildProcessLaunch(
+      CefRefPtr<CefCommandLine> command_line) override {
+    laufey_schemes::ForwardToChild(command_line);
+  }
+
+  bool OnAlreadyRunningAppRelaunch(
+      CefRefPtr<CefCommandLine> command_line,
+      const CefString& current_directory) override {
+    return LaufeyHandleAlreadyRunningAppRelaunch();
   }
 
   void OnBeforeCommandLineProcessing(
@@ -718,7 +748,9 @@ class LaufeyCombinedApp : public CefApp, public CefBrowserProcessHandler {
     // Electron/Puppeteer do). Only the browser process needs the switch; CEF
     // propagates it to subprocesses.
     if (process_type.empty()) {
+      LaufeyStripDeepLinkSwitches(command_line);
       command_line->AppendSwitch("disable-background-networking");
+      LaufeyApplyInspectableToCommandLine(command_line);
     }
   }
 
@@ -763,7 +795,16 @@ class LaufeyCombinedApp : public CefApp, public CefBrowserProcessHandler {
 };
 
 int main(int argc, char* argv[]) {
-  CefMainArgs main_args(argc, argv);
+  // CEF gets its own copy of argv. Chromium sets the process title by
+  // rewriting the argv strings in place (setproctitle), which garbles the
+  // arguments the runtime later reads with std::env::args() or its
+  // equivalent (they point at the original argv); see docs/deep-links.md.
+  std::vector<std::string> cef_arg_storage(argv, argv + argc);
+  std::vector<char*> cef_argv;
+  for (std::string& arg : cef_arg_storage)
+    cef_argv.push_back(&arg[0]);
+  cef_argv.push_back(nullptr);
+  CefMainArgs main_args(argc, cef_argv.data());
 
   // Single-exe model: check if we are a subprocess first
   CefRefPtr<LaufeyCombinedApp> app(new LaufeyCombinedApp());
@@ -794,12 +835,9 @@ int main(int argc, char* argv[]) {
 
   // Wayland app_id / X11 WM_CLASS for our windows (see LaufeyWindowDelegate::
   // GetLinuxWindowProperties). Prefer the reverse-DNS identifier the embedder
-  // also uses for the `.desktop` file; fall back to the display name.
-  if (const char* app_id = getenv("LAUFEY_APP_ID")) {
-    if (*app_id) {
-      g_app_id = app_id;
-    }
-  }
+  // also uses for the `.desktop` file (LAUFEY_APP_ID, or "appId" in the
+  // launch file); fall back to the display name.
+  g_app_id = laufey_common::LaunchAppId();
   if (g_app_id.empty()) {
     if (const char* app_name = getenv("LAUFEY_APP_NAME")) {
       if (*app_name) {
@@ -813,15 +851,43 @@ int main(int argc, char* argv[]) {
     return run_headless(g_runtime_path);
   }
 
+  // Single-instance mode (docs/deep-links.md): a second launch forwards its
+  // arguments to the running instance and exits here, before CefInitialize
+  // (so CEF's own profile singleton is never reached) and before the runtime
+  // loads.
+  int single_instance_exit = 0;
+  if (!laufey_common::SingleInstanceStartup(argc, argv,
+                                            &single_instance_exit)) {
+    return single_instance_exit;
+  }
+  // Notifications (API 41): the Windows toast activator / the Linux
+  // scheduler start before the runtime, so a click on a toast that launched
+  // the app, or a notification scheduled for while it wasn't running, is
+  // delivered.
+  laufey_common::InitNotificationsAtLaunch();
+
   CefSettings settings;
   settings.no_sandbox = true;
   settings.log_severity = LaufeyCefLogSeverity();
 
-  // Set cache path
-  std::string cache_path = "/tmp/laufey_cef_" + std::to_string(getpid());
-  CefString(&settings.root_cache_path) = cache_path;
+  // Set cache path. With a per-app data dir (LAUFEY_DATA_DIR / LAUFEY_APP_ID)
+  // the profile persists there; cache_path must be set too (equal to the root)
+  // or CEF runs the browser "incognito" and keeps localStorage/cookies in
+  // memory. Without one, keep the throwaway per-process temp root.
+  std::string cache_path = laufey_common::AppDataSubdir("CEF");
+  if (!cache_path.empty()) {
+    CefString(&settings.root_cache_path) = cache_path;
+    CefString(&settings.cache_path) = cache_path;
+  } else {
+    cache_path = "/tmp/laufey_cef_" + std::to_string(getpid());
+    CefString(&settings.root_cache_path) = cache_path;
+  }
 
-  if (const char* port_env = getenv("LAUFEY_REMOTE_DEBUGGING_PORT")) {
+  // No remote debugging while DevTools are off (API 40, inspectable).
+  const char* port_env = laufey_common::LaunchInspectable()
+                             ? getenv("LAUFEY_REMOTE_DEBUGGING_PORT")
+                             : nullptr;
+  if (port_env) {
     int port = atoi(port_env);
     if (port > 0 && port < 65536) {
       settings.remote_debugging_port = port;
@@ -829,11 +895,19 @@ int main(int argc, char* argv[]) {
   }
 
   if (!CefInitialize(main_args, settings, app.get(), nullptr)) {
+    LaufeyReportCefInitializeFailure(cache_path);
     return 1;
   }
+  LaufeyInstallSecondInstanceHooks();
 
   CefRunMessageLoop();
 
+  // The loop is over: UI tasks still queued are answered "not run" and an
+  // auth session in progress ends cancelled, so a runtime thread waiting on
+  // either is released before Shutdown waits for it.
+  laufey_common::UiLoopEnded();
+
+  LaufeyClearSecondInstanceHooks();
   RuntimeLoader::GetInstance()->Shutdown();
 
   CefShutdown();

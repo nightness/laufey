@@ -42,7 +42,9 @@ if(MSVC)
 endif()
 
 # Shared native-API implementations (notifications, tray, dock, dialogs, ...).
-# Each platform branch links laufey_backend_common below.
+# Each platform branch links laufey_backend_common below. enable_testing()
+# registers backend-common's unit tests with `ctest --test-dir cef/build`.
+enable_testing()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../backend-common
                  ${CMAKE_BINARY_DIR}/backend-common)
 
@@ -72,6 +74,8 @@ if(OS_MAC)
   set(LAUFEY_SRCS_COMMON
     src/app.cc
     src/app.h
+    src/custom_schemes.cc
+    src/custom_schemes.h
     src/scheme_handler.cc
     src/scheme_handler.h
     src/runtime_loader.cc
@@ -80,11 +84,19 @@ if(OS_MAC)
   )
 
   set(LAUFEY_SRCS_MAC
+    src/drag_paths_mac.mm
     src/main_mac.mm
   )
 
+  # The helpers read the launch file's custom schemes (custom_schemes.cc ->
+  # launch_config.cc, which validates with data_dir.cc) without linking all of
+  # laufey_backend_common.
   set(LAUFEY_HELPER_SRCS
     src/helper.cc
+    src/custom_schemes.cc
+    src/custom_schemes.h
+    ../backend-common/src/launch_config.cc
+    ../backend-common/src/data_dir.cc
     ${LAUFEY_RENDERER_SRCS}
   )
 
@@ -147,7 +159,13 @@ if(OS_MAC)
     add_executable(${_helper_target} MACOSX_BUNDLE ${LAUFEY_HELPER_SRCS})
     SET_EXECUTABLE_TARGET_PROPERTIES(${_helper_target})
     target_link_libraries(${_helper_target} libcef_dll_wrapper ${CEF_STANDARD_LIBS})
-    target_include_directories(${_helper_target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${LAUFEY_INCLUDE_DIR}")
+    # backend-common/include for the scheme-name helpers and launch file
+    # reader used by custom_schemes.cc; the helper does not link
+    # laufey_backend_common (see LAUFEY_HELPER_SRCS).
+    target_include_directories(${_helper_target} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${LAUFEY_INCLUDE_DIR}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../backend-common/include")
     set_target_properties(${_helper_target} PROPERTIES
       MACOSX_BUNDLE_INFO_PLIST ${_helper_info_plist}
       OUTPUT_NAME ${_helper_output_name}
@@ -185,13 +203,17 @@ elseif(OS_WINDOWS)
   set(LAUFEY_SRCS_COMMON
     src/app.cc
     src/app.h
+    src/custom_schemes.cc
+    src/custom_schemes.h
     src/scheme_handler.cc
     src/scheme_handler.h
     src/runtime_loader.cc
+    src/views_menu.cc
     src/runtime_loader.h
   )
 
   set(LAUFEY_SRCS_WIN
+    src/drag_paths_win.cc
     src/main_windows.cc
     ${LAUFEY_RENDERER_SRCS}
   )
@@ -248,13 +270,17 @@ elseif(OS_LINUX)
   set(LAUFEY_SRCS_COMMON
     src/app.cc
     src/app.h
+    src/custom_schemes.cc
+    src/custom_schemes.h
     src/scheme_handler.cc
     src/scheme_handler.h
     src/runtime_loader.cc
+    src/views_menu.cc
     src/runtime_loader.h
   )
 
   set(LAUFEY_SRCS_LINUX
+    src/drag_paths_linux.cc
     src/main_linux.cc
     src/runtime_loader_linux.cc
     ${LAUFEY_RENDERER_SRCS}

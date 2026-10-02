@@ -2,14 +2,24 @@
 
 #include "runtime_loader.h"
 #include "laufey_backend_common.h"
+#include "laufey_io.h"
+#include "laufey_launch_config.h"
+#include "laufey_system.h"
+#include "laufey_single_instance.h"
 #include "laufey_json.h"
+#include "laufey_passkey.h"
+#include "laufey_scheme_registry.h"
+#include "laufey_window.h"
 #include "init_script.h"
+#include "wv2_scheme_stream.h"
 #include <win32_menu.h>
+#include "laufey_notifications.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <shellscalingapi.h>
 #include <wincodec.h>
 #include <wrl.h>
 
@@ -26,6 +36,7 @@
 
 #include <shlwapi.h>
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <map>
@@ -33,6 +44,9 @@
 #include <condition_variable>
 #include <vector>
 #include <functional>
+#include <thread>
+#include <algorithm>
+#include <cmath>
 
 using namespace Microsoft::WRL;
 
@@ -92,6 +106,14 @@ struct WinWindowState {
   bool webview_ready = false;
   std::wstring pending_url;
   std::wstring pending_title;
+  // LAUFEY_BACKDROP_* behind the page (API 38); not NONE means the client
+  // area is left unpainted and the web view background is transparent.
+  int backdrop = LAUFEY_BACKDROP_NONE;
+  // DevTools (API 40). WebView2 opens them in a top-level window of its
+  // browser process and has no API to close them or ask whether they are
+  // open, so the window open_devtools brought up is tracked.
+  UINT32 browser_pid = 0;
+  HWND devtools_hwnd = nullptr;
 };
 
 // Custom window message for UI tasks
@@ -103,8 +125,116 @@ struct UiTaskData {
 };
 
 // ============================================================================
-// Custom app:// scheme handling (in-process transport)
+// Window geometry units
 // ============================================================================
+//
+// Sizes, positions and size constraints cross the C ABI in DIP (CSS pixels at
+// the page's zoom 1), as on the other backends, and a window's size is its
+// client (page) area; get_outer_size is the whole frame. HWNDs work in
+// physical pixels (the process is per-monitor DPI aware), so a window's
+// geometry converts with its own DPI and a screen's with its monitor's.
+
+namespace {
+
+double WinWindowScale(HWND hwnd) {
+  UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 0;
+  return dpi ? dpi / 96.0 : 1.0;
+}
+
+double WinMonitorScale(HMONITOR monitor) {
+  UINT dpi_x = 96, dpi_y = 96;
+  if (!monitor ||
+      FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y)) ||
+      dpi_x == 0)
+    return 1.0;
+  return dpi_x / 96.0;
+}
+
+int WinToDip(LONG px, double scale) {
+  return static_cast<int>(std::lround(px / scale));
+}
+
+LONG WinToPx(int dip, double scale) {
+  return static_cast<LONG>(std::lround(dip * scale));
+}
+
+// The frame's physical size around a client area of `width` x `height`
+// physical pixels: the window's current frame (title bar, borders, a menu
+// bar however many rows it wraps to), or the style's frame while there is
+// no client area to measure (minimized).
+SIZE WinFrameForClient(HWND hwnd, LONG width, LONG height) {
+  RECT window_rect, client;
+  if (!IsIconic(hwnd) && GetWindowRect(hwnd, &window_rect) &&
+      GetClientRect(hwnd, &client) && client.right > 0 && client.bottom > 0) {
+    return {width + (window_rect.right - window_rect.left) - client.right,
+            height + (window_rect.bottom - window_rect.top) - client.bottom};
+  }
+  RECT r = {0, 0, width, height};
+  AdjustWindowRectExForDpi(
+      &r, static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)),
+      GetMenu(hwnd) != nullptr,
+      static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)),
+      GetDpiForWindow(hwnd));
+  return {r.right - r.left, r.bottom - r.top};
+}
+
+// Resizes `hwnd` so its client area is `width` x `height` DIP.
+void WinSetClientSize(HWND hwnd, int width, int height, UINT extra_flags) {
+  double scale = WinWindowScale(hwnd);
+  LONG cw = WinToPx(width, scale), ch = WinToPx(height, scale);
+  SIZE frame = WinFrameForClient(hwnd, cw, ch);
+  SetWindowPos(hwnd, nullptr, 0, 0, frame.cx, frame.cy,
+               SWP_NOMOVE | SWP_NOZORDER | extra_flags);
+  // A menu bar can wrap to another row at the new width; correct once.
+  RECT client;
+  if (!IsIconic(hwnd) && GetClientRect(hwnd, &client) &&
+      (client.right != cw || client.bottom != ch)) {
+    frame = WinFrameForClient(hwnd, cw, ch);
+    SetWindowPos(hwnd, nullptr, 0, 0, frame.cx, frame.cy,
+                 SWP_NOMOVE | SWP_NOZORDER | extra_flags);
+  }
+}
+
+// The frame (physical) around the client area while the window was last in
+// the normal state, for normal bounds of a maximized / fullscreen window.
+// UI thread only.
+std::map<HWND, SIZE>& WinNormalFrames() {
+  static std::map<HWND, SIZE> frames;
+  return frames;
+}
+
+void WinNoteNormalFrame(HWND hwnd) {
+  RECT window_rect, client;
+  if (GetWindowRect(hwnd, &window_rect) && GetClientRect(hwnd, &client) &&
+      client.right > 0 && client.bottom > 0) {
+    WinNormalFrames()[hwnd] = {
+        (window_rect.right - window_rect.left) - client.right,
+        (window_rect.bottom - window_rect.top) - client.bottom};
+  }
+}
+
+// A screen rectangle in its monitor's DIP.
+void WinScreenRectToDip(int* x, int* y, int* width, int* height) {
+  RECT r = {*x, *y, *x + *width, *y + *height};
+  double scale = WinMonitorScale(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST));
+  *x = WinToDip(r.left, scale);
+  *y = WinToDip(r.top, scale);
+  *width = WinToDip(r.right - r.left, scale);
+  *height = WinToDip(r.bottom - r.top, scale);
+}
+
+}  // namespace
+
+// ============================================================================
+// Custom URL scheme handling (in-process transport)
+// ============================================================================
+//
+// Serves "app" and every scheme the embedder registered through
+// register_scheme_handler. WebView2 learns custom schemes from
+// CoreWebView2CustomSchemeRegistration entries on the *environment options*,
+// so the set is fixed when the first window's environment is created (see
+// SchemesForEnvironment); each is TreatAsSecure (secure context,
+// `<scheme>://<host>` origin, per-origin storage) with an authority component.
 
 namespace {
 
@@ -119,167 +249,8 @@ std::wstring SchemeUtf8ToWide(const std::string& s) {
   return w;
 }
 
-std::string SchemeWideToUtf8(LPCWSTR s) {
-  if (!s)
-    return std::string();
-  int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
-  if (n <= 0)
-    return std::string();
-  std::string out(n - 1, '\0');
-  WideCharToMultiByte(CP_UTF8, 0, s, -1, &out[0], n, nullptr, nullptr);
-  return out;
-}
-
-// Buffered exchange: the response is collected, then a single
-// WebResourceResponse is created and the deferral completed on the UI thread.
-class WinSchemeExchange : public SchemeExchangeBase {
- public:
-  WinSchemeExchange(ComPtr<ICoreWebView2Environment> env,
-                    ComPtr<ICoreWebView2WebResourceRequestedEventArgs> args,
-                    ComPtr<ICoreWebView2Deferral> deferral,
-                    std::vector<uint8_t> request_body)
-      : env_(std::move(env)),
-        args_(std::move(args)),
-        deferral_(std::move(deferral)),
-        request_body_(std::move(request_body)) {}
-
-  intptr_t ReadRequestBody(uint8_t* buf, size_t cap) override {
-    if (cap == 0)
-      return 0;
-    size_t remaining = request_body_.size() - req_cursor_;
-    if (remaining == 0)
-      return 0;
-    size_t n = (std::min)(cap, remaining);
-    memcpy(buf, request_body_.data() + req_cursor_, n);
-    req_cursor_ += n;
-    return static_cast<intptr_t>(n);
-  }
-
-  void Begin(int status, const char* headers, size_t headers_len) override {
-    status_ = status;
-    headers_ = LaufeyParseFlatHeaders(headers, headers_len);
-  }
-
-  intptr_t WriteResponse(const uint8_t* buf, size_t len) override {
-    response_body_.insert(response_body_.end(), buf, buf + len);
-    return static_cast<intptr_t>(len);
-  }
-
-  void Finish() override {
-    // WebView2 objects are single-threaded; complete on the UI thread.
-    RuntimeLoader::GetInstance()->GetBackend()->PostUiTask(
-        &WinSchemeExchange::CompleteOnUi, this);
-  }
-
- private:
-  static void CompleteOnUi(void* data) {
-    auto* self = static_cast<WinSchemeExchange*>(data);
-    self->Complete();
-    delete self;
-  }
-
-  void Complete() {
-    ComPtr<IStream> stream;
-    stream.Attach(SHCreateMemStream(
-        response_body_.empty() ? nullptr : response_body_.data(),
-        static_cast<UINT>(response_body_.size())));
-    std::wstring headers_w;
-    for (const auto& [k, v] : headers_) {
-      headers_w += SchemeUtf8ToWide(k) + L": " + SchemeUtf8ToWide(v) + L"\r\n";
-    }
-    ComPtr<ICoreWebView2WebResourceResponse> response;
-    if (env_) {
-      env_->CreateWebResourceResponse(stream.Get(), status_, L"OK",
-                                      headers_w.c_str(), &response);
-      if (response)
-        args_->put_Response(response.Get());
-    }
-    deferral_->Complete();
-  }
-
-  ComPtr<ICoreWebView2Environment> env_;
-  ComPtr<ICoreWebView2WebResourceRequestedEventArgs> args_;
-  ComPtr<ICoreWebView2Deferral> deferral_;
-  std::vector<uint8_t> request_body_;
-  size_t req_cursor_ = 0;
-  int status_ = 200;
-  std::vector<std::pair<std::string, std::string>> headers_;
-  std::vector<uint8_t> response_body_;
-};
-
-HRESULT HandleAppResourceRequested(
-    ComPtr<ICoreWebView2Environment> env,
-    ICoreWebView2WebResourceRequestedEventArgs* args) {
-  // This runs inside a WebView2 COM event callback. A C++ exception unwinding
-  // back through WebView2's (non-EH) frames would reach std::terminate and
-  // crash the whole process — on Windows that surfaces as exit code
-  // 0xc0000409 (STATUS_STACK_BUFFER_OVERRUN). Contain everything here.
-  try {
-    ComPtr<ICoreWebView2WebResourceRequest> request;
-    if (FAILED(args->get_Request(&request)) || !request)
-      return S_OK;
-
-    LPWSTR uri_raw = nullptr;
-    request->get_Uri(&uri_raw);
-    LPWSTR method_raw = nullptr;
-    request->get_Method(&method_raw);
-    std::string url = SchemeWideToUtf8(uri_raw);
-    std::string method = method_raw ? SchemeWideToUtf8(method_raw) : "GET";
-    if (uri_raw)
-      CoTaskMemFree(uri_raw);
-    if (method_raw)
-      CoTaskMemFree(method_raw);
-
-    std::vector<std::pair<std::string, std::string>> headers;
-    ComPtr<ICoreWebView2HttpRequestHeaders> req_headers;
-    if (SUCCEEDED(request->get_Headers(&req_headers)) && req_headers) {
-      ComPtr<ICoreWebView2HttpHeadersCollectionIterator> it;
-      if (SUCCEEDED(req_headers->GetIterator(&it)) && it) {
-        BOOL has_current = FALSE;
-        while (SUCCEEDED(it->get_HasCurrentHeader(&has_current)) &&
-               has_current) {
-          LPWSTR name = nullptr;
-          LPWSTR value = nullptr;
-          if (SUCCEEDED(it->GetCurrentHeader(&name, &value))) {
-            headers.emplace_back(SchemeWideToUtf8(name),
-                                 SchemeWideToUtf8(value));
-            if (name)
-              CoTaskMemFree(name);
-            if (value)
-              CoTaskMemFree(value);
-          }
-          BOOL has_next = FALSE;
-          if (FAILED(it->MoveNext(&has_next)) || !has_next)
-            break;
-        }
-      }
-    }
-
-    std::vector<uint8_t> body;
-    ComPtr<IStream> content;
-    if (SUCCEEDED(request->get_Content(&content)) && content) {
-      uint8_t chunk[16 * 1024];
-      ULONG read = 0;
-      while (SUCCEEDED(content->Read(chunk, sizeof(chunk), &read)) &&
-             read > 0) {
-        body.insert(body.end(), chunk, chunk + read);
-      }
-    }
-
-    ComPtr<ICoreWebView2Deferral> deferral;
-    args->GetDeferral(&deferral);
-
-    std::string flat = LaufeyFlattenHeaders(headers);
-    // window_id is unused by the desktop bridge (single named channel).
-    auto* exchange =
-        new WinSchemeExchange(env, args, deferral, std::move(body));
-    RuntimeLoader::GetInstance()->DispatchSchemeRequest(0, exchange, method,
-                                                        url, flat);
-    return S_OK;
-  } catch (...) {
-    return S_OK;
-  }
-}
+// The exchange itself (buffered, or streamed through the page shim) lives in
+// wv2_scheme_stream.cc.
 
 }  // namespace
 
@@ -301,6 +272,10 @@ class WebView2Backend : public LaufeyBackend {
   void CloseWindow(uint32_t window_id) override;
 
   void Navigate(uint32_t window_id, const std::string& url) override;
+  // Record a scheme the embedder registered so the WebView2 environment
+  // registers it as a secure custom scheme, next to "app". Must be called
+  // before the first window: WebView2 fixes the set per environment.
+  void RegisterSchemeHandler(const std::string& scheme) override;
   void OpenExternalURL(const std::string& url) override;
   void SetTitle(uint32_t window_id, const std::string& title) override;
   void ExecuteJs(uint32_t window_id, const std::string& script,
@@ -308,8 +283,11 @@ class WebView2Backend : public LaufeyBackend {
   void Quit() override;
   void SetWindowSize(uint32_t window_id, int width, int height) override;
   void GetWindowSize(uint32_t window_id, int* width, int* height) override;
+  void GetWindowOuterSize(uint32_t window_id, int* width, int* height) override;
+  double GetWindowScaleFactor(uint32_t window_id) override;
   void SetWindowPosition(uint32_t window_id, int x, int y) override;
   void GetWindowPosition(uint32_t window_id, int* x, int* y) override;
+  void GetWindowInnerPosition(uint32_t window_id, int* x, int* y) override;
   void SetResizable(uint32_t window_id, bool resizable) override;
   bool IsResizable(uint32_t window_id) override;
   void SetAlwaysOnTop(uint32_t window_id, bool always_on_top) override;
@@ -322,7 +300,52 @@ class WebView2Backend : public LaufeyBackend {
   void Show(uint32_t window_id) override;
   void Hide(uint32_t window_id) override;
   void Focus(uint32_t window_id) override;
+
+  // Window state, constraints, screens and backdrop (API >= 38).
+  uint32_t WindowCapabilities() override;
+  void SetWindowState(uint32_t window_id, int action) override;
+  uint32_t GetWindowState(uint32_t window_id) override;
+  void SetWindowStateHandler(laufey_window_state_fn handler,
+                             void* user_data) override {
+    laufey_common::SetWindowStateHandler(handler, user_data);
+  }
+  void SetWindowSizeConstraints(uint32_t window_id, int min_width,
+                                int min_height, int max_width,
+                                int max_height) override;
+  void GetWindowSizeConstraints(uint32_t window_id, int* min_width,
+                                int* min_height, int* max_width,
+                                int* max_height) override;
+  size_t GetScreens(laufey_screen_t* out, size_t capacity) override {
+    // In each monitor's DIP (see "Window geometry units").
+    std::vector<laufey_screen_t> screens = laufey_common::WinGetScreens();
+    for (auto& s : screens) {
+      double k = s.scale_factor > 0 ? s.scale_factor : 1.0;
+      s.x = WinToDip(s.x, k);
+      s.y = WinToDip(s.y, k);
+      s.width = WinToDip(s.width, k);
+      s.height = WinToDip(s.height, k);
+      s.work_x = WinToDip(s.work_x, k);
+      s.work_y = WinToDip(s.work_y, k);
+      s.work_width = WinToDip(s.work_width, k);
+      s.work_height = WinToDip(s.work_height, k);
+    }
+    return laufey_common::CopyScreens(screens, out, capacity);
+  }
+  int64_t GetWindowScreen(uint32_t window_id) override;
+  void SetDisplayChangedHandler(laufey_display_changed_fn handler,
+                                void* user_data) override;
+  bool SetWindowBackdrop(uint32_t window_id, int backdrop,
+                         int material) override;
+  bool GetWindowNormalBounds(uint32_t window_id, int* x, int* y, int* width,
+                             int* height) override;
+  void SetQuitOnLastWindowClosed(bool quit) override {
+    laufey_common::SetQuitOnLastWindowClosed(quit);
+  }
   void PostUiTask(void (*task)(void*), void* data) override;
+  void SetSecondInstanceHandler(laufey_second_instance_fn handler,
+                                void* user_data) override {
+    laufey_common::SetSecondInstanceHandler(handler, user_data);
+  }
 
   void InvokeJsCallback(uint32_t window_id, uint64_t callback_id,
                         laufey::ValuePtr args) override;
@@ -349,6 +372,14 @@ class WebView2Backend : public LaufeyBackend {
   void PrintToPdf(uint32_t window_id, laufey_pdf_result_fn callback,
                   void* callback_data) override;
 
+  uint32_t PasskeyCapabilities() override {
+    return laufey_common::PasskeyCapabilitiesWin();
+  }
+  void PasskeyRequest(uint32_t window_id, uint32_t kind,
+                      const char* options_json,
+                      laufey_passkey_result_fn callback,
+                      void* user_data) override;
+
   int ShowDialog(uint32_t window_id, int dialog_type, const std::string& title,
                  const std::string& message, const std::string& default_value,
                  char** out_input_value) override;
@@ -359,6 +390,113 @@ class WebView2Backend : public LaufeyBackend {
   void WriteClipboardText(const std::string& text) override {
     laufey_common::ClipboardWriteTextWin(text);
   }
+
+  // Drag and drop, file dialogs, rich clipboard (API >= 39).
+  void SetFileDropHandler(laufey_file_drop_fn handler,
+                          void* user_data) override {
+    laufey_common::SetFileDropHandler(handler, user_data);
+  }
+  bool TestTriggerFileDrop(uint32_t window_id, int phase, double x, double y,
+                           const char* const* paths, size_t count) override {
+    // The page's drop messages are dispatched on the UI thread; so is this.
+    bool delivered = false;
+    RunOnUiThreadSync([&] {
+      delivered = laufey_common::TestTriggerFileDrop(window_id, phase, x, y,
+                                                     paths, count);
+    });
+    return delivered;
+  }
+  void StartFileDrag(uint32_t window_id, const char* const* paths, size_t count,
+                     const uint8_t* icon_png, size_t icon_len,
+                     laufey_drag_result_fn callback, void* user_data) override;
+  uint32_t ShowFileDialog(uint32_t window_id,
+                          const laufey_file_dialog_options_t* options,
+                          laufey_file_dialog_result_fn callback,
+                          void* user_data) override;
+  bool CancelFileDialog(uint32_t dialog_id) override {
+    return laufey_common::CancelFileDialogWin(dialog_id);
+  }
+  bool TestFileDialogRespond(int action, const char* path) override {
+    return laufey_common::TestFileDialogRespondWin(action, path);
+  }
+  uint32_t ClipboardCapabilities() override {
+    return laufey_common::ClipboardCapabilitiesWin();
+  }
+  char* ReadClipboardHtml() override {
+    return laufey_common::ClipboardReadHtmlWin();
+  }
+  bool WriteClipboardHtml(const std::string& html,
+                          const char* text_or_null) override {
+    return laufey_common::ClipboardWriteHtmlWin(html, text_or_null);
+  }
+  uint8_t* ReadClipboardImage(size_t* len_out) override {
+    return laufey_common::ClipboardReadImageWin(len_out);
+  }
+  bool WriteClipboardImage(const uint8_t* png, size_t len) override {
+    return laufey_common::ClipboardWriteImageWin(png, len);
+  }
+  char* ReadClipboardFormats() override {
+    return laufey_common::ClipboardReadFormatsWin();
+  }
+  void SetClipboardChangeHandler(laufey_clipboard_change_fn handler,
+                                 void* user_data) override {
+    laufey_common::SetClipboardChangeHandler(handler, user_data);
+  }
+
+  // Global shortcuts, launch at login, DevTools (API >= 40). RegisterHotKey
+  // runs on the UI thread (its hidden window lives there); the platform is
+  // installed on first use.
+  void EnsureShortcuts() {
+    std::call_once(shortcuts_once_, [this] {
+      laufey_common::InstallShortcutPlatform(
+          laufey_common::CreateShortcutPlatformWin(
+              [this](std::function<void()> task) {
+                RunOnUiThread(std::move(task));
+              }));
+    });
+  }
+  uint32_t SystemCapabilities() override {
+    EnsureShortcuts();
+    uint32_t caps =
+        laufey_common::ShortcutCapabilities() | LAUFEY_SYSTEM_CAP_DEVTOOLS;
+    if (laufey_common::GetLaunchAtLogin() != LAUFEY_LOGIN_ITEM_NOT_SUPPORTED)
+      caps |= LAUFEY_SYSTEM_CAP_LAUNCH_AT_LOGIN;
+    return caps;
+  }
+  void SetShortcutHandler(laufey_shortcut_fn handler,
+                          void* user_data) override {
+    laufey_common::SetShortcutHandler(handler, user_data);
+  }
+  void RegisterShortcut(const char* accelerator,
+                        laufey_shortcut_result_fn callback,
+                        void* user_data) override {
+    EnsureShortcuts();
+    laufey_common::RegisterShortcut(accelerator, callback, user_data);
+  }
+  bool UnregisterShortcut(const char* accelerator) override {
+    return laufey_common::UnregisterShortcut(accelerator);
+  }
+  void UnregisterAllShortcuts() override {
+    laufey_common::UnregisterAllShortcuts();
+  }
+  char* ListShortcuts() override {
+    return laufey_common::ListShortcuts();
+  }
+  char* CanonicalizeAccelerator(const char* accelerator) override {
+    return laufey_common::CanonicalizeAccelerator(accelerator);
+  }
+  bool TestTriggerShortcut(const char* accelerator) override {
+    return laufey_common::TestTriggerShortcut(accelerator);
+  }
+  int GetLaunchAtLogin() override {
+    return laufey_common::GetLaunchAtLogin();
+  }
+  int SetLaunchAtLogin(bool enabled, std::string* error) override {
+    return laufey_common::SetLaunchAtLogin(enabled, error);
+  }
+  void CloseDevTools(uint32_t window_id) override;
+  bool IsDevToolsOpen(uint32_t window_id) override;
+  bool IsDevToolsEnabled(uint32_t window_id) override;
 
   void BounceDock(int type) override;
   void SetDockBadge(const char* badge_or_null) override;
@@ -386,33 +524,82 @@ class WebView2Backend : public LaufeyBackend {
                             void* user_data) override;
   void CloseNotification(uint32_t notification_id) override;
 
-  // Shell_NotifyIcon balloons have no permission model — always granted.
+  // Toasts: the user's notification setting for the app (no prompt).
   void QueryPermission(int kind, laufey_permission_callback_fn cb,
                        void* user_data) override {
-    laufey_common::QueryPermissionStub(kind, cb, user_data);
+    laufey_common::QueryNotificationPermission(kind, cb, user_data);
   }
   void RequestPermission(int kind, laufey_permission_callback_fn cb,
                          void* user_data) override {
-    laufey_common::RequestPermissionStub(kind, cb, user_data);
+    laufey_common::RequestNotificationPermission(kind, cb, user_data);
   }
 
+  // Notifications and menus (API >= 41): backend-common.
+  uint32_t NotificationCapabilities() override {
+    return laufey_common::NotificationCapabilities();
+  }
+  void SetNotificationResponseHandler(laufey_notification_response_fn handler,
+                                      void* user_data) override {
+    laufey_common::SetNotificationResponseHandler(handler, user_data);
+  }
+  void ListScheduledNotifications(laufey_notification_list_fn cb,
+                                  void* user_data) override {
+    laufey_common::ListScheduledNotifications(cb, user_data);
+  }
+  void CancelNotification(const char* tag) override {
+    laufey_common::CancelNotification(tag);
+  }
+  bool TestNotificationRespond(const char* tag,
+                               const char* action_id) override {
+    return laufey_common::TestNotificationRespond(tag, action_id);
+  }
+  uint32_t MenuCapabilities() override {
+    return LAUFEY_MENU_CAP_APP_MENU | LAUFEY_MENU_CAP_ACCELERATORS |
+           LAUFEY_MENU_CAP_CONTEXT_MENU | LAUFEY_MENU_CAP_CONTEXT_CLOSED |
+           LAUFEY_MENU_CAP_ICONS;
+  }
+  void ShowContextMenuEx(uint32_t window_id, int x, int y,
+                         laufey_value_t* menu_template,
+                         const laufey_backend_api_t* api,
+                         laufey_menu_click_fn on_click, void* on_click_data,
+                         laufey_menu_closed_fn on_closed,
+                         void* on_closed_data) override;
+  bool TestDismissContextMenu() override {
+    return laufey_common::DismissOpenContextMenu();
+  }
+  bool TestTriggerMenuAccelerator(uint32_t window_id,
+                                  const char* accelerator) override;
+
   void HandleJsMessage(uint32_t window_id, const std::wstring& json);
+  // A message from the injected file-drop observer (see
+  // BuildFileDropScript): true if `message` was one (handled or refused),
+  // false if it is for the JS bridge.
+  bool HandleFileDropMessage(uint32_t window_id, const wchar_t* message,
+                             ICoreWebView2WebMessageReceivedEventArgs* args);
 
  private:
   WinWindowState* GetWindow(uint32_t window_id);
   void InitializeWebViewForWindow(uint32_t window_id, HWND hwnd);
-  // Creates the WebView2 environment for a window. When `with_app_scheme` is
-  // true the in-process "app://" custom scheme is registered; if that makes
-  // environment creation fail it retries once with the scheme disabled so the
-  // window still opens (only the app:// transport is lost).
+  // The custom schemes to register on a WebView2 environment. Every
+  // environment this process creates shares one user data folder, and
+  // WebView2 requires identical custom-scheme registrations across them
+  // (creation fails otherwise), so the registered-scheme set is frozen on the
+  // first call and reused for every later window. A RegisterSchemeHandler
+  // after that point is logged and has no effect — hence the contract to
+  // register schemes before the first window.
+  std::vector<std::string> SchemesForEnvironment();
+  // Creates the WebView2 environment for a window, registering `schemes`
+  // ("app" plus the embedder's) as secure custom schemes. If that makes
+  // environment creation fail it retries once with no custom schemes so the
+  // window still opens (only the in-process scheme transport is lost).
   void CreateEnvironmentForWindow(uint32_t window_id, HWND hwnd,
-                                  bool with_app_scheme);
+                                  std::vector<std::string> schemes);
   // Wires up the controller, init script, message + scheme handlers once the
-  // environment is ready. `app_scheme_enabled` reflects whether the "app://"
-  // scheme was registered on the environment.
+  // environment is ready. `schemes` are the custom schemes actually
+  // registered on the environment (empty after the fallback retry).
   void OnEnvironmentReady(uint32_t window_id, HWND hwnd,
                           ICoreWebView2Environment* env,
-                          bool app_scheme_enabled);
+                          std::vector<std::string> schemes);
   static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
                                      LPARAM lParam);
 
@@ -434,13 +621,24 @@ class WebView2Backend : public LaufeyBackend {
   void RunOnUiThreadSync(std::function<void()> task);
 
   std::map<uint32_t, WinWindowState> windows_;
+  std::once_flag shortcuts_once_;
+  // The window's DevTools window (tracked or, with one window per browser
+  // process, found by title), or null. Any thread.
+  HWND FindDevToolsWindow(uint32_t window_id);
   std::recursive_mutex windows_mutex_;
   bool class_registered_ = false;
+  // See SchemesForEnvironment.
+  std::mutex schemes_mutex_;
+  bool schemes_frozen_ = false;
+  std::vector<std::string> frozen_schemes_;
   // Thread that constructs the backend (== WinMain / the message-loop thread).
   DWORD ui_thread_id_ = 0;
   // Message-only window owned by the UI thread used to receive marshaled
   // tasks even before the first real window exists.
   HWND dispatcher_hwnd_ = nullptr;
+  // Random per process; the file-drop observer script carries it in its
+  // closure and the host drops observer-shaped messages without it.
+  std::string file_drop_token_;
 };
 
 LRESULT CALLBACK WebView2Backend::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
@@ -460,17 +658,68 @@ LRESULT CALLBACK WebView2Backend::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
         }
       }
       if (wid > 0) {
+        if (wParam == SIZE_RESTORED && !laufey_common::WinIsFullscreen(wid))
+          WinNoteNormalFrame(hwnd);
         RECT rect;
         GetClientRect(hwnd, &rect);
+        double scale = WinWindowScale(hwnd);
         RuntimeLoader::GetInstance()->DispatchResizeEvent(
-            wid, rect.right - rect.left, rect.bottom - rect.top);
+            wid, WinToDip(rect.right - rect.left, scale),
+            WinToDip(rect.bottom - rect.top, scale));
+        // SIZE_MAXIMIZED / SIZE_MINIMIZED / SIZE_RESTORED: one source of the
+        // window-state events (API 38); duplicates are dropped there.
+        laufey_common::ReportWindowState(
+            wid, laufey_common::WinGetWindowState(hwnd, wid));
       }
       return 0;
     }
+    case WM_GETMINMAXINFO:
+      // Size constraints (API 38) are client sizes in DIP, like
+      // set_window_size; Windows tracks the frame in physical pixels.
+      if (wid > 0) {
+        SIZE frame = WinFrameForClient(hwnd, 0, 0);
+        if (laufey_common::WinApplyMinMaxInfo(
+                reinterpret_cast<void*>(lParam),
+                laufey_common::GetSizeConstraints(wid), WinWindowScale(hwnd),
+                frame.cx, frame.cy)) {
+          return 0;
+        }
+      }
+      break;
+    case WM_DPICHANGED: {
+      // Moved to a monitor with another scale: take the size Windows
+      // suggests, which keeps the window's DIP size.
+      const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+      if (suggested) {
+        SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+      }
+      return 0;
+    }
+    case WM_ERASEBKGND:
+      // With a backdrop the client area must stay unpainted (black is
+      // transparent over an extended DWM frame) for it to show through.
+      if (g_win_backend && wid > 0) {
+        std::lock_guard<std::recursive_mutex> lock(
+            g_win_backend->windows_mutex_);
+        auto* state = g_win_backend->GetWindow(wid);
+        if (state && state->backdrop != LAUFEY_BACKDROP_NONE) {
+          RECT rect;
+          GetClientRect(hwnd, &rect);
+          FillRect(reinterpret_cast<HDC>(wParam), &rect,
+                   static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+          return 1;
+        }
+      }
+      break;
     case WM_MOVE:
       if (wid > 0) {
+        double scale = WinWindowScale(hwnd);
         RuntimeLoader::GetInstance()->DispatchMoveEvent(
-            wid, (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
+            wid, WinToDip((short)LOWORD(lParam), scale),
+            WinToDip((short)HIWORD(lParam), scale));
       }
       return 0;
     case WM_SETFOCUS:
@@ -515,8 +764,9 @@ LRESULT CALLBACK WebView2Backend::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
                        : LAUFEY_MOUSE_BUTTON_FORWARD;
           break;
       }
-      double x = static_cast<double>(GET_X_LPARAM(lParam));
-      double y = static_cast<double>(GET_Y_LPARAM(lParam));
+      double scale = WinWindowScale(hwnd);
+      double x = GET_X_LPARAM(lParam) / scale;
+      double y = GET_Y_LPARAM(lParam) / scale;
       uint32_t modifiers = keyboard::GetLaufeyModifiers();
       RuntimeLoader::GetInstance()->DispatchMouseClickEvent(wid, state, button,
                                                             x, y, modifiers, 1);
@@ -569,12 +819,24 @@ LRESULT CALLBACK WebView2Backend::WindowProc(HWND hwnd, UINT msg, WPARAM wParam,
         return 0;
       break;
     case WM_DESTROY: {
+      // A passkey dialog owned by this window ends with it (`cancelled`).
+      // Before the lock below: the result callback may re-enter the backend.
+      laufey_common::PasskeyWindowClosing(hwnd);
       // Single exit point for window teardown: fires for WM_CLOSE-initiated
       // closes and for CloseWindow()'s direct DestroyWindow alike, so a
       // deferred close resolved via close_window still quits the message
       // loop when the last window goes away.
+      if (wid > 0) {
+        laufey_common::ForgetWindow(wid);
+        laufey_wv2::CancelStreamsForWindow(wid);
+      }
+      WinNormalFrames().erase(hwnd);
+      win32_menu::ForgetWindow(hwnd);
       std::lock_guard<std::recursive_mutex> lock(g_hwnd_mutex);
-      if (g_hwnd_to_laufey_id.erase(hwnd) > 0 && g_hwnd_to_laufey_id.empty()) {
+      // A tray app can keep running with no window
+      // (set_quit_on_last_window_closed(false)); quit() ends it anyway.
+      if (g_hwnd_to_laufey_id.erase(hwnd) > 0 && g_hwnd_to_laufey_id.empty() &&
+          laufey_common::ShouldEndLoopAfterLastWindow()) {
         PostQuitMessage(0);
       }
       return 0;
@@ -617,6 +879,36 @@ WebView2Backend::WebView2Backend() {
   dispatcher_hwnd_ =
       CreateWindowExW(0, L"LaufeyWebView2", L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
                       nullptr, GetModuleHandle(nullptr), nullptr);
+
+  laufey_wv2::StreamHooks stream_hooks;
+  stream_hooks.run_on_ui = [this](std::function<void()> task) {
+    RunOnUiThread(std::move(task));
+  };
+  stream_hooks.post_json = [this](uint32_t window_id,
+                                  const std::wstring& json) {
+    std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    return state && state->webview &&
+           SUCCEEDED(state->webview->PostWebMessageAsJson(json.c_str()));
+  };
+  laufey_wv2::InitSchemeStreams(std::move(stream_hooks));
+
+  // backend-common's I/O thread (file dialogs, drag-out, clipboard change
+  // events; its own STA thread, see laufey_io.h).
+  laufey_common::WinIoInit();
+
+  // 256 random bits from two v4 GUIDs (CoCreateGuid draws them from the
+  // system RNG).
+  for (int i = 0; i < 2; i++) {
+    GUID g = {};
+    CoCreateGuid(&g);
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&g);
+    static const char kHex[] = "0123456789abcdef";
+    for (size_t k = 0; k < sizeof(g); k++) {
+      file_drop_token_ += kHex[b[k] >> 4];
+      file_drop_token_ += kHex[b[k] & 15];
+    }
+  }
 }
 
 void WebView2Backend::RunOnUiThread(std::function<void()> task) {
@@ -740,59 +1032,109 @@ void WebView2Backend::CreateWindowEx(uint32_t window_id, int width, int height,
   }
 }
 
-void WebView2Backend::InitializeWebViewForWindow(uint32_t window_id,
-                                                 HWND hwnd) {
-  // Try with the in-process "app://" custom scheme first. If registering it
-  // makes environment creation fail, CreateEnvironmentForWindow retries
-  // without it so the window still opens for ordinary http(s)/TCP navigations.
-  CreateEnvironmentForWindow(window_id, hwnd, /*with_app_scheme=*/true);
+void WebView2Backend::RegisterSchemeHandler(const std::string& scheme) {
+  // Any thread (the runtime registers from its own thread).
+  if (!laufey_common::IsValidSchemeName(scheme)) {
+    std::cerr << "laufey: ignoring invalid URL scheme name \"" << scheme
+              << "\" passed to register_scheme_handler" << std::endl;
+    return;
+  }
+  bool added = laufey_common::SchemeRegistry::GetInstance()->Add(scheme);
+  std::lock_guard<std::mutex> lock(schemes_mutex_);
+  if (added && schemes_frozen_) {
+    std::cerr << "laufey: scheme \"" << scheme
+              << "\" was registered after the first window was created; "
+                 "WebView2 fixes custom schemes when the environment is "
+                 "created, so it will not be served (register schemes "
+                 "before the first window)"
+              << std::endl;
+  }
 }
 
-void WebView2Backend::CreateEnvironmentForWindow(uint32_t window_id, HWND hwnd,
-                                                 bool with_app_scheme) {
+std::vector<std::string> WebView2Backend::SchemesForEnvironment() {
+  std::lock_guard<std::mutex> lock(schemes_mutex_);
+  if (!schemes_frozen_) {
+    frozen_schemes_ = laufey_common::SchemeRegistry::GetInstance()->Snapshot();
+    schemes_frozen_ = true;
+  }
+  return frozen_schemes_;
+}
+
+void WebView2Backend::InitializeWebViewForWindow(uint32_t window_id,
+                                                 HWND hwnd) {
+  // Try with the in-process custom schemes ("app" plus any the embedder
+  // registered) first. If registering them makes environment creation fail,
+  // CreateEnvironmentForWindow retries without them so the window still opens
+  // for ordinary http(s)/TCP navigations.
+  CreateEnvironmentForWindow(window_id, hwnd, SchemesForEnvironment());
+}
+
+void WebView2Backend::CreateEnvironmentForWindow(
+    uint32_t window_id, HWND hwnd, std::vector<std::string> schemes) {
   ComPtr<ICoreWebView2EnvironmentOptions> options;
-  if (with_app_scheme) {
-    // Register "app" as a secure custom scheme so the in-process scheme handler
-    // can serve top-level navigations to app:// like a normal origin.
+  // Keep the registration objects alive until the options have consumed
+  // them; SetCustomSchemeRegistrations takes an array of raw pointers.
+  std::vector<ComPtr<CoreWebView2CustomSchemeRegistration>> registrations;
+  if (!schemes.empty()) {
+    // Register each scheme as a secure custom scheme with an authority
+    // component so the in-process scheme handler can serve top-level
+    // navigations to <scheme>://<host>/ like a normal https origin:
+    // TreatAsSecure gives isSecureContext / crypto.subtle / per-origin
+    // storage, HasAuthorityComponent makes `<scheme>://<host>` the origin.
+    // AllowedOrigins is left empty: no other origin may fetch the custom
+    // scheme (pages served over it fetching http(s) origins are governed by
+    // those origins' CORS headers, as with any secure origin).
     auto opts = Make<CoreWebView2EnvironmentOptions>();
     ComPtr<ICoreWebView2EnvironmentOptions4> options4;
     if (SUCCEEDED(opts.As(&options4)) && options4) {
-      auto appScheme = Make<CoreWebView2CustomSchemeRegistration>(L"app");
-      appScheme->put_TreatAsSecure(TRUE);
-      appScheme->put_HasAuthorityComponent(TRUE);
-      ICoreWebView2CustomSchemeRegistration* registrations[] = {
-          appScheme.Get()};
-      options4->SetCustomSchemeRegistrations(1, registrations);
+      std::vector<ICoreWebView2CustomSchemeRegistration*> raw;
+      for (const std::string& scheme : schemes) {
+        std::wstring name = SchemeUtf8ToWide(scheme);
+        auto registration =
+            Make<CoreWebView2CustomSchemeRegistration>(name.c_str());
+        registration->put_TreatAsSecure(TRUE);
+        registration->put_HasAuthorityComponent(TRUE);
+        raw.push_back(registration.Get());
+        registrations.push_back(registration);
+      }
+      options4->SetCustomSchemeRegistrations(static_cast<UINT32>(raw.size()),
+                                             raw.data());
     }
     options = opts;
   }
 
+  // Per-app user data folder (LAUFEY_DATA_DIR / LAUFEY_APP_ID). Without one,
+  // pass nullptr to keep WebView2's default "<exe>.WebView2" next to the exe.
+  // Every window's environment must use the same folder.
+  static const std::wstring user_data_folder =
+      laufey_common::Utf8ToWide(laufey_common::AppDataSubdir("WebView2"));
+
   HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
-      nullptr, nullptr, options.Get(),
+      nullptr, user_data_folder.empty() ? nullptr : user_data_folder.c_str(),
+      options.Get(),
       Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-          [this, window_id, hwnd, with_app_scheme](
+          [this, window_id, hwnd, schemes](
               HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
             if (FAILED(result) || !env) {
-              if (with_app_scheme) {
-                // Registering a custom scheme can make environment creation
+              if (!schemes.empty()) {
+                // Registering custom schemes can make environment creation
                 // fail outright — e.g. when the (shared, exe-derived) user
                 // data folder was previously initialized with a different set
                 // of custom schemes, WebView2 returns an error instead of
-                // opening. Retry once without the scheme so the window still
-                // appears; only the in-process app:// transport is lost.
+                // opening. Retry once without them so the window still
+                // appears; only the in-process scheme transport is lost.
                 std::cerr << "WebView2 environment creation failed with the "
-                             "app:// scheme (hr=0x"
+                             "custom schemes (hr=0x"
                           << std::hex << result << std::dec
-                          << "), retrying without it" << std::endl;
-                CreateEnvironmentForWindow(window_id, hwnd,
-                                           /*with_app_scheme=*/false);
+                          << "), retrying without them" << std::endl;
+                CreateEnvironmentForWindow(window_id, hwnd, {});
                 return S_OK;
               }
               std::cerr << "Failed to create WebView2 environment (hr=0x"
                         << std::hex << result << std::dec << ")" << std::endl;
               return result;
             }
-            OnEnvironmentReady(window_id, hwnd, env, with_app_scheme);
+            OnEnvironmentReady(window_id, hwnd, env, schemes);
             return S_OK;
           })
           .Get());
@@ -805,11 +1147,11 @@ void WebView2Backend::CreateEnvironmentForWindow(uint32_t window_id, HWND hwnd,
 
 void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
                                          ICoreWebView2Environment* env,
-                                         bool app_scheme_enabled) {
+                                         std::vector<std::string> schemes) {
   env->CreateCoreWebView2Controller(
       hwnd,
       Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-          [this, window_id, hwnd, env, app_scheme_enabled](
+          [this, window_id, hwnd, env, schemes](
               HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
             if (FAILED(result) || !controller) {
               std::cerr << "Failed to create WebView2 controller" << std::endl;
@@ -823,11 +1165,46 @@ void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
 
             state->controller = controller;
             controller->get_CoreWebView2(&state->webview);
+            if (state->webview) {
+              state->webview->get_BrowserProcessId(&state->browser_pid);
+              // DevTools (API 40): F12, the context menu's Inspect and
+              // OpenDevToolsWindow all follow AreDevToolsEnabled, which
+              // follows LAUFEY_INSPECTABLE / "inspectable" (default on).
+              ComPtr<ICoreWebView2Settings> settings;
+              if (SUCCEEDED(state->webview->get_Settings(&settings)) &&
+                  settings) {
+                settings->put_AreDevToolsEnabled(
+                    laufey_common::LaunchInspectable() ? TRUE : FALSE);
+              }
+            }
 
             RECT bounds;
             GetClientRect(hwnd, &bounds);
             controller->put_Bounds(bounds);
             controller->put_IsVisible(TRUE);
+
+            // App menu accelerators while the page has the focus: its keys
+            // go to the browser process, never through Run()'s message loop,
+            // so the menu's accelerator table is matched here (API 41).
+            controller->add_AcceleratorKeyPressed(
+                Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+                    [hwnd](ICoreWebView2Controller*,
+                           ICoreWebView2AcceleratorKeyPressedEventArgs* args)
+                        -> HRESULT {
+                      COREWEBVIEW2_KEY_EVENT_KIND kind;
+                      UINT key = 0;
+                      if (FAILED(args->get_KeyEventKind(&kind)) ||
+                          FAILED(args->get_VirtualKey(&key)))
+                        return S_OK;
+                      if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN &&
+                          kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN)
+                        return S_OK;
+                      if (win32_menu::HandleAcceleratorKey(hwnd, key))
+                        args->put_Handled(TRUE);
+                      return S_OK;
+                    })
+                    .Get(),
+                nullptr);
 
             std::string initScript = BuildInitScript(
                 RuntimeLoader::GetInstance()->GetJsNamespace(),
@@ -839,6 +1216,34 @@ void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
             std::wstring wInitScript(initScript.begin(), initScript.end());
             state->webview->AddScriptToExecuteOnDocumentCreated(
                 wInitScript.c_str(), nullptr);
+
+            // The file-drop observer (API 39): reports file drags over the
+            // page to the host, the drop with its File objects, whose native
+            // paths WebView2 reveals to the host only (ICoreWebView2File).
+            // Its `send` posts with a per-process token kept in the closure.
+            std::string dropScript =
+                "(function () {\n"
+                "  var wv = window.chrome && window.chrome.webview;\n"
+                "  if (!wv || window.top !== window) return;\n"
+                "  var post = wv.postMessage;\n"
+                "  var postX = wv.postMessageWithAdditionalObjects;\n"
+                "  var call = Function.prototype.call;\n"
+                "  var token = '" +
+                file_drop_token_ +
+                "';\n"
+                "  (" +
+                laufey_common::BuildDomFileDropObserverScript() +
+                ")(function (p, x, y, n, files) {\n"
+                "    var m = '{\"__laufeyFileDrop\":\"' + token + "
+                "'\",\"p\":' + (p | 0) + ',\"x\":' + (+x || 0) + "
+                "',\"y\":' + (+y || 0) + ',\"n\":' + (n | 0) + '}';\n"
+                "    if (files && postX) call.call(postX, wv, m, files);\n"
+                "    else call.call(post, wv, m);\n"
+                "  });\n"
+                "})();\n";
+            std::wstring wDropScript(dropScript.begin(), dropScript.end());
+            state->webview->AddScriptToExecuteOnDocumentCreated(
+                wDropScript.c_str(), nullptr);
 
             uint32_t wid = window_id;
             state->webview->add_WebMessageReceived(
@@ -869,10 +1274,17 @@ void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
                         return S_OK;
                       }
 
-                      LPWSTR messageRaw;
+                      LPWSTR messageRaw = nullptr;
                       args->TryGetWebMessageAsString(&messageRaw);
                       if (messageRaw) {
-                        HandleJsMessage(wid, messageRaw);
+                        LPWSTR source = nullptr;
+                        args->get_Source(&source);
+                        if (!laufey_wv2::HandleStreamMessage(wid, messageRaw,
+                                                             source) &&
+                            !HandleFileDropMessage(wid, messageRaw, args))
+                          HandleJsMessage(wid, messageRaw);
+                        if (source)
+                          CoTaskMemFree(source);
                         CoTaskMemFree(messageRaw);
                       }
                       return S_OK;
@@ -905,25 +1317,71 @@ void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
                     .Get(),
                 nullptr);
 
-            // In-process app:// scheme: intercept requests and
-            // bridge them to the runtime's memory transport. Only
-            // wired up when the "app" scheme was actually registered
-            // on the environment — otherwise an app:// filter would
-            // never fire and the handler is dead weight.
-            if (app_scheme_enabled) {
+            // In-process custom schemes: intercept requests for each
+            // registered scheme and bridge them to the runtime's memory
+            // transport (one handler; the runtime dispatches on the URL).
+            // Only wired up for schemes actually registered on the
+            // environment — otherwise the filter would never fire and the
+            // handler is dead weight.
+            if (!schemes.empty()) {
+              // Streams fetch / EventSource / XHR responses on these schemes
+              // to the page; see wv2_scheme_stream.h.
+              std::wstring shim = SchemeUtf8ToWide(
+                  laufey_wv2::BuildSchemeStreamShimScript(schemes));
+              state->webview->AddScriptToExecuteOnDocumentCreated(shim.c_str(),
+                                                                  nullptr);
               ComPtr<ICoreWebView2Environment> envPtr = env;
-              state->webview->AddWebResourceRequestedFilter(
-                  L"app://*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+              for (const std::string& scheme : schemes) {
+                std::wstring filter = SchemeUtf8ToWide(scheme) + L"://*";
+                state->webview->AddWebResourceRequestedFilter(
+                    filter.c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+              }
               EventRegistrationToken schemeToken;
               state->webview->add_WebResourceRequested(
                   Callback<ICoreWebView2WebResourceRequestedEventHandler>(
-                      [envPtr](ICoreWebView2* sender,
-                               ICoreWebView2WebResourceRequestedEventArgs* args)
-                          -> HRESULT {
-                        return HandleAppResourceRequested(envPtr, args);
+                      [envPtr, wid](ICoreWebView2* sender,
+                                    ICoreWebView2WebResourceRequestedEventArgs*
+                                        args) -> HRESULT {
+                        return laufey_wv2::HandleSchemeRequest(envPtr.Get(),
+                                                               args, wid);
                       })
                       .Get(),
                   &schemeToken);
+              // The streams of a document end with it: at the commit of the
+              // main-frame navigation that replaces it, or with its renderer.
+              state->webview->add_NavigationStarting(
+                  Callback<ICoreWebView2NavigationStartingEventHandler>(
+                      [wid](ICoreWebView2*,
+                            ICoreWebView2NavigationStartingEventArgs* args)
+                          -> HRESULT {
+                        UINT64 nav = 0;
+                        args->get_NavigationId(&nav);
+                        laufey_wv2::OnNavigationStarting(wid, nav);
+                        return S_OK;
+                      })
+                      .Get(),
+                  nullptr);
+              state->webview->add_ContentLoading(
+                  Callback<ICoreWebView2ContentLoadingEventHandler>(
+                      [wid](ICoreWebView2*,
+                            ICoreWebView2ContentLoadingEventArgs* args)
+                          -> HRESULT {
+                        UINT64 nav = 0;
+                        args->get_NavigationId(&nav);
+                        laufey_wv2::OnNavigationCommitted(wid, nav);
+                        return S_OK;
+                      })
+                      .Get(),
+                  nullptr);
+              state->webview->add_ProcessFailed(
+                  Callback<ICoreWebView2ProcessFailedEventHandler>(
+                      [wid](ICoreWebView2*,
+                            ICoreWebView2ProcessFailedEventArgs*) -> HRESULT {
+                        laufey_wv2::CancelStreamsForWindow(wid);
+                        return S_OK;
+                      })
+                      .Get(),
+                  nullptr);
             }
 
             state->webview->add_ScriptDialogOpening(
@@ -940,39 +1398,38 @@ void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
                       if (messageRaw)
                         CoTaskMemFree(messageRaw);
 
+                      // The page's text is shown as text (ShowDialogWin
+                      // never hands it to a shell), modal to this window.
+                      std::string msg = laufey_common::WideToUtf8(message);
                       if (kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT) {
-                        MessageBoxW(hwnd, message.c_str(), L"Alert",
-                                    MB_OK | MB_ICONINFORMATION);
+                        laufey_common::ShowDialogWin(LAUFEY_DIALOG_ALERT,
+                                                     "Alert", msg, "", nullptr,
+                                                     hwnd);
                         args->Accept();
                       } else if (kind ==
                                  COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM) {
-                        int result =
-                            MessageBoxW(hwnd, message.c_str(), L"Confirm",
-                                        MB_OKCANCEL | MB_ICONQUESTION);
-                        if (result == IDOK) {
+                        if (laufey_common::ShowDialogWin(LAUFEY_DIALOG_CONFIRM,
+                                                         "Confirm", msg, "",
+                                                         nullptr, hwnd)) {
                           args->Accept();
                         }
                       } else if (kind ==
                                  COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT) {
-                        // For prompt, we need a custom dialog. Use a
-                        // simple approach with TaskDialog-style
-                        // input. WebView2 doesn't have a built-in way
-                        // to show prompt with input, so we accept
-                        // with the default.
                         LPWSTR defaultTextRaw = nullptr;
                         args->get_DefaultText(&defaultTextRaw);
                         std::wstring defaultText =
                             defaultTextRaw ? defaultTextRaw : L"";
                         if (defaultTextRaw)
                           CoTaskMemFree(defaultTextRaw);
-
-                        // Use a simple MessageBox for now — accept
-                        // with default text
-                        int result =
-                            MessageBoxW(hwnd, message.c_str(), L"Prompt",
-                                        MB_OKCANCEL | MB_ICONQUESTION);
-                        if (result == IDOK) {
-                          args->put_ResultText(defaultText.c_str());
+                        char* input = nullptr;
+                        if (laufey_common::ShowDialogWin(
+                                LAUFEY_DIALOG_PROMPT, "Prompt", msg,
+                                laufey_common::WideToUtf8(defaultText), &input,
+                                hwnd)) {
+                          std::wstring result =
+                              laufey_common::Utf8ToWide(input ? input : "");
+                          free(input);
+                          args->put_ResultText(result.c_str());
                           args->Accept();
                         }
                       } else if (kind ==
@@ -1121,6 +1578,13 @@ void WebView2Backend::ExecuteJs(uint32_t window_id, const std::string& script,
 }
 
 void WebView2Backend::Quit() {
+  laufey_common::MarkQuitting();
+  // PostQuitMessage posts to the CALLING thread's queue; the loop to end is
+  // the UI thread's.
+  if (GetCurrentThreadId() != ui_thread_id_) {
+    PostThreadMessageW(ui_thread_id_, WM_QUIT, 0, 0);
+    return;
+  }
   PostQuitMessage(0);
 }
 
@@ -1141,9 +1605,19 @@ void WebView2Backend::SetWindowSize(uint32_t window_id, int width, int height) {
   std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
   auto* state = GetWindow(window_id);
   if (state) {
-    SetWindowPos(state->hwnd, nullptr, 0, 0, width, height,
-                 SWP_NOMOVE | SWP_NOZORDER);
+    // SetWindowPos ignores WM_GETMINMAXINFO; clamp to the constraints here.
+    laufey_common::ClampSizeForWindow(window_id, &width, &height);
+    WinSetClientSize(state->hwnd, width, height, 0);
   }
+}
+
+double WebView2Backend::GetWindowScaleFactor(uint32_t window_id) {
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  if (!state)
+    return 1.0;
+  UINT dpi = GetDpiForWindow(state->hwnd);
+  return dpi > 0 ? dpi / 96.0 : 1.0;
 }
 
 void WebView2Backend::GetWindowSize(uint32_t window_id, int* width,
@@ -1152,11 +1626,28 @@ void WebView2Backend::GetWindowSize(uint32_t window_id, int* width,
   auto* state = GetWindow(window_id);
   if (state) {
     RECT rect;
-    if (GetWindowRect(state->hwnd, &rect)) {
+    if (GetClientRect(state->hwnd, &rect)) {
+      double scale = WinWindowScale(state->hwnd);
       if (width)
-        *width = rect.right - rect.left;
+        *width = WinToDip(rect.right, scale);
       if (height)
-        *height = rect.bottom - rect.top;
+        *height = WinToDip(rect.bottom, scale);
+    }
+  }
+}
+
+void WebView2Backend::GetWindowOuterSize(uint32_t window_id, int* width,
+                                         int* height) {
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  if (state) {
+    RECT rect;
+    if (GetWindowRect(state->hwnd, &rect)) {
+      double scale = WinWindowScale(state->hwnd);
+      if (width)
+        *width = WinToDip(rect.right - rect.left, scale);
+      if (height)
+        *height = WinToDip(rect.bottom - rect.top, scale);
     }
   }
 }
@@ -1170,7 +1661,25 @@ void WebView2Backend::SetWindowPosition(uint32_t window_id, int x, int y) {
   std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
   auto* state = GetWindow(window_id);
   if (state) {
-    SetWindowPos(state->hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    double scale = WinWindowScale(state->hwnd);
+    SetWindowPos(state->hwnd, nullptr, WinToPx(x, scale), WinToPx(y, scale), 0,
+                 0, SWP_NOSIZE | SWP_NOZORDER);
+  }
+}
+
+void WebView2Backend::GetWindowInnerPosition(uint32_t window_id, int* x,
+                                             int* y) {
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  if (!state)
+    return;
+  POINT pt = {0, 0};
+  if (ClientToScreen(state->hwnd, &pt)) {
+    double scale = WinWindowScale(state->hwnd);
+    if (x)
+      *x = WinToDip(pt.x, scale);
+    if (y)
+      *y = WinToDip(pt.y, scale);
   }
 }
 
@@ -1180,10 +1689,11 @@ void WebView2Backend::GetWindowPosition(uint32_t window_id, int* x, int* y) {
   if (state) {
     RECT rect;
     if (GetWindowRect(state->hwnd, &rect)) {
+      double scale = WinWindowScale(state->hwnd);
       if (x)
-        *x = rect.left;
+        *x = WinToDip(rect.left, scale);
       if (y)
-        *y = rect.top;
+        *y = WinToDip(rect.top, scale);
     }
   }
 }
@@ -1388,6 +1898,305 @@ void WebView2Backend::Focus(uint32_t window_id) {
   }
 }
 
+// --- Window state, constraints, screens and backdrop (API >= 38) ---
+//
+// The HWND work is laufey_common's (window_win.cc, shared with CEF). Sizes
+// and positions here are this backend's: outer window pixels.
+
+uint32_t WebView2Backend::WindowCapabilities() {
+  return LAUFEY_WINDOW_CAP_STATE | LAUFEY_WINDOW_CAP_STATE_EVENTS |
+         LAUFEY_WINDOW_CAP_SIZE_CONSTRAINTS | LAUFEY_WINDOW_CAP_SCREENS |
+         LAUFEY_WINDOW_CAP_DISPLAY_EVENTS | LAUFEY_WINDOW_CAP_NORMAL_BOUNDS |
+         LAUFEY_WINDOW_CAP_KEEP_ALIVE | LAUFEY_WINDOW_CAP_SET_POSITION |
+         laufey_common::WinBackdropCapabilities() |
+         // API 39. WebView2 shows the host the dropped files' paths only on
+         // the drop (ICoreWebView2File), so ENTER / OVER carry the count.
+         LAUFEY_WINDOW_CAP_FILE_DROP | LAUFEY_WINDOW_CAP_FILE_DRAG_OUT |
+         LAUFEY_WINDOW_CAP_FILE_DIALOGS | LAUFEY_WINDOW_CAP_FILE_DIALOG_MODAL;
+}
+
+// ---------------------------------------------------------------------------
+// Drag and drop, file dialogs (API >= 39)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Reads `"key":<number>` from the observer's message (which the script
+// builds itself, so the shape is fixed).
+bool ReadNumberField(const wchar_t* msg, const wchar_t* key, double* out) {
+  const wchar_t* at = wcsstr(msg, key);
+  if (!at)
+    return false;
+  at += wcslen(key);
+  wchar_t* end = nullptr;
+  double v = wcstod(at, &end);
+  if (end == at)
+    return false;
+  *out = v;
+  return true;
+}
+
+}  // namespace
+
+bool WebView2Backend::HandleFileDropMessage(
+    uint32_t window_id, const wchar_t* message,
+    ICoreWebView2WebMessageReceivedEventArgs* args) {
+  static const wchar_t kPrefix[] = L"{\"__laufeyFileDrop\":\"";
+  size_t prefix_len = wcslen(kPrefix);
+  if (wcsncmp(message, kPrefix, prefix_len) != 0)
+    return false;
+  // Refuse (but swallow) anything without this process's token: page script
+  // can post observer-shaped messages, but can't read the token.
+  std::wstring token(file_drop_token_.begin(), file_drop_token_.end());
+  const wchar_t* t = message + prefix_len;
+  if (wcsncmp(t, token.c_str(), token.size()) != 0 || t[token.size()] != L'"')
+    return true;
+  double phase = -1, x = 0, y = 0, n = 0;
+  if (!ReadNumberField(message, L"\"p\":", &phase) ||
+      !ReadNumberField(message, L"\"x\":", &x) ||
+      !ReadNumberField(message, L"\"y\":", &y) ||
+      !ReadNumberField(message, L"\"n\":", &n))
+    return true;
+  int p = static_cast<int>(phase);
+  if (p < LAUFEY_DRAG_ENTER || p > LAUFEY_DRAG_DROP || n < 0)
+    return true;
+  std::vector<std::string> paths;
+  if (p == LAUFEY_DRAG_DROP) {
+    // The dropped File objects, as WebView2 hands them to the host with their
+    // native paths.
+    ComPtr<ICoreWebView2WebMessageReceivedEventArgs2> args2;
+    ComPtr<ICoreWebView2ObjectCollectionView> objects;
+    if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&args2))) &&
+        SUCCEEDED(args2->get_AdditionalObjects(&objects)) && objects) {
+      UINT32 count = 0;
+      objects->get_Count(&count);
+      for (UINT32 i = 0; i < count && paths.size() < LAUFEY_MAX_DROP_PATHS;
+           i++) {
+        ComPtr<IUnknown> item;
+        ComPtr<ICoreWebView2File> file;
+        if (FAILED(objects->GetValueAtIndex(i, &item)) || !item ||
+            FAILED(item.As(&file)))
+          continue;
+        LPWSTR path = nullptr;
+        if (SUCCEEDED(file->get_Path(&path)) && path) {
+          if (path[0])
+            paths.push_back(laufey_common::WideToUtf8(path));
+          CoTaskMemFree(path);
+        }
+      }
+    }
+  }
+  laufey_common::DispatchFileDrop(window_id, p, x, y, paths,
+                                  static_cast<size_t>(n));
+  return true;
+}
+
+void WebView2Backend::StartFileDrag(uint32_t window_id,
+                                    const char* const* paths, size_t count,
+                                    const uint8_t* icon_png, size_t icon_len,
+                                    laufey_drag_result_fn callback,
+                                    void* user_data) {
+  auto* req = new laufey_common::DragOutRequest();
+  req->callback = callback;
+  req->user_data = user_data;
+  HWND hwnd = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+    if (auto* state = GetWindow(window_id))
+      hwnd = state->hwnd;
+  }
+  if (!hwnd || !laufey_common::ValidateDragPaths(paths, count, &req->paths)) {
+    req->Finish(LAUFEY_DRAG_RESULT_FAILED);
+    delete req;
+    return;
+  }
+  if (icon_png && icon_len > 0)
+    req->icon_png.assign(icon_png, icon_png + icon_len);
+  // RunDrag re-checks the HWND (IsWindow) on the UI thread.
+  laufey_common::StartFileDragWin(hwnd, req);
+}
+
+uint32_t WebView2Backend::ShowFileDialog(
+    uint32_t window_id, const laufey_file_dialog_options_t* options,
+    laufey_file_dialog_result_fn callback, void* user_data) {
+  laufey_common::ParentResolver parent;
+  if (window_id != 0) {
+    parent = [this, window_id]() -> void* {
+      std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      return state ? state->hwnd : nullptr;
+    };
+  }
+  return laufey_common::ShowFileDialogWin(std::move(parent), options, callback,
+                                          user_data);
+}
+
+void WebView2Backend::SetWindowState(uint32_t window_id, int action) {
+  if (GetCurrentThreadId() != ui_thread_id_) {
+    RunOnUiThread(
+        [this, window_id, action] { SetWindowState(window_id, action); });
+    return;
+  }
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  if (state)
+    laufey_common::WinSetWindowState(state->hwnd, window_id, action);
+}
+
+uint32_t WebView2Backend::GetWindowState(uint32_t window_id) {
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  return state ? laufey_common::WinGetWindowState(state->hwnd, window_id) : 0;
+}
+
+void WebView2Backend::SetWindowSizeConstraints(uint32_t window_id,
+                                               int min_width, int min_height,
+                                               int max_width, int max_height) {
+  laufey_common::SetSizeConstraints(window_id, min_width, min_height, max_width,
+                                    max_height);
+  RunOnUiThread([this, window_id] {
+    std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state || IsZoomed(state->hwnd) || IsIconic(state->hwnd) ||
+        laufey_common::WinIsFullscreen(window_id))
+      return;
+    RECT rect;
+    if (!GetClientRect(state->hwnd, &rect))
+      return;
+    double scale = WinWindowScale(state->hwnd);
+    int w = WinToDip(rect.right, scale);
+    int h = WinToDip(rect.bottom, scale);
+    // A window outside its new range is brought into it.
+    if (laufey_common::ClampSizeForWindow(window_id, &w, &h))
+      WinSetClientSize(state->hwnd, w, h, SWP_NOACTIVATE);
+  });
+}
+
+void WebView2Backend::GetWindowSizeConstraints(uint32_t window_id,
+                                               int* min_width, int* min_height,
+                                               int* max_width,
+                                               int* max_height) {
+  laufey_common::SizeConstraints c =
+      laufey_common::GetSizeConstraints(window_id);
+  if (min_width)
+    *min_width = c.min_width;
+  if (min_height)
+    *min_height = c.min_height;
+  if (max_width)
+    *max_width = c.max_width;
+  if (max_height)
+    *max_height = c.max_height;
+}
+
+int64_t WebView2Backend::GetWindowScreen(uint32_t window_id) {
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  return state ? laufey_common::WinScreenForWindow(state->hwnd) : 0;
+}
+
+void WebView2Backend::SetDisplayChangedHandler(
+    laufey_display_changed_fn handler, void* user_data) {
+  laufey_common::SetDisplayChangedHandler(handler, user_data);
+  if (handler)
+    RunOnUiThread([] { laufey_common::WinInstallDisplayWatcher(); });
+}
+
+bool WebView2Backend::SetWindowBackdrop(uint32_t window_id, int backdrop,
+                                        int /*material*/) {
+  bool ok = false;
+  RunOnUiThreadSync([&] {
+    std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state || !laufey_common::WinSetBackdrop(state->hwnd, backdrop))
+      return;
+    state->backdrop = backdrop;
+    // The web view paints white by default; a transparent default lets a
+    // page with a transparent background show the backdrop.
+    ComPtr<ICoreWebView2Controller2> controller2;
+    if (state->controller && SUCCEEDED(state->controller.As(&controller2)) &&
+        controller2) {
+      COREWEBVIEW2_COLOR color = {255, 255, 255, 255};
+      if (backdrop != LAUFEY_BACKDROP_NONE)
+        color = {0, 0, 0, 0};
+      controller2->put_DefaultBackgroundColor(color);
+    }
+    ok = true;
+  });
+  return ok;
+}
+
+bool WebView2Backend::GetWindowNormalBounds(uint32_t window_id, int* x, int* y,
+                                            int* width, int* height) {
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  int px = 0, py = 0, pw = 0, ph = 0;
+  if (!state || !laufey_common::WinGetNormalRect(state->hwnd, window_id, &px,
+                                                 &py, &pw, &ph))
+    return false;
+  // The frame's origin (get_position) and the client size inside it
+  // (get_size), the frame being the one the window had while normal.
+  SIZE frame;
+  auto it = WinNormalFrames().find(state->hwnd);
+  if (it != WinNormalFrames().end()) {
+    frame = it->second;
+  } else {
+    RECT r = {0, 0, 0, 0};
+    AdjustWindowRectExForDpi(
+        &r, static_cast<DWORD>(GetWindowLongPtrW(state->hwnd, GWL_STYLE)),
+        GetMenu(state->hwnd) != nullptr,
+        static_cast<DWORD>(GetWindowLongPtrW(state->hwnd, GWL_EXSTYLE)),
+        GetDpiForWindow(state->hwnd));
+    frame = {r.right - r.left, r.bottom - r.top};
+  }
+  double scale = WinWindowScale(state->hwnd);
+  if (x)
+    *x = WinToDip(px, scale);
+  if (y)
+    *y = WinToDip(py, scale);
+  if (width)
+    *width = WinToDip((std::max)(0L, pw - frame.cx), scale);
+  if (height)
+    *height = WinToDip((std::max)(0L, ph - frame.cy), scale);
+  return true;
+}
+
+void WebView2Backend::PasskeyRequest(uint32_t window_id, uint32_t kind,
+                                     const char* options_json,
+                                     laufey_passkey_result_fn callback,
+                                     void* user_data) {
+  // Any thread. Refusals (no webauthn.dll, invalid options, busy) answer
+  // here, synchronously; a started ceremony resolves its window on the UI
+  // thread and then runs on its own worker thread (PasskeyStartWin).
+  if (laufey_common::PasskeyCapabilitiesWin() == 0) {
+    laufey_common::PasskeyReportNotSupported(callback, user_data);
+    return;
+  }
+  std::shared_ptr<laufey_common::PasskeyCeremony> ceremony =
+      laufey_common::PasskeyBegin(kind, options_json, callback, user_data);
+  if (!ceremony)
+    return;
+  RunOnUiThread([this, window_id, ceremony] {
+    HWND hwnd = nullptr;
+    bool found = window_id == 0;
+    if (window_id != 0) {
+      std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+      if (auto* state = GetWindow(window_id)) {
+        hwnd = state->hwnd;
+        found = hwnd != nullptr;
+      }
+    }
+    if (!found) {
+      ceremony->Finish(laufey_common::PasskeyErrorEnvelope(
+          laufey_common::kPasskeyUnknown,
+          "window " + std::to_string(window_id) + " not found"));
+      return;
+    }
+    // nullptr: the foreground window when it is ours, else our first visible
+    // window (see PasskeyStartWin).
+    laufey_common::PasskeyStartWin(ceremony, hwnd);
+  });
+}
+
 void WebView2Backend::PostUiTask(void (*task)(void*), void* data) {
   // Always deliverable: the message-only dispatcher window exists from
   // construction, so this works even before the first real window is created
@@ -1469,6 +2278,10 @@ void WebView2Backend::RespondToJsCall(uint32_t window_id, uint64_t call_id,
 void WebView2Backend::Run() {
   MSG msg;
   while (GetMessage(&msg, nullptr, 0, 0)) {
+    // App menu accelerators while a host window (not the page) has the
+    // focus; the page's keys arrive through AcceleratorKeyPressed.
+    if (win32_menu::TranslateWindowAccelerator(&msg))
+      continue;
     TranslateMessage(&msg);
     DispatchMessage(&msg);
   }
@@ -1516,16 +2329,23 @@ void WebView2Backend::SetApplicationMenu(uint32_t window_id,
                                          void* on_click_data) {
   if (!menu_template)
     return;
-  // SetMenu/DrawMenuBar message the window's owning (UI) thread synchronously
-  // (deadlock if called here while holding windows_mutex_ — see the
-  // window-state mutators above). Marshal SYNCHRONOUSLY because
-  // `menu_template` is caller-owned and only guaranteed to outlive this call.
+  // Parsed here: `menu_template` is caller-owned and only guaranteed to
+  // outlive this call. SetMenu/DrawMenuBar message the window's owning (UI)
+  // thread synchronously (deadlock if called here while holding
+  // windows_mutex_ — see the window-state mutators above).
+  auto entries = std::make_shared<std::vector<laufey_common::MenuEntry>>(
+      laufey_common::ParseMenuTemplate(menu_template, api, false));
   RunOnUiThreadSync([&] {
-    std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
-    auto* state = GetWindow(window_id);
-    if (state && state->hwnd) {
-      win32_menu::SetApplicationMenu(state->hwnd, menu_template, api, on_click,
-                                     on_click_data, window_id);
+    HWND hwnd = nullptr;
+    {
+      std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      if (state)
+        hwnd = state->hwnd;
+    }
+    if (hwnd) {
+      win32_menu::SetApplicationMenu(hwnd, *entries, on_click, on_click_data,
+                                     window_id);
     }
   });
 }
@@ -1541,34 +2361,192 @@ void WebView2Backend::ShowContextMenu(uint32_t window_id, int x, int y,
                                       void* on_click_data) {
   if (!menu_template)
     return;
-  // TrackPopupMenu only works on the window's owning (UI) thread, and the
-  // call was already blocking (the popup runs a modal loop). Marshal
-  // SYNCHRONOUSLY: `menu_template` is caller-owned and only guaranteed to
-  // outlive this call.
-  RunOnUiThreadSync([&] {
-    std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
-    auto* state = GetWindow(window_id);
-    if (state && state->hwnd) {
-      win32_menu::ShowContextMenu(state->hwnd, x, y, menu_template, api,
-                                  on_click, on_click_data, window_id);
+  ShowContextMenuEx(window_id, x, y, menu_template, api, on_click,
+                    on_click_data, nullptr, nullptr);
+}
+
+void WebView2Backend::ShowContextMenuEx(uint32_t window_id, int x, int y,
+                                        laufey_value_t* menu_template,
+                                        const laufey_backend_api_t* api,
+                                        laufey_menu_click_fn on_click,
+                                        void* on_click_data,
+                                        laufey_menu_closed_fn on_closed,
+                                        void* on_closed_data) {
+  // Parsed here (the template is the caller's only for this call), shown on
+  // the UI thread: TrackPopupMenu runs a modal loop there until the menu
+  // closes, which this call doesn't wait for.
+  auto entries = std::make_shared<std::vector<laufey_common::MenuEntry>>(
+      laufey_common::ParseMenuTemplate(menu_template, api, false));
+  RunOnUiThread([this, window_id, x, y, entries, on_click, on_click_data,
+                 on_closed, on_closed_data] {
+    HWND hwnd = nullptr;
+    {
+      std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      if (state)
+        hwnd = state->hwnd;
     }
+    // (x, y) is in window (client) DIP; the menu takes client pixels.
+    double scale = hwnd ? WinWindowScale(hwnd) : 1.0;
+    win32_menu::ShowContextMenu(hwnd, WinToPx(x, scale), WinToPx(y, scale),
+                                *entries, on_click, on_click_data, window_id,
+                                on_closed, on_closed_data);
   });
+}
+
+bool WebView2Backend::TestTriggerMenuAccelerator(uint32_t window_id,
+                                                 const char* accelerator) {
+  bool fired = false;
+  RunOnUiThreadSync([&] {
+    HWND hwnd = nullptr;
+    {
+      std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      if (state)
+        hwnd = state->hwnd;
+    }
+    fired = win32_menu::TestTriggerAccelerator(hwnd, accelerator);
+  });
+  return fired;
 }
 
 // ============================================================================
 // DevTools
 // ============================================================================
 
+namespace {
+
+// The visible top-level windows of process `pid` titled "DevTools..." (the
+// title Chromium gives a DevTools window: "DevTools - <page>").
+std::vector<HWND> DevToolsWindowsOf(DWORD pid) {
+  struct Scan {
+    DWORD pid;
+    std::vector<HWND> found;
+  } scan{pid, {}};
+  if (!pid)
+    return scan.found;
+  EnumWindows(
+      [](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* sc = reinterpret_cast<Scan*>(lp);
+        DWORD owner = 0;
+        GetWindowThreadProcessId(hwnd, &owner);
+        if (owner != sc->pid || !IsWindowVisible(hwnd))
+          return TRUE;
+        wchar_t title[16] = {};
+        int n = GetWindowTextW(hwnd, title, 16);
+        if (n >= 8 && wcsncmp(title, L"DevTools", 8) == 0)
+          sc->found.push_back(hwnd);
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&scan));
+  return scan.found;
+}
+
+bool IsDevToolsWindowOf(HWND hwnd, DWORD pid) {
+  if (!hwnd || !IsWindow(hwnd))
+    return false;
+  for (HWND h : DevToolsWindowsOf(pid)) {
+    if (h == hwnd)
+      return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 void WebView2Backend::OpenDevTools(uint32_t window_id) {
+  if (!laufey_common::LaunchInspectable())
+    return;
   if (GetCurrentThreadId() != ui_thread_id_) {
     RunOnUiThread([this, window_id] { OpenDevTools(window_id); });
     return;
   }
   std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
   auto* state = GetWindow(window_id);
-  if (state && state->webview) {
-    state->webview->OpenDevToolsWindow();
+  if (!state || !state->webview)
+    return;
+  DWORD pid = static_cast<DWORD>(state->browser_pid);
+  std::vector<HWND> before = DevToolsWindowsOf(pid);
+  state->webview->OpenDevToolsWindow();
+  // The window appears asynchronously (or, when this view's DevTools are
+  // already open, the existing one comes to the front): find it and remember
+  // it, for close_devtools / is_devtools_open.
+  std::thread([this, window_id, pid, before] {
+    HWND found = nullptr;
+    for (int i = 0; i < 100 && !found; i++) {
+      Sleep(50);
+      for (HWND h : DevToolsWindowsOf(pid)) {
+        if (std::find(before.begin(), before.end(), h) == before.end()) {
+          found = h;
+          break;
+        }
+      }
+      if (!found && i >= 10) {
+        HWND fg = GetForegroundWindow();
+        if (IsDevToolsWindowOf(fg, pid))
+          found = fg;
+      }
+    }
+    if (!found)
+      return;
+    std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+    if (auto* st = GetWindow(window_id))
+      st->devtools_hwnd = found;
+  }).detach();
+}
+
+HWND WebView2Backend::FindDevToolsWindow(uint32_t window_id) {
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  if (!state || !state->browser_pid)
+    return nullptr;
+  DWORD pid = static_cast<DWORD>(state->browser_pid);
+  if (IsDevToolsWindowOf(state->devtools_hwnd, pid))
+    return state->devtools_hwnd;
+  state->devtools_hwnd = nullptr;
+  // Opened some other way (F12, the context menu): attributable to this
+  // view only when no other window shares its browser process.
+  int sharing = 0;
+  for (auto& [wid, other] : windows_) {
+    if (other.browser_pid == state->browser_pid)
+      sharing++;
   }
+  if (sharing != 1)
+    return nullptr;
+  std::vector<HWND> found = DevToolsWindowsOf(pid);
+  return found.empty() ? nullptr : found.front();
+}
+
+void WebView2Backend::CloseDevTools(uint32_t window_id) {
+  HWND hwnd = FindDevToolsWindow(window_id);
+  if (!hwnd)
+    return;
+  // The DevTools window belongs to the browser process; closing it is what
+  // its own close button does.
+  PostMessageW(hwnd, WM_CLOSE, 0, 0);
+  std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+  if (auto* state = GetWindow(window_id))
+    state->devtools_hwnd = nullptr;
+}
+
+bool WebView2Backend::IsDevToolsOpen(uint32_t window_id) {
+  return FindDevToolsWindow(window_id) != nullptr;
+}
+
+bool WebView2Backend::IsDevToolsEnabled(uint32_t window_id) {
+  if (window_id == 0)
+    return laufey_common::LaunchInspectable();
+  BOOL enabled = FALSE;
+  RunOnUiThreadSync([&] {
+    std::lock_guard<std::recursive_mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state || !state->webview)
+      return;
+    ComPtr<ICoreWebView2Settings> settings;
+    if (SUCCEEDED(state->webview->get_Settings(&settings)) && settings)
+      settings->get_AreDevToolsEnabled(&enabled);
+  });
+  return enabled != FALSE;
 }
 
 void WebView2Backend::PrintToPdf(uint32_t window_id,
@@ -1709,7 +2687,12 @@ void WebView2Backend::SetDockBadge(const char* badge_or_null) {
 
 uint32_t WebView2Backend::CreateTrayIcon() {
   uint32_t tray_id = laufey_common::CreateTrayIconWin();
-  laufey_common::FinalizeTrayIconWin(tray_id);
+  // The tray's hidden window must belong to the thread that pumps
+  // messages (this backend's UI thread): created on the caller's thread --
+  // the runtime's, which never pumps -- it received no clicks or menu
+  // requests at all, which is what made a tray-only app (no visible window)
+  // unusable (denoland/deno#36778). CEF already finalizes on its UI thread.
+  RunOnUiThreadSync([tray_id] { laufey_common::FinalizeTrayIconWin(tray_id); });
   return tray_id;
 }
 void WebView2Backend::DestroyTrayIcon(uint32_t tray_id) {
@@ -1726,7 +2709,19 @@ void WebView2Backend::SetTrayIconDark(uint32_t tray_id, const void* png_bytes,
 
 bool WebView2Backend::GetTrayIconBounds(uint32_t tray_id, int* x, int* y,
                                         int* width, int* height) {
-  return laufey_common::GetTrayIconBoundsWin(tray_id, x, y, width, height);
+  int px = 0, py = 0, pw = 0, ph = 0;
+  if (!laufey_common::GetTrayIconBoundsWin(tray_id, &px, &py, &pw, &ph))
+    return false;
+  WinScreenRectToDip(&px, &py, &pw, &ph);
+  if (x)
+    *x = px;
+  if (y)
+    *y = py;
+  if (width)
+    *width = pw;
+  if (height)
+    *height = ph;
+  return true;
 }
 void WebView2Backend::SetTrayDoubleClickHandler(uint32_t tray_id,
                                                 laufey_tray_click_fn handler,
@@ -1754,18 +2749,18 @@ void WebView2Backend::SetTrayClickHandler(uint32_t tray_id,
 // Notifications (WebView2 Windows)
 // ============================================================================
 //
-// Thin trampoline over backend-common/src/notifications_win.cc.
+// Thin trampolines over backend-common (laufey_notifications.h: toasts).
 
 uint32_t WebView2Backend::ShowNotification(
     laufey_value_t* options, const laufey_backend_api_t* api,
     laufey_notification_event_fn on_event, void* user_data) {
   laufey_common::NotificationOptions opts =
       laufey_common::ParseNotificationOptions(options, api);
-  return laufey_common::ShowNotificationWin(opts, on_event, user_data);
+  return laufey_common::ShowNotification(opts, on_event, user_data);
 }
 
 void WebView2Backend::CloseNotification(uint32_t notification_id) {
-  laufey_common::CloseNotificationWin(notification_id);
+  laufey_common::CloseNotification(notification_id);
 }
 
 // ============================================================================

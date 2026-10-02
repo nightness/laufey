@@ -2,7 +2,20 @@
 
 #include "runtime_loader.h"
 #include "app.h"
+#include "custom_schemes.h"
 #include "laufey_backend_common.h"
+#include "laufey_io.h"
+#include "laufey_launch_config.h"
+#include "laufey_menu.h"
+#include "laufey_notifications.h"
+#include "laufey_passkey.h"
+#include "laufey_auth_session.h"
+#include "laufey_ui_tasks.h"
+#include "laufey_scheme_registry.h"
+#include "laufey_single_instance.h"
+#include "laufey_sync_call.h"
+#include "laufey_system.h"
+#include "laufey_window.h"
 #include "scheme_handler.h"
 
 #ifndef _WIN32
@@ -16,6 +29,12 @@
 #include <mach-o/dyld.h>
 #endif
 
+#ifdef __linux__
+#include <gtk/gtk.h>
+#endif
+
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
@@ -31,6 +50,7 @@
 #include "include/cef_registration.h"
 #include "include/cef_task.h"
 #include "include/views/cef_browser_view.h"
+#include "include/views/cef_display.h"
 #include "include/views/cef_window.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
@@ -131,28 +151,26 @@ void ConfigureWin32WindowAsPanel(void* hwnd_ptr) {
 
 // Helper to run a callback synchronously on the CEF UI thread.
 // If already on the UI thread, runs immediately.
+//
+// `call` lives in this frame and Done() is the UI task's last access to it:
+// Done() notifies under the lock, since the waiter returns (destroying `call`)
+// as soon as it sees the call complete. A notify after the unlock corrupted
+// the next wait on macOS, which then never woke (the e2e hung in screens())
+// or crashed. See laufey_sync_call.h.
 template <typename F>
 static void cef_invoke_sync(F&& fn) {
   if (CefCurrentlyOn(TID_UI)) {
     fn();
     return;
   }
-  std::mutex mtx;
-  std::condition_variable cv;
-  bool done = false;
+  laufey_common::SyncCall call;
   CefPostTask(TID_UI, base::BindOnce(
-                          [](F* fn, std::mutex* mtx,
-                             std::condition_variable* cv, bool* done) {
+                          [](F* fn, laufey_common::SyncCall* call) {
                             (*fn)();
-                            {
-                              std::lock_guard<std::mutex> lock(*mtx);
-                              *done = true;
-                            }
-                            cv->notify_one();
+                            call->Done();
                           },
-                          &fn, &mtx, &cv, &done));
-  std::unique_lock<std::mutex> lock(mtx);
-  cv.wait(lock, [&done] { return done; });
+                          &fn, &call));
+  call.Wait();
 }
 
 // --- Backend API functions (cross-platform, using CEF Views) ---
@@ -232,12 +250,64 @@ static void Backend_ExecuteJs(void* data, uint32_t window_id,
                   browser, eval_id, script_str));
 }
 
+// Ends the loop the way closing the last window does: every browser is
+// closed (marked close-allowed, so no close-requested negotiation) and
+// LaufeyHandler::OnBeforeClose ends the loop when the last one is gone. With
+// no window open the loop ends right away. Quitting the loop directly with
+// live browsers would leave CEF to shut down under them; and on macOS the
+// loop is [NSApp run], which CefQuitMessageLoop does not stop.
 static void Backend_Quit(void* data) {
-  CefPostTask(TID_UI, base::BindOnce([]() { CefQuitMessageLoop(); }));
+  laufey_common::MarkQuitting();
+  CefPostTask(TID_UI, base::BindOnce([]() {
+                auto* loader = RuntimeLoader::GetInstance();
+                std::vector<CefRefPtr<CefBrowser>> browsers =
+                    loader->GetAllBrowsers();
+                if (browsers.empty()) {
+                  LaufeyQuitMainLoop();
+                  return;
+                }
+                for (const auto& browser : browsers) {
+                  uint32_t wid = loader->GetLaufeyIdForBrowser(browser);
+                  if (wid > 0)
+                    loader->MarkCloseAllowed(wid);
+                  browser->GetHost()->CloseBrowser(true);
+                }
+              }));
+}
+
+// Window sizes are the page area, the browser view (as window.innerWidth /
+// innerHeight see it), in DIP; CefWindow's size is the whole window, so the
+// frame around the page is added when resizing. UI thread.
+static CefSize CefFrameAroundPage(CefRefPtr<CefBrowserView> browser_view) {
+  CefRefPtr<CefWindow> window = browser_view->GetWindow();
+  if (!window)
+    return CefSize();
+  CefSize outer = window->GetSize();
+  CefSize page = browser_view->GetSize();
+  if (page.width <= 0 || page.height <= 0) {
+    // Not laid out yet: the client area is what the page will fill.
+    CefRect client = window->GetClientAreaBoundsInScreen();
+    page = CefSize(client.width, client.height);
+  }
+  if (page.width <= 0 || page.height <= 0)
+    return CefSize();
+  return CefSize((std::max)(0, outer.width - page.width),
+                 (std::max)(0, outer.height - page.height));
+}
+
+static void CefSetPageSize(CefRefPtr<CefBrowserView> browser_view, int width,
+                           int height) {
+  CefRefPtr<CefWindow> window = browser_view->GetWindow();
+  if (!window)
+    return;
+  CefSize frame = CefFrameAroundPage(browser_view);
+  window->SetSize(CefSize(width + frame.width, height + frame.height));
 }
 
 static void Backend_SetWindowSize(void* data, uint32_t window_id, int width,
                                   int height) {
+  // Programmatic resizes are clamped to the size constraints (API 38).
+  laufey_common::ClampSizeForWindow(window_id, &width, &height);
   RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
   CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
   if (browser) {
@@ -245,12 +315,8 @@ static void Backend_SetWindowSize(void* data, uint32_t window_id, int width,
                             [](CefRefPtr<CefBrowser> b, int w, int h) {
                               auto browser_view =
                                   CefBrowserView::GetForBrowser(b);
-                              if (browser_view) {
-                                auto window = browser_view->GetWindow();
-                                if (window) {
-                                  window->SetSize(CefSize(w, h));
-                                }
-                              }
+                              if (browser_view)
+                                CefSetPageSize(browser_view, w, h);
                             },
                             browser, width, height));
   }
@@ -264,14 +330,53 @@ static void Backend_GetWindowSize(void* data, uint32_t window_id, int* width,
   if (browser) {
     cef_invoke_sync([&] {
       auto browser_view = CefBrowserView::GetForBrowser(browser);
-      if (browser_view) {
-        auto window = browser_view->GetWindow();
-        if (window) {
-          CefSize size = window->GetSize();
-          w = size.width;
-          h = size.height;
-        }
+      auto window = browser_view ? browser_view->GetWindow() : nullptr;
+      if (window) {
+        CefSize outer = window->GetSize();
+        CefSize frame = CefFrameAroundPage(browser_view);
+        w = (std::max)(0, outer.width - frame.width);
+        h = (std::max)(0, outer.height - frame.height);
       }
+    });
+  }
+  if (width)
+    *width = w;
+  if (height)
+    *height = h;
+}
+
+static void Backend_GetWindowOuterSize(void* data, uint32_t window_id,
+                                       int* width, int* height) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
+  int w = 0, h = 0;
+  if (browser) {
+    cef_invoke_sync([&] {
+      auto browser_view = CefBrowserView::GetForBrowser(browser);
+      if (!browser_view)
+        return;
+      auto window = browser_view->GetWindow();
+      if (!window)
+        return;
+#ifdef _WIN32
+      // The window rectangle in DIP, like CefWindow::GetPosition.
+      HWND hwnd = window->GetWindowHandle();
+      RECT rect;
+      UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 0;
+      if (hwnd && dpi && GetWindowRect(hwnd, &rect)) {
+        w = static_cast<int>(
+            std::lround((rect.right - rect.left) * 96.0 / dpi));
+        h = static_cast<int>(
+            std::lround((rect.bottom - rect.top) * 96.0 / dpi));
+        return;
+      }
+#elif defined(__APPLE__)
+      if (GetNSWindowOuterSize(window->GetWindowHandle(), &w, &h))
+        return;
+#endif
+      CefSize size = window->GetSize();
+      w = size.width;
+      h = size.height;
     });
   }
   if (width)
@@ -315,6 +420,27 @@ static void Backend_GetWindowPosition(void* data, uint32_t window_id, int* x,
           px = pos.x;
           py = pos.y;
         }
+      }
+    });
+  }
+  if (x)
+    *x = px;
+  if (y)
+    *y = py;
+}
+
+static void Backend_GetWindowInnerPosition(void* data, uint32_t window_id,
+                                           int* x, int* y) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
+  int px = 0, py = 0;
+  if (browser) {
+    cef_invoke_sync([&] {
+      auto browser_view = CefBrowserView::GetForBrowser(browser);
+      if (browser_view) {
+        CefRect bounds = browser_view->GetBoundsInScreen();
+        px = bounds.x;
+        py = bounds.y;
       }
     });
   }
@@ -501,6 +627,26 @@ static double Backend_GetWindowOpacity(void* data, uint32_t window_id) {
 #elif defined(__linux__)
       result = GetLinuxWindowOpacity(window->GetWindowHandle());
 #endif
+    });
+  }
+  return result;
+}
+
+static double Backend_GetWindowScaleFactor(void* data, uint32_t window_id) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
+  double result = 1.0;
+  if (browser) {
+    cef_invoke_sync([&] {
+      auto browser_view = CefBrowserView::GetForBrowser(browser);
+      if (!browser_view)
+        return;
+      auto window = browser_view->GetWindow();
+      if (!window)
+        return;
+      auto display = window->GetDisplay();
+      if (display)
+        result = display->GetDeviceScaleFactor();
     });
   }
   return result;
@@ -713,6 +859,180 @@ static void Backend_PostUiTask(void* data, void (*task)(void*),
     CefPostTask(TID_UI, base::BindOnce([](void (*t)(void*), void* d) { t(d); },
                                        task, task_data));
   }
+}
+
+static void Backend_SetSecondInstanceHandler(void* /*data*/,
+                                             laufey_second_instance_fn handler,
+                                             void* user_data) {
+  laufey_common::SetSecondInstanceHandler(handler, user_data);
+}
+
+// --- Passkeys (API >= 37) ---
+//
+// macOS and Windows run real ceremonies (backend-common passkey_mac.mm /
+// passkey_win.cc); Linux has no platform API and answers not_supported.
+
+static uint32_t Backend_PasskeyCapabilities(void* /*data*/) {
+#if defined(__APPLE__)
+  return laufey_common::PasskeyCapabilitiesMac();
+#elif defined(_WIN32)
+  return laufey_common::PasskeyCapabilitiesWin();
+#else
+  return 0;
+#endif
+}
+
+static void Backend_PasskeyRequest(void* data, uint32_t window_id,
+                                   uint32_t kind, const char* options_json,
+                                   laufey_passkey_result_fn callback,
+                                   void* user_data) {
+  // Any thread. Refusals (no API, invalid options, busy) answer here,
+  // synchronously; a started ceremony resolves its window on TID_UI (the
+  // main thread on macOS).
+  if (!callback)
+    return;
+  if (Backend_PasskeyCapabilities(data) == 0) {
+    laufey_common::PasskeyReportNotSupported(callback, user_data);
+    return;
+  }
+#if defined(__APPLE__) || defined(_WIN32)
+  std::shared_ptr<laufey_common::PasskeyCeremony> ceremony =
+      laufey_common::PasskeyBegin(kind, options_json, callback, user_data);
+  if (!ceremony)
+    return;
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  CefRefPtr<CefBrowser> browser =
+      window_id != 0 ? loader->GetBrowserForWindow(window_id) : nullptr;
+  if (window_id != 0 && !browser) {
+    ceremony->Finish(laufey_common::PasskeyErrorEnvelope(
+        laufey_common::kPasskeyUnknown,
+        "window " + std::to_string(window_id) + " not found"));
+    return;
+  }
+  CefPostTask(TID_UI,
+              base::BindOnce(
+                  [](CefRefPtr<CefBrowser> b,
+                     std::shared_ptr<laufey_common::PasskeyCeremony> c) {
+                    void* native = nullptr;
+                    if (b) {
+                      auto browser_view = CefBrowserView::GetForBrowser(b);
+                      auto window =
+                          browser_view ? browser_view->GetWindow() : nullptr;
+                      if (!window) {
+                        c->Finish(laufey_common::PasskeyErrorEnvelope(
+                            laufey_common::kPasskeyUnknown,
+                            "the window has no native handle"));
+                        return;
+                      }
+#if defined(__APPLE__)
+                      native = NSWindowForCefHandle(window->GetWindowHandle());
+#else
+                      native =
+                          reinterpret_cast<void*>(window->GetWindowHandle());
+#endif
+                    }
+    // nullptr: the key / foreground window of the app.
+#if defined(__APPLE__)
+                    laufey_common::PasskeyStartMac(c, native);
+#else
+                    laufey_common::PasskeyStartWin(c, native);
+#endif
+                  },
+                  browser, ceremony));
+#else
+  (void)data;
+  (void)window_id;
+  (void)kind;
+  (void)options_json;
+#endif
+}
+
+// --- UI-thread tasks (API >= 42) ---
+//
+// The UI thread is CEF's TID_UI (the process main thread, which runs
+// CefRunMessageLoop / [NSApp run]); RuntimeLoader::Load binds it.
+
+static void Backend_DispatchUiTask(void* /*data*/, laufey_ui_task_fn task,
+                                   void* task_data) {
+  laufey_common::UiTaskDispatcher::Get().Dispatch(task, task_data);
+}
+
+static bool Backend_IsUiThread(void* /*data*/) {
+  return laufey_common::UiTaskDispatcher::Get().IsUiThread();
+}
+
+// --- Auth session (API >= 42) ---
+//
+// macOS runs ASWebAuthenticationSession (backend-common
+// auth_session_mac.mm); Windows and Linux have no OS auth session and
+// answer not_supported (RFC 8252: the embedder opens the system browser).
+
+static uint32_t Backend_AuthSessionCapabilities(void* /*data*/) {
+  return laufey_common::AuthSessionCapabilities();
+}
+
+static void Backend_AuthSessionStart(void* data, uint32_t window_id,
+                                     const char* url, const char* callback,
+                                     uint32_t flags,
+                                     laufey_auth_session_result_fn on_result,
+                                     void* user_data) {
+  // Any thread. Refusals answer here, synchronously; a started session
+  // resolves its window on TID_UI (the main thread on macOS).
+  std::shared_ptr<laufey_common::AuthSession> session =
+      laufey_common::AuthSessionBegin(laufey_common::AuthSessionCapabilities(),
+                                      url, callback, flags, on_result,
+                                      user_data);
+  if (!session)
+    return;
+#if defined(__APPLE__)
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  CefRefPtr<CefBrowser> browser =
+      window_id != 0 ? loader->GetBrowserForWindow(window_id) : nullptr;
+  if (window_id != 0 && !browser) {
+    session->Finish(LAUFEY_AUTH_SESSION_INVALID,
+                    "window " + std::to_string(window_id) + " not found");
+    return;
+  }
+  bool posted = CefPostTask(
+      TID_UI, base::BindOnce(
+                  [](CefRefPtr<CefBrowser> b,
+                     std::shared_ptr<laufey_common::AuthSession> s) {
+                    void* native = nullptr;
+                    if (b) {
+                      auto browser_view = CefBrowserView::GetForBrowser(b);
+                      auto window =
+                          browser_view ? browser_view->GetWindow() : nullptr;
+                      if (!window) {
+                        s->Finish(LAUFEY_AUTH_SESSION_INVALID,
+                                  "the window has no native handle");
+                        return;
+                      }
+                      native = NSWindowForCefHandle(window->GetWindowHandle());
+                    }
+                    // nullptr: the key / main window of the app.
+                    laufey_common::AuthSessionStartMac(s, native);
+                  },
+                  browser, session));
+  if (!posted) {
+    session->Finish(LAUFEY_AUTH_SESSION_CANCELLED, "the app is quitting");
+  }
+#else
+  // AuthSessionBegin refused it: the capabilities are 0 here.
+  (void)data;
+  (void)window_id;
+#endif
+}
+
+static bool Backend_TestCancelAuthSession(void* /*data*/) {
+  return laufey_common::AuthSessionCancelCurrent(
+      "the user cancelled the sign-in");
+}
+
+// API >= 43: the app cancels the running session (no session runs off
+// macOS, so it answers false there).
+static bool Backend_AuthSessionCancel(void* /*data*/) {
+  return laufey_common::AuthSessionCancelCurrent(
+      "the app cancelled the sign-in");
 }
 
 // --- CefValue <-> laufey::Value conversion (IPC boundary only) ---
@@ -1023,9 +1343,14 @@ static void Backend_ReleaseJsCallback(void* data, uint64_t callback_id) {
 // --- Platform-specific menu (stub on Windows, implemented in runtime_loader.mm
 // on macOS) ---
 
+#if defined(_WIN32) || defined(__linux__)
 #if defined(_WIN32)
 #include <win32_menu.h>
+#endif
+#include "views_menu.h"
 
+// The application menu is a CEF Views menu bar on Windows and Linux (see
+// views_menu.h): a native menu bar can't be attached to a Views window.
 static void Backend_SetApplicationMenu(void* data, uint32_t window_id,
                                        laufey_value_t* menu_template,
                                        laufey_menu_click_fn on_click,
@@ -1033,23 +1358,72 @@ static void Backend_SetApplicationMenu(void* data, uint32_t window_id,
   if (!menu_template)
     return;
   RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
-  const laufey_backend_api_t* api = &loader->GetBackendApi();
-
+  // Parsed here: the template is the caller's only for this call.
+  std::vector<laufey_common::MenuEntry> entries =
+      laufey_common::ParseMenuTemplate(menu_template, &loader->GetBackendApi(),
+                                       false);
   CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
-  if (browser) {
-    CefPostTask(
-        TID_UI,
-        base::BindOnce(
-            [](CefRefPtr<CefBrowser> b, uint32_t wid, laufey_value_t* tmpl,
-               const laufey_backend_api_t* a, laufey_menu_click_fn fn,
-               void* d) {
-              HWND hwnd = b->GetHost()->GetWindowHandle();
-              if (hwnd) {
-                win32_menu::SetApplicationMenu(hwnd, tmpl, a, fn, d, wid);
-              }
-            },
-            browser, window_id, menu_template, api, on_click, on_click_data));
+  if (!browser)
+    return;
+  CefPostTask(
+      TID_UI,
+      base::BindOnce(
+          [](CefRefPtr<CefBrowser> b, uint32_t wid,
+             std::vector<laufey_common::MenuEntry> items,
+             laufey_menu_click_fn fn, void* d) {
+            CefRefPtr<CefBrowserView> view = CefBrowserView::GetForBrowser(b);
+            CefRefPtr<CefWindow> window = view ? view->GetWindow() : nullptr;
+            laufey_cef_menu::SetApplicationMenu(window, view, wid,
+                                                std::move(items), fn, d);
+          },
+          browser, window_id, std::move(entries), on_click, on_click_data));
+}
+
+// A context menu: Win32's TrackPopupMenu on Windows (native look and item
+// icons), a CEF Views menu on Linux (there is no GtkWindow to anchor a GTK
+// menu to).
+static void ShowCefContextMenu(RuntimeLoader* loader, uint32_t window_id, int x,
+                               int y,
+                               std::vector<laufey_common::MenuEntry> entries,
+                               laufey_menu_click_fn on_click,
+                               void* on_click_data,
+                               laufey_menu_closed_fn on_closed,
+                               void* on_closed_data) {
+  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
+  if (!browser || entries.empty()) {
+    laufey_common::FireContextMenuClosedNow(window_id, on_closed,
+                                            on_closed_data);
+    return;
   }
+  CefPostTask(TID_UI,
+              base::BindOnce(
+                  [](CefRefPtr<CefBrowser> b, uint32_t wid, int cx, int cy,
+                     std::vector<laufey_common::MenuEntry> items,
+                     laufey_menu_click_fn fn, void* d,
+                     laufey_menu_closed_fn closed, void* closed_data) {
+#if defined(_WIN32)
+                    // (cx, cy) is in window DIP, like every CEF geometry;
+                    // the Win32 menu takes client pixels (the process is
+                    // per-monitor DPI aware).
+                    HWND hwnd = b->GetHost()->GetWindowHandle();
+                    UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 0;
+                    double scale = dpi ? dpi / 96.0 : 1.0;
+                    win32_menu::ShowContextMenu(
+                        hwnd, static_cast<int>(std::lround(cx * scale)),
+                        static_cast<int>(std::lround(cy * scale)), items, fn, d,
+                        wid, closed, closed_data);
+#else
+                    CefRefPtr<CefBrowserView> view =
+                        CefBrowserView::GetForBrowser(b);
+                    CefRefPtr<CefWindow> window =
+                        view ? view->GetWindow() : nullptr;
+                    laufey_cef_menu::ShowContextMenu(window, view, wid, cx, cy,
+                                                     std::move(items), fn, d,
+                                                     closed, closed_data);
+#endif
+                  },
+                  browser, window_id, x, y, std::move(entries), on_click,
+                  on_click_data, on_closed, on_closed_data));
 }
 
 static void Backend_ShowContextMenu(void* data, uint32_t window_id, int x,
@@ -1059,26 +1433,54 @@ static void Backend_ShowContextMenu(void* data, uint32_t window_id, int x,
   if (!menu_template)
     return;
   RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
-  const laufey_backend_api_t* api = &loader->GetBackendApi();
-
-  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
-  if (browser) {
-    CefPostTask(TID_UI,
-                base::BindOnce(
-                    [](CefRefPtr<CefBrowser> b, uint32_t wid, int cx, int cy,
-                       laufey_value_t* tmpl, const laufey_backend_api_t* a,
-                       laufey_menu_click_fn fn, void* d) {
-                      HWND hwnd = b->GetHost()->GetWindowHandle();
-                      if (hwnd) {
-                        win32_menu::ShowContextMenu(hwnd, cx, cy, tmpl, a, fn,
-                                                    d, wid);
-                      }
-                    },
-                    browser, window_id, x, y, menu_template, api, on_click,
-                    on_click_data));
-  }
+  std::vector<laufey_common::MenuEntry> entries =
+      laufey_common::ParseMenuTemplate(menu_template, &loader->GetBackendApi(),
+                                       false);
+#if defined(__linux__)
+  // The Linux path always consumed the template.
+  loader->GetBackendApi().value_free(menu_template);
+#endif
+  ShowCefContextMenu(loader, window_id, x, y, std::move(entries), on_click,
+                     on_click_data, nullptr, nullptr);
 }
-#elif defined(__APPLE__)
+
+static void Backend_ShowContextMenuEx(void* data, uint32_t window_id, int x,
+                                      int y, laufey_value_t* menu_template,
+                                      laufey_menu_click_fn on_click,
+                                      void* on_click_data,
+                                      laufey_menu_closed_fn on_closed,
+                                      void* on_closed_data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  std::vector<laufey_common::MenuEntry> entries =
+      laufey_common::ParseMenuTemplate(menu_template, &loader->GetBackendApi(),
+                                       false);
+  if (menu_template)
+    loader->GetBackendApi().value_free(menu_template);
+  ShowCefContextMenu(loader, window_id, x, y, std::move(entries), on_click,
+                     on_click_data, on_closed, on_closed_data);
+}
+
+static bool Backend_TestTriggerMenuAccelerator(void* /*data*/,
+                                               uint32_t window_id,
+                                               const char* accelerator) {
+  bool fired = false;
+  cef_invoke_sync([&] {
+    fired = laufey_cef_menu::TestTriggerAccelerator(window_id, accelerator);
+  });
+  return fired;
+}
+
+static uint32_t Backend_MenuCapabilities(void* /*data*/) {
+  uint32_t caps = LAUFEY_MENU_CAP_APP_MENU | LAUFEY_MENU_CAP_ACCELERATORS |
+                  LAUFEY_MENU_CAP_CONTEXT_MENU | LAUFEY_MENU_CAP_CONTEXT_CLOSED;
+#if defined(_WIN32)
+  caps |= LAUFEY_MENU_CAP_ICONS;  // context menus (Win32)
+#endif
+  return caps;
+}
+#endif  // _WIN32 || __linux__
+
+#if defined(__APPLE__)
 // Defined in runtime_loader_mac.mm
 extern void Backend_SetApplicationMenu_Mac(void* data, uint32_t window_id,
                                            laufey_value_t* menu_template,
@@ -1088,6 +1490,12 @@ extern void Backend_ShowContextMenu_Mac(void* data, uint32_t window_id, int x,
                                         int y, laufey_value_t* menu_template,
                                         laufey_menu_click_fn on_click,
                                         void* on_click_data);
+extern void Backend_ShowContextMenuEx_Mac(void* data, uint32_t window_id, int x,
+                                          int y, laufey_value_t* menu_template,
+                                          laufey_menu_click_fn on_click,
+                                          void* on_click_data,
+                                          laufey_menu_closed_fn on_closed,
+                                          void* on_closed_data);
 extern void Backend_SetDockBadge_Mac(void* data, const char* badge_or_null);
 extern void Backend_BounceDock_Mac(void* data, int type);
 extern void Backend_SetDockMenu_Mac(void* data, laufey_value_t* menu_template,
@@ -1097,6 +1505,10 @@ extern void Backend_SetDockVisible_Mac(void* data, bool visible);
 extern void Backend_SetDockReopenHandler_Mac(void* data,
                                              laufey_dock_reopen_fn handler,
                                              void* user_data);
+extern void Backend_SetOpenUrlHandler_Mac(void* data,
+                                          laufey_open_url_fn handler,
+                                          void* user_data);
+extern bool Backend_TestTriggerOpenUrl_Mac(void* data, const char* url);
 
 extern uint32_t Backend_CreateTrayIcon_Mac(void* data);
 extern void Backend_DestroyTrayIcon_Mac(void* data, uint32_t tray_id);
@@ -1118,22 +1530,8 @@ extern void Backend_SetTrayIconDark_Mac(void* data, uint32_t tray_id,
                                         const void* png_bytes, size_t len);
 extern bool Backend_GetTrayIconBounds_Mac(void* data, uint32_t tray_id, int* x,
                                           int* y, int* width, int* height);
-extern uint32_t Backend_ShowNotification_Mac(
-    void* data, laufey_value_t* options, laufey_notification_event_fn on_event,
-    void* user_data);
-extern void Backend_CloseNotification_Mac(void* data, uint32_t notification_id);
-extern void Backend_QueryPermission_Mac(void* data, int kind,
-                                        laufey_permission_callback_fn cb,
-                                        void* user_data);
-extern void Backend_RequestPermission_Mac(void* data, int kind,
-                                          laufey_permission_callback_fn cb,
-                                          void* user_data);
 #elif defined(__linux__)
 // Defined in runtime_loader_linux.cc
-extern void Backend_ShowContextMenu_Linux(void* data, uint32_t window_id, int x,
-                                          int y, laufey_value_t* menu_template,
-                                          laufey_menu_click_fn on_click,
-                                          void* on_click_data);
 extern uint32_t Backend_CreateTrayIcon_Linux(void* data);
 extern void Backend_DestroyTrayIcon_Linux(void* data, uint32_t tray_id);
 extern void Backend_SetTrayIcon_Linux(void* data, uint32_t tray_id,
@@ -1152,31 +1550,67 @@ extern void Backend_SetTrayDoubleClickHandler_Linux(
     void* user_data);
 extern void Backend_SetTrayIconDark_Linux(void* data, uint32_t tray_id,
                                           const void* png_bytes, size_t len);
-extern "C" uint32_t Backend_ShowNotification_Linux(
-    void* data, laufey_value_t* options, laufey_notification_event_fn on_event,
-    void* user_data);
-extern "C" void Backend_CloseNotification_Linux(void* data,
-                                                uint32_t notification_id);
 #endif
 
-// --- Permissions / runtime authorization ---
+// --- Notifications and permissions (every platform) ---
 //
-// macOS routes to UNUserNotificationCenter (see runtime_loader_mac.mm).
-// Windows + Linux permission stubs live in backend-common
-// (laufey_common::QueryPermissionStub / RequestPermissionStub).
-#if !defined(__APPLE__)
-static void Backend_QueryPermission_Stub(void* /*data*/, int kind,
-                                         laufey_permission_callback_fn cb,
+// Thin trampolines over backend-common's laufey_notifications.h, whose
+// per-OS platform (UNUserNotificationCenter, toasts, D-Bus) does the work.
+
+static uint32_t Backend_ShowNotification(void* data, laufey_value_t* options,
+                                         laufey_notification_event_fn on_event,
                                          void* user_data) {
-  laufey_common::QueryPermissionStub(kind, cb, user_data);
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  laufey_common::NotificationOptions opts =
+      laufey_common::ParseNotificationOptions(options,
+                                              &loader->GetBackendApi());
+  return laufey_common::ShowNotification(opts, on_event, user_data);
 }
 
-static void Backend_RequestPermission_Stub(void* /*data*/, int kind,
-                                           laufey_permission_callback_fn cb,
-                                           void* user_data) {
-  laufey_common::RequestPermissionStub(kind, cb, user_data);
+static void Backend_CloseNotification(void* /*data*/,
+                                      uint32_t notification_id) {
+  laufey_common::CloseNotification(notification_id);
 }
-#endif
+
+static uint32_t Backend_NotificationCapabilities(void* /*data*/) {
+  return laufey_common::NotificationCapabilities();
+}
+
+static void Backend_SetNotificationResponseHandler(
+    void* /*data*/, laufey_notification_response_fn handler, void* user_data) {
+  laufey_common::SetNotificationResponseHandler(handler, user_data);
+}
+
+static void Backend_ListScheduledNotifications(void* /*data*/,
+                                               laufey_notification_list_fn cb,
+                                               void* user_data) {
+  laufey_common::ListScheduledNotifications(cb, user_data);
+}
+
+static void Backend_CancelNotification(void* /*data*/, const char* tag) {
+  laufey_common::CancelNotification(tag);
+}
+
+static bool Backend_TestNotificationRespond(void* /*data*/, const char* tag,
+                                            const char* action_id) {
+  return laufey_common::TestNotificationRespond(tag, action_id);
+}
+
+static void Backend_QueryPermission(void* /*data*/, int kind,
+                                    laufey_permission_callback_fn cb,
+                                    void* user_data) {
+  laufey_common::QueryNotificationPermission(kind, cb, user_data);
+}
+
+static void Backend_RequestPermission(void* /*data*/, int kind,
+                                      laufey_permission_callback_fn cb,
+                                      void* user_data) {
+  laufey_common::RequestNotificationPermission(kind, cb, user_data);
+}
+
+static bool Backend_TestDismissContextMenu(void* /*data*/) {
+  return laufey_common::DismissOpenContextMenu();
+}
 
 // --- Dock / taskbar (Windows + Linux) ---
 //
@@ -1265,7 +1699,7 @@ static void Backend_BounceDock_Win(void* data, int type) {
 
 // --- Tray (Windows) ---
 //
-// Shell_NotifyIcon + a hidden message-only window that receives
+// Shell_NotifyIcon + a hidden top-level window that receives
 // WM_TRAYICON (one per process). PNG → HICON via WIC.
 
 // --- Tray (Windows) ---
@@ -1275,7 +1709,7 @@ static void Backend_BounceDock_Win(void* data, int type) {
 
 uint32_t Backend_CreateTrayIcon_Win(void* /*data*/) {
   // Allocate the id synchronously; do the Shell_NotifyIcon setup on the
-  // UI thread so the message-only window is owned by the thread that
+  // UI thread so the hidden tray window is owned by the thread that
   // pumps messages for it.
   uint32_t tray_id = laufey_common::CreateTrayIconWin();
   CefPostTask(TID_UI,
@@ -1378,25 +1812,6 @@ void Backend_SetTrayClickHandler_Win(void* /*data*/, uint32_t tray_id,
                           tray_id, handler, user_data));
 }
 
-// --- Notifications (Windows) ---
-//
-// Thin trampolines over backend-common/src/notifications_win.cc.
-
-static uint32_t Backend_ShowNotification_Win(
-    void* data, laufey_value_t* options, laufey_notification_event_fn on_event,
-    void* user_data) {
-  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
-  laufey_common::NotificationOptions opts =
-      laufey_common::ParseNotificationOptions(options,
-                                              &loader->GetBackendApi());
-  return laufey_common::ShowNotificationWin(opts, on_event, user_data);
-}
-
-static void Backend_CloseNotification_Win(void* /*data*/,
-                                          uint32_t notification_id) {
-  laufey_common::CloseNotificationWin(notification_id);
-}
-
 #elif defined(__linux__)
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -1441,6 +1856,10 @@ static void Backend_BounceDock_Linux(void* data, int /*type*/) {
 #endif
 
 static void Backend_OpenDevTools(void* data, uint32_t window_id) {
+  // DevTools are off for the whole process (LAUFEY_INSPECTABLE=0 /
+  // "inspectable": false); see LaufeyApplyInspectable* in app.cc.
+  if (!laufey_common::LaunchInspectable())
+    return;
   RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
   CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
   if (browser) {
@@ -1456,6 +1875,107 @@ static void Backend_OpenDevTools(void* data, uint32_t window_id) {
                             },
                             browser));
   }
+}
+
+// --- Global shortcuts, launch at login, DevTools (API >= 40) ---
+
+static uint32_t Backend_SystemCapabilities(void* /*data*/) {
+  uint32_t caps =
+      laufey_common::ShortcutCapabilities() | LAUFEY_SYSTEM_CAP_DEVTOOLS;
+  if (laufey_common::GetLaunchAtLogin() != LAUFEY_LOGIN_ITEM_NOT_SUPPORTED)
+    caps |= LAUFEY_SYSTEM_CAP_LAUNCH_AT_LOGIN;
+  return caps;
+}
+
+static void Backend_SetShortcutHandler(void* /*data*/,
+                                       laufey_shortcut_fn handler,
+                                       void* user_data) {
+  laufey_common::SetShortcutHandler(handler, user_data);
+}
+
+static void Backend_RegisterShortcut(void* /*data*/, const char* accelerator,
+                                     laufey_shortcut_result_fn callback,
+                                     void* user_data) {
+  laufey_common::RegisterShortcut(accelerator, callback, user_data);
+}
+
+static bool Backend_UnregisterShortcut(void* /*data*/,
+                                       const char* accelerator) {
+  return laufey_common::UnregisterShortcut(accelerator);
+}
+
+static void Backend_UnregisterAllShortcuts(void* /*data*/) {
+  laufey_common::UnregisterAllShortcuts();
+}
+
+static char* Backend_ListShortcuts(void* /*data*/) {
+  return laufey_common::ListShortcuts();
+}
+
+static char* Backend_CanonicalizeAccelerator(void* /*data*/,
+                                             const char* accelerator) {
+  return laufey_common::CanonicalizeAccelerator(accelerator);
+}
+
+static bool Backend_TestTriggerShortcut(void* /*data*/,
+                                        const char* accelerator) {
+  return laufey_common::TestTriggerShortcut(accelerator);
+}
+
+static int Backend_GetLaunchAtLogin(void* /*data*/) {
+  return laufey_common::GetLaunchAtLogin();
+}
+
+static int Backend_SetLaunchAtLogin(void* /*data*/, bool enabled,
+                                    char** error_out) {
+  if (error_out)
+    *error_out = nullptr;
+  std::string error;
+  int state = laufey_common::SetLaunchAtLogin(enabled, &error);
+  if (state == LAUFEY_LOGIN_ITEM_FAILED && error_out && !error.empty()) {
+    char* copy = static_cast<char*>(malloc(error.size() + 1));
+    if (copy) {
+      memcpy(copy, error.c_str(), error.size() + 1);
+      *error_out = copy;
+    }
+  }
+  return state;
+}
+
+static void Backend_CloseDevTools(void* data, uint32_t window_id) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
+  if (!browser)
+    return;
+  CefPostTask(TID_UI, base::BindOnce(
+                          [](CefRefPtr<CefBrowser> b) {
+                            b->GetHost()->CloseDevTools();
+                          },
+                          browser));
+}
+
+static bool Backend_IsDevToolsOpen(void* data, uint32_t window_id) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
+  if (!browser)
+    return false;
+  bool open = false;
+  cef_invoke_sync([&] { open = browser->GetHost()->HasDevTools(); });
+  return open;
+}
+
+static bool Backend_IsDevToolsEnabled(void* data, uint32_t window_id) {
+  if (window_id == 0)
+    return laufey_common::LaunchInspectable();
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
+  if (!browser)
+    return false;
+  bool enabled = false;
+  // Read back from CEF: the launch setting, unless a remote-debugging switch
+  // made it onto the browser process's command line anyway.
+  cef_invoke_sync([&] { enabled = LaufeyDevToolsReachable(); });
+  return enabled;
 }
 
 static void Backend_SetJsNamespace(void* data, const char* name) {
@@ -1618,8 +2138,8 @@ static uint32_t Backend_CreateWindowImpl(void* data, uint32_t flags) {
   auto* loader = RuntimeLoader::GetInstance();
   uint32_t window_id = loader->AllocateWindowId();
 
-  CefPostTask(TID_UI,
-              base::BindOnce(
+  bool posted = CefPostTask(
+      TID_UI, base::BindOnce(
                   [](uint32_t wid, uint32_t window_flags) {
                     auto* handler = LaufeyHandler::GetInstance();
                     if (!handler)
@@ -1646,8 +2166,18 @@ static uint32_t Backend_CreateWindowImpl(void* data, uint32_t flags) {
                   window_id, flags));
 
   // Block until the browser is registered by OnAfterCreated, so that
-  // subsequent calls (navigate, set_title, etc.) can find it.
-  loader->WaitForBrowser(window_id);
+  // subsequent calls (navigate, set_title, etc.) can find it: until then they
+  // are dropped. The wait returns as soon as the browser exists; its bound
+  // only guards against a creation that never completes. A cold start on a
+  // slow machine takes several seconds per browser (over 5 s, the old bound,
+  // on a Windows CI runner, which dropped the window's first navigation).
+  // (Nothing to wait for when CEF is no longer taking UI tasks.)
+  constexpr int kBrowserCreateTimeoutMs = 30000;
+  if (posted && !loader->WaitForBrowser(window_id, kBrowserCreateTimeoutMs)) {
+    std::cerr << "laufey: the browser for window " << window_id
+              << " was not created within " << kBrowserCreateTimeoutMs / 1000
+              << " s; calls on the window are ignored until it is" << std::endl;
+  }
 
   return window_id;
 }
@@ -1670,11 +2200,24 @@ static void Backend_CloseWindow(void* data, uint32_t window_id) {
     // prompt, not CanClose -- without the mark a registered handler would
     // re-defer this close forever).
     loader->MarkCloseAllowed(window_id);
-    CefPostTask(TID_UI, base::BindOnce(
-                            [](CefRefPtr<CefBrowser> b) {
-                              b->GetHost()->CloseBrowser(true);
-                            },
-                            browser));
+    CefPostTask(TID_UI,
+                base::BindOnce(
+                    [](CefRefPtr<CefBrowser> b, uint32_t id) {
+#if defined(__APPLE__)
+                      // An auth session / passkey sheet attached to
+                      // the window keeps it from closing: end it
+                      // first (`cancelled`), as WKWebView does.
+                      if (void* nswindow = RuntimeLoader::GetInstance()
+                                               ->GetNSWindowForLaufeyId(id)) {
+                        laufey_common::PasskeyWindowClosing(nswindow);
+                        laufey_common::AuthSessionWindowClosing(nswindow);
+                      }
+#else
+                      (void)id;
+#endif
+                      b->GetHost()->CloseBrowser(true);
+                    },
+                    browser, window_id));
   }
 }
 
@@ -1710,8 +2253,14 @@ static int Backend_ShowDialog(void* /*data*/, uint32_t /*window_id*/,
   return laufey_common::ShowDialogMac(dialog_type, title_str, message_str,
                                       default_str, out_input_value);
 #elif defined(__linux__)
-  return laufey_common::ShowDialogLinux(dialog_type, title_str, message_str,
-                                        default_str, out_input_value);
+  // GTK belongs to TID_UI: run the modal there (its nested loop keeps CEF's
+  // tasks running, see ShowDialogLinux) and wait for it.
+  int result = 0;
+  cef_invoke_sync([&] {
+    result = laufey_common::ShowDialogLinux(dialog_type, title_str, message_str,
+                                            default_str, out_input_value);
+  });
+  return result;
 #elif defined(_WIN32)
   return laufey_common::ShowDialogWin(dialog_type, title_str, message_str,
                                       default_str, out_input_value);
@@ -1730,6 +2279,7 @@ static char* Backend_ReadClipboardText(void* /*data*/) {
 #ifdef __APPLE__
   return laufey_common::ClipboardReadTextMac();
 #elif defined(__linux__)
+  laufey_common::GtkRunSync([] { CefEnsureGtkInit(); });
   return laufey_common::ClipboardReadTextLinux();
 #elif defined(_WIN32)
   return laufey_common::ClipboardReadTextWin();
@@ -1743,6 +2293,7 @@ static void Backend_WriteClipboardText(void* /*data*/, const char* text) {
 #ifdef __APPLE__
   laufey_common::ClipboardWriteTextMac(text_str);
 #elif defined(__linux__)
+  laufey_common::GtkRunSync([] { CefEnsureGtkInit(); });
   laufey_common::ClipboardWriteTextLinux(text_str);
 #elif defined(_WIN32)
   laufey_common::ClipboardWriteTextWin(text_str);
@@ -1751,10 +2302,701 @@ static void Backend_WriteClipboardText(void* /*data*/, const char* text) {
 #endif
 }
 
+// --- Drag and drop, file dialogs, rich clipboard (API >= 39) ----------------
+//
+// Drops: CefDragHandler::OnDragEnter hands the browser process the dragged
+// files' paths (LaufeyHandler keeps them per browser); a closure-private
+// observer injected into the main frame (render_process_handler.cc) reports
+// where the drag is and when it drops, and LaufeyHandler dispatches each
+// phase with those paths. Dialogs, drag-out and the clipboard are the OS's
+// own, shared with the WebView backends (backend-common): the same dialogs
+// on every backend, not CEF's RunFileDialog.
+
+static CefRefPtr<CefWindow> CefWindowForId(uint32_t window_id);
+
+#ifdef __linux__
+// GTK must be initialized before the Linux clipboard / dialogs / drag source
+// touch it (runtime_loader_linux.cc); do it on the GTK (CEF UI) thread.
+static void EnsureGtkReady() {
+  laufey_common::GtkRunSync([] { CefEnsureGtkInit(); });
+}
+#endif
+
+static void Backend_SetFileDropHandler(void* /*data*/,
+                                       laufey_file_drop_fn handler,
+                                       void* user_data) {
+  laufey_common::SetFileDropHandler(handler, user_data);
+}
+
+static bool Backend_TestTriggerFileDrop(void* /*data*/, uint32_t window_id,
+                                        int phase, double x, double y,
+                                        const char* const* paths,
+                                        size_t count) {
+  // Real drops are dispatched on the UI thread (LaufeyHandler); so is this.
+  bool delivered = false;
+  cef_invoke_sync([&] {
+    delivered = laufey_common::TestTriggerFileDrop(window_id, phase, x, y,
+                                                   paths, count);
+  });
+  return delivered;
+}
+
+static void Backend_StartFileDrag(void* /*data*/, uint32_t window_id,
+                                  const char* const* paths, size_t count,
+                                  const uint8_t* icon_png, size_t icon_len,
+                                  laufey_drag_result_fn callback,
+                                  void* user_data) {
+  auto* req = new laufey_common::DragOutRequest();
+  req->callback = callback;
+  req->user_data = user_data;
+  if (!RuntimeLoader::GetInstance()->GetBrowserForWindow(window_id) ||
+      !laufey_common::ValidateDragPaths(paths, count, &req->paths)) {
+    req->Finish(LAUFEY_DRAG_RESULT_FAILED);
+    delete req;
+    return;
+  }
+  if (icon_png && icon_len > 0)
+    req->icon_png.assign(icon_png, icon_png + icon_len);
+#if defined(__APPLE__)
+  // The window's content view is the drag source; resolved on the UI (main)
+  // thread, where StartFileDragMac runs anyway.
+  CefPostTask(TID_UI, base::BindOnce(
+                          [](uint32_t wid, laufey_common::DragOutRequest* r) {
+                            CefRefPtr<CefWindow> window = CefWindowForId(wid);
+                            if (!window) {
+                              r->Finish(LAUFEY_DRAG_RESULT_FAILED);
+                              delete r;
+                              return;
+                            }
+                            laufey_common::StartFileDragMac(
+                                window->GetWindowHandle(), r);
+                          },
+                          window_id, req));
+#elif defined(_WIN32)
+  CefPostTask(TID_UI, base::BindOnce(
+                          [](uint32_t wid, laufey_common::DragOutRequest* r) {
+                            CefRefPtr<CefWindow> window = CefWindowForId(wid);
+                            if (!window) {
+                              r->Finish(LAUFEY_DRAG_RESULT_FAILED);
+                              delete r;
+                              return;
+                            }
+                            laufey_common::StartFileDragWin(
+                                window->GetWindowHandle(), r);
+                          },
+                          window_id, req));
+#else
+  // Chromium's windows are not GTK's; GTK drags from its own invisible
+  // source widget, which needs an X11 display (see the capability).
+  EnsureGtkReady();
+  laufey_common::StartFileDragLinux(nullptr, req);
+#endif
+}
+
+#if defined(__APPLE__) || defined(_WIN32)
+// The dialog's owner: the CefWindow's NSWindow / HWND, looked up on the UI
+// thread right before the dialog shows.
+static laufey_common::ParentResolver CefParentResolver(uint32_t window_id) {
+  if (window_id == 0)
+    return nullptr;
+  return [window_id]() -> void* {
+    CefRefPtr<CefWindow> window = CefWindowForId(window_id);
+    if (!window)
+      return nullptr;
+#if defined(__APPLE__)
+    return NSWindowForCefHandle(window->GetWindowHandle());
+#else
+    return window->GetWindowHandle();
+#endif
+  };
+}
+#endif
+
+static uint32_t Backend_ShowFileDialog(
+    void* /*data*/, uint32_t window_id,
+    const laufey_file_dialog_options_t* options,
+    laufey_file_dialog_result_fn callback, void* user_data) {
+  if (!callback)
+    return 0;
+#if defined(__APPLE__)
+  return laufey_common::ShowFileDialogMac(CefParentResolver(window_id), options,
+                                          callback, user_data);
+#elif defined(_WIN32)
+  return laufey_common::ShowFileDialogWin(CefParentResolver(window_id), options,
+                                          callback, user_data);
+#else
+  // GtkFileChooserNative needs a GtkWindow to be modal to; Chromium's X11 /
+  // Wayland windows aren't GTK's, so the dialog is app-level here.
+  (void)window_id;
+  EnsureGtkReady();
+  return laufey_common::ShowFileDialogLinux(nullptr, options, callback,
+                                            user_data);
+#endif
+}
+
+static bool Backend_CancelFileDialog(void* /*data*/, uint32_t dialog_id) {
+#if defined(__APPLE__)
+  return laufey_common::CancelFileDialogMac(dialog_id);
+#elif defined(_WIN32)
+  return laufey_common::CancelFileDialogWin(dialog_id);
+#else
+  return laufey_common::CancelFileDialogLinux(dialog_id);
+#endif
+}
+
+static bool Backend_TestFileDialogRespond(void* /*data*/, int action,
+                                          const char* path) {
+#if defined(__APPLE__)
+  return laufey_common::TestFileDialogRespondMac(action, path);
+#elif defined(_WIN32)
+  return laufey_common::TestFileDialogRespondWin(action, path);
+#else
+  return laufey_common::TestFileDialogRespondLinux(action, path);
+#endif
+}
+
+static uint32_t Backend_ClipboardCapabilities(void* /*data*/) {
+#if defined(__APPLE__)
+  return laufey_common::ClipboardCapabilitiesMac();
+#elif defined(_WIN32)
+  return laufey_common::ClipboardCapabilitiesWin();
+#else
+  EnsureGtkReady();
+  return laufey_common::ClipboardCapabilitiesLinux();
+#endif
+}
+
+static char* Backend_ReadClipboardHtml(void* /*data*/) {
+#if defined(__APPLE__)
+  return laufey_common::ClipboardReadHtmlMac();
+#elif defined(_WIN32)
+  return laufey_common::ClipboardReadHtmlWin();
+#else
+  EnsureGtkReady();
+  return laufey_common::ClipboardReadHtmlLinux();
+#endif
+}
+
+static bool Backend_WriteClipboardHtml(void* /*data*/, const char* html,
+                                       const char* text_or_null) {
+  if (!html)
+    return false;
+#if defined(__APPLE__)
+  return laufey_common::ClipboardWriteHtmlMac(html, text_or_null);
+#elif defined(_WIN32)
+  return laufey_common::ClipboardWriteHtmlWin(html, text_or_null);
+#else
+  EnsureGtkReady();
+  return laufey_common::ClipboardWriteHtmlLinux(html, text_or_null);
+#endif
+}
+
+static uint8_t* Backend_ReadClipboardImage(void* /*data*/, size_t* len_out) {
+#if defined(__APPLE__)
+  return laufey_common::ClipboardReadImageMac(len_out);
+#elif defined(_WIN32)
+  return laufey_common::ClipboardReadImageWin(len_out);
+#else
+  EnsureGtkReady();
+  return laufey_common::ClipboardReadImageLinux(len_out);
+#endif
+}
+
+static bool Backend_WriteClipboardImage(void* /*data*/, const uint8_t* png,
+                                        size_t len) {
+  if (!png || len == 0)
+    return false;
+#if defined(__APPLE__)
+  return laufey_common::ClipboardWriteImageMac(png, len);
+#elif defined(_WIN32)
+  return laufey_common::ClipboardWriteImageWin(png, len);
+#else
+  EnsureGtkReady();
+  return laufey_common::ClipboardWriteImageLinux(png, len);
+#endif
+}
+
+static char* Backend_ReadClipboardFormats(void* /*data*/) {
+#if defined(__APPLE__)
+  return laufey_common::ClipboardReadFormatsMac();
+#elif defined(_WIN32)
+  return laufey_common::ClipboardReadFormatsWin();
+#else
+  EnsureGtkReady();
+  return laufey_common::ClipboardReadFormatsLinux();
+#endif
+}
+
+static void Backend_SetClipboardChangeHandler(void* /*data*/,
+                                              laufey_clipboard_change_fn fn,
+                                              void* user_data) {
+#ifdef __linux__
+  EnsureGtkReady();
+#endif
+  laufey_common::SetClipboardChangeHandler(fn, user_data);
+}
+
+static void Backend_BufferFree(void* /*data*/, void* buffer) {
+  free(buffer);
+}
+
 // Test hook (API >= 30): synthesize a click on a menu/tray item by id. Platform
 // independent — the shared registry in backend-common holds the handlers.
 static bool Backend_TestClickMenuItem(void* /*data*/, const char* item_id) {
   return laufey_common::TestClickMenuItem(item_id);
+}
+
+static void InjectKey(void* ctx, uint32_t window_id, int state, const char* key,
+                      const char* code, uint32_t modifiers, bool repeat) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchKeyboardEvent(
+      window_id, state, key, code, modifiers, repeat);
+}
+static void InjectClick(void* ctx, uint32_t window_id, int state, int button,
+                        double x, double y, uint32_t modifiers,
+                        int32_t click_count) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchMouseClickEvent(
+      window_id, state, button, x, y, modifiers, click_count);
+}
+static void InjectMove(void* ctx, uint32_t window_id, double x, double y,
+                       uint32_t modifiers) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchMouseMoveEvent(window_id, x, y,
+                                                           modifiers);
+}
+static void InjectWheel(void* ctx, uint32_t window_id, double delta_x,
+                        double delta_y, double x, double y, uint32_t modifiers,
+                        int32_t delta_mode) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchWheelEvent(
+      window_id, delta_x, delta_y, x, y, modifiers, delta_mode);
+}
+static void InjectEnterLeave(void* ctx, uint32_t window_id, int entered,
+                             double x, double y, uint32_t modifiers) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchCursorEnterLeaveEvent(
+      window_id, entered, x, y, modifiers);
+}
+
+static bool Backend_TestInjectInput(void* data, uint32_t window_id,
+                                    const laufey_test_input_t* event) {
+  laufey_common::TestInjectSink sink = {
+      InjectKey, InjectClick, InjectMove, InjectWheel, InjectEnterLeave, data,
+  };
+  return laufey_common::TestInjectInput(window_id, event, sink);
+}
+
+// --- Window state, constraints, screens and chrome (API >= 38) ---
+//
+// Cross-platform through the CEF Views API (CefWindow / CefDisplay), in its
+// units: DIP, CefWindow::GetPosition / GetSize. The OS notices state changes
+// first; each platform hook (NSWindow notifications on macOS, a WM_SIZE
+// subclass on Windows, the window delegate's bounds / activation /
+// fullscreen callbacks everywhere) schedules CefRecheckWindowState, which
+// reads the state back from CefWindow and reports it; duplicates are dropped
+// in laufey_common::ReportWindowState.
+
+// windowsx.h defines IsMaximized / IsMinimized as function-like macros
+// (IsZoomed / IsIconic); `(window->IsMaximized)()` keeps them from expanding.
+static CefRefPtr<CefWindow> CefWindowForId(uint32_t window_id) {
+  CefRefPtr<CefBrowser> browser =
+      RuntimeLoader::GetInstance()->GetBrowserForWindow(window_id);
+  if (!browser)
+    return nullptr;
+  auto browser_view = CefBrowserView::GetForBrowser(browser);
+  return browser_view ? browser_view->GetWindow() : nullptr;
+}
+
+static uint32_t CefStateOf(CefRefPtr<CefWindow> window) {
+  uint32_t state = 0;
+  if (window->IsFullscreen())
+    state |= LAUFEY_WINDOW_STATE_FULLSCREEN;
+  else if ((window->IsMaximized)())
+    state |= LAUFEY_WINDOW_STATE_MAXIMIZED;
+  if ((window->IsMinimized)())
+    state |= LAUFEY_WINDOW_STATE_MINIMIZED;
+  return state;
+}
+
+// Normal bounds: the frame's position and the page size (get_window_size).
+static laufey_common::Bounds CefBoundsOf(CefRefPtr<CefWindow> window,
+                                         uint32_t window_id) {
+  laufey_common::Bounds b;
+  CefPoint pos = window->GetPosition();
+  CefSize size = window->GetSize();
+  CefRefPtr<CefBrowser> browser =
+      RuntimeLoader::GetInstance()->GetBrowserForWindow(window_id);
+  auto browser_view =
+      browser ? CefBrowserView::GetForBrowser(browser) : nullptr;
+  CefSize frame = browser_view ? CefFrameAroundPage(browser_view) : CefSize();
+  b.x = pos.x;
+  b.y = pos.y;
+  b.width = (std::max)(0, size.width - frame.width);
+  b.height = (std::max)(0, size.height - frame.height);
+  return b;
+}
+
+// UI thread.
+void CefRecheckWindowState(uint32_t window_id) {
+  CefRefPtr<CefWindow> window = CefWindowForId(window_id);
+  if (!window || window->IsClosed())
+    return;
+  uint32_t state = CefStateOf(window);
+  int64_t now = laufey_common::MonotonicMs();
+  if (state != 0 && laufey_common::LastReportedWindowState(window_id) == 0)
+    laufey_common::NoteWindowLeftNormal(window_id, now);
+  laufey_common::NoteWindowGeometry(window_id, CefBoundsOf(window, window_id),
+                                    state == 0, now);
+  laufey_common::ReportWindowState(window_id, state);
+}
+
+// Any thread: a recheck now and a few more while the OS animates the change
+// (Linux window managers apply state asynchronously; macOS animates
+// zoom / fullscreen).
+void CefScheduleWindowStateRecheck(uint32_t window_id) {
+  auto task = [](uint32_t wid) { CefRecheckWindowState(wid); };
+  CefPostTask(TID_UI, base::BindOnce(task, window_id));
+  for (int64_t delay : {150, 600, 1500}) {
+    CefPostDelayedTask(TID_UI, base::BindOnce(task, window_id), delay);
+  }
+}
+
+static uint32_t Backend_WindowCapabilities(void* /*data*/) {
+  uint32_t caps = LAUFEY_WINDOW_CAP_STATE | LAUFEY_WINDOW_CAP_STATE_EVENTS |
+                  LAUFEY_WINDOW_CAP_SIZE_CONSTRAINTS |
+                  LAUFEY_WINDOW_CAP_SCREENS | LAUFEY_WINDOW_CAP_DISPLAY_EVENTS |
+                  LAUFEY_WINDOW_CAP_NORMAL_BOUNDS |
+                  LAUFEY_WINDOW_CAP_KEEP_ALIVE;
+#if defined(__APPLE__)
+  // Titled NSWindow chrome is AppKit's; vibrancy is not available: the CEF
+  // browser view paints an opaque background in windowed mode.
+  caps |= LAUFEY_WINDOW_CAP_TITLEBAR_HIDDEN |
+          LAUFEY_WINDOW_CAP_TITLEBAR_HIDDEN_INSET |
+          LAUFEY_WINDOW_CAP_TRAFFIC_LIGHT_POSITION |
+          LAUFEY_WINDOW_CAP_SET_POSITION;
+#elif defined(_WIN32)
+  // No Mica / Acrylic: the CEF browser view paints an opaque background in
+  // windowed mode, so a DWM backdrop could never show through the page.
+  caps |= LAUFEY_WINDOW_CAP_SET_POSITION;
+#else
+  // Ozone/Wayland (chosen when WAYLAND_DISPLAY is set, see main_linux.cc)
+  // can't place windows.
+  const char* wayland = getenv("WAYLAND_DISPLAY");
+  if (!(wayland && *wayland))
+    caps |= LAUFEY_WINDOW_CAP_SET_POSITION;
+#endif
+  // Drag and drop and file dialogs (API >= 39). OnDragEnter has the paths
+  // from the start. macOS sheets and Windows owner windows are modal; on
+  // Linux the GTK dialog can't be made modal to Chromium's (non-GTK) window,
+  // and the GTK drag source needs an X11 display.
+  caps |= LAUFEY_WINDOW_CAP_FILE_DROP |
+          LAUFEY_WINDOW_CAP_FILE_DROP_ENTER_PATHS |
+          LAUFEY_WINDOW_CAP_FILE_DIALOGS;
+#if defined(__APPLE__)
+  caps |= LAUFEY_WINDOW_CAP_FILE_DRAG_OUT |
+          LAUFEY_WINDOW_CAP_FILE_DIALOG_FILES_AND_DIRECTORIES |
+          LAUFEY_WINDOW_CAP_FILE_DIALOG_MODAL;
+#elif defined(_WIN32)
+  caps |= LAUFEY_WINDOW_CAP_FILE_DRAG_OUT | LAUFEY_WINDOW_CAP_FILE_DIALOG_MODAL;
+#else
+  EnsureGtkReady();
+  bool x11 = false;
+  laufey_common::GtkRunSync([&] {
+    GdkDisplay* display = gdk_display_get_default();
+    x11 = display && strstr(G_OBJECT_TYPE_NAME(display), "X11") != nullptr;
+  });
+  if (x11)
+    caps |= LAUFEY_WINDOW_CAP_FILE_DRAG_OUT;
+#endif
+  return caps;
+}
+
+static void Backend_SetWindowState(void* /*data*/, uint32_t window_id,
+                                   int action) {
+  CefPostTask(TID_UI, base::BindOnce(
+                          [](uint32_t wid, int act) {
+                            CefRefPtr<CefWindow> window = CefWindowForId(wid);
+                            if (!window)
+                              return;
+                            switch (act) {
+                              case LAUFEY_WINDOW_ACTION_MAXIMIZE:
+                                if (!window->IsFullscreen())
+                                  window->Maximize();
+                                break;
+                              case LAUFEY_WINDOW_ACTION_UNMAXIMIZE:
+                                if ((window->IsMaximized)())
+                                  window->Restore();
+                                break;
+                              case LAUFEY_WINDOW_ACTION_MINIMIZE:
+                                window->Minimize();
+                                break;
+                              case LAUFEY_WINDOW_ACTION_RESTORE:
+                                if ((window->IsMinimized)())
+                                  window->Restore();
+                                break;
+                              case LAUFEY_WINDOW_ACTION_ENTER_FULLSCREEN:
+                                window->SetFullscreen(true);
+                                break;
+                              case LAUFEY_WINDOW_ACTION_LEAVE_FULLSCREEN:
+                                window->SetFullscreen(false);
+                                break;
+                              default:
+                                return;
+                            }
+                            CefScheduleWindowStateRecheck(wid);
+                          },
+                          window_id, action));
+}
+
+static uint32_t Backend_GetWindowState(void* /*data*/, uint32_t window_id) {
+  uint32_t state = 0;
+  cef_invoke_sync([&] {
+    if (CefRefPtr<CefWindow> window = CefWindowForId(window_id))
+      state = CefStateOf(window);
+  });
+  return state;
+}
+
+static void Backend_SetWindowStateHandler(void* /*data*/,
+                                          laufey_window_state_fn handler,
+                                          void* user_data) {
+  laufey_common::SetWindowStateHandler(handler, user_data);
+}
+
+static void Backend_SetWindowSizeConstraints(void* /*data*/, uint32_t window_id,
+                                             int min_width, int min_height,
+                                             int max_width, int max_height) {
+  laufey_common::SizeConstraints c = laufey_common::SetSizeConstraints(
+      window_id, min_width, min_height, max_width, max_height);
+  CefPostTask(TID_UI,
+              base::BindOnce(
+                  [](uint32_t wid, laufey_common::SizeConstraints c) {
+                    CefRefPtr<CefWindow> window = CefWindowForId(wid);
+                    if (!window)
+                      return;
+#if defined(__APPLE__)
+                    // LaufeyWindowDelegate::GetMinimumSize / GetMaximumSize
+                    // answer Chromium when it asks; AppKit enforces the
+                    // content limits during a live resize.
+                    laufey_common::MacApplyContentSizeConstraints(
+                        NSWindowForCefHandle(window->GetWindowHandle()), c);
+#endif
+                    // Have Chromium ask the delegate again.
+                    window->InvalidateLayout();
+                    if ((window->IsMaximized)() || (window->IsMinimized)() ||
+                        window->IsFullscreen())
+                      return;
+                    CefRefPtr<CefBrowser> browser =
+                        RuntimeLoader::GetInstance()->GetBrowserForWindow(wid);
+                    auto browser_view =
+                        browser ? CefBrowserView::GetForBrowser(browser)
+                                : nullptr;
+                    if (!browser_view)
+                      return;
+                    CefSize outer = window->GetSize();
+                    CefSize frame = CefFrameAroundPage(browser_view);
+                    int w = outer.width - frame.width;
+                    int h = outer.height - frame.height;
+                    if (laufey_common::ClampSize(c, &w, &h))
+                      CefSetPageSize(browser_view, w, h);
+                  },
+                  window_id, c));
+}
+
+static void Backend_GetWindowSizeConstraints(void* /*data*/, uint32_t window_id,
+                                             int* min_width, int* min_height,
+                                             int* max_width, int* max_height) {
+  laufey_common::SizeConstraints c =
+      laufey_common::GetSizeConstraints(window_id);
+  if (min_width)
+    *min_width = c.min_width;
+  if (min_height)
+    *min_height = c.min_height;
+  if (max_width)
+    *max_width = c.max_width;
+  if (max_height)
+    *max_height = c.max_height;
+}
+
+// CEF display ids are int64; keep them in the JS-safe range the ABI promises.
+static int64_t CefSafeDisplayId(int64_t id) {
+  if (id > 0 && id < (int64_t{1} << 53))
+    return id;
+  std::string s = std::to_string(id);
+  return laufey_common::HashDisplayName(s.data(), s.size());
+}
+
+// UI thread.
+static std::vector<laufey_screen_t> CefCollectScreens() {
+  std::vector<laufey_screen_t> screens;
+  std::vector<CefRefPtr<CefDisplay>> displays;
+  CefDisplay::GetAllDisplays(displays);
+  CefRefPtr<CefDisplay> primary = CefDisplay::GetPrimaryDisplay();
+  int64_t primary_id = primary ? primary->GetID() : 0;
+  for (const auto& d : displays) {
+    laufey_screen_t s = {};
+    s.id = CefSafeDisplayId(d->GetID());
+    CefRect b = d->GetBounds();
+    CefRect w = d->GetWorkArea();
+    s.x = b.x;
+    s.y = b.y;
+    s.width = b.width;
+    s.height = b.height;
+    s.work_x = w.x;
+    s.work_y = w.y;
+    s.work_width = w.width;
+    s.work_height = w.height;
+    s.scale_factor = d->GetDeviceScaleFactor();
+    s.is_primary = d->GetID() == primary_id;
+    screens.push_back(s);
+  }
+  std::stable_partition(screens.begin(), screens.end(),
+                        [](const laufey_screen_t& s) { return s.is_primary; });
+  return screens;
+}
+
+static size_t Backend_GetScreens(void* /*data*/, laufey_screen_t* out,
+                                 size_t capacity) {
+  std::vector<laufey_screen_t> screens;
+  cef_invoke_sync([&] { screens = CefCollectScreens(); });
+  return laufey_common::CopyScreens(screens, out, capacity);
+}
+
+static int64_t Backend_GetWindowScreen(void* /*data*/, uint32_t window_id) {
+  int64_t id = 0;
+  cef_invoke_sync([&] {
+    CefRefPtr<CefWindow> window = CefWindowForId(window_id);
+    if (!window || window->IsClosed())
+      return;
+    // The screen the window overlaps most, from its bounds: CefWindow's
+    // GetDisplay() crashed on macOS for a window that had just been shown
+    // (seen in CI), and the overlap rule is what the ABI promises anyway.
+    laufey_common::Bounds frame;
+    CefPoint pos = window->GetPosition();
+    CefSize size = window->GetSize();
+    frame.x = pos.x;
+    frame.y = pos.y;
+    frame.width = size.width;
+    frame.height = size.height;
+    id = laufey_common::ScreenForBounds(CefCollectScreens(), frame);
+  });
+  return id;
+}
+
+#if !defined(__APPLE__) && !defined(_WIN32)
+// Linux: CEF reports no display changes, so compare the layout every 2 s
+// while a handler is registered.
+static std::string CefScreensSignature() {
+  std::string sig;
+  for (const auto& s : CefCollectScreens()) {
+    sig += std::to_string(s.id) + ":" + std::to_string(s.x) + "," +
+           std::to_string(s.y) + "," + std::to_string(s.width) + "x" +
+           std::to_string(s.height) + "/" + std::to_string(s.work_x) + "," +
+           std::to_string(s.work_y) + "," + std::to_string(s.work_width) + "x" +
+           std::to_string(s.work_height) + "@" +
+           std::to_string(s.scale_factor) + (s.is_primary ? "p" : "") + ";";
+  }
+  return sig;
+}
+
+static void CefPollDisplays(std::string last) {
+  std::string now = CefScreensSignature();
+  if (now != last)
+    laufey_common::NotifyDisplayChanged();
+  CefPostDelayedTask(TID_UI, base::BindOnce(&CefPollDisplays, now), 2000);
+}
+#endif
+
+static void Backend_SetDisplayChangedHandler(void* /*data*/,
+                                             laufey_display_changed_fn handler,
+                                             void* user_data) {
+  laufey_common::SetDisplayChangedHandler(handler, user_data);
+  if (!handler)
+    return;
+  static std::atomic<bool> installed{false};
+  if (installed.exchange(true))
+    return;
+#if defined(__APPLE__)
+  laufey_common::MacInstallDisplayWatcher();
+#elif defined(_WIN32)
+  CefPostTask(TID_UI, base::BindOnce(
+                          [] { laufey_common::WinInstallDisplayWatcher(); }));
+#else
+  CefPostTask(TID_UI,
+              base::BindOnce([] { CefPollDisplays(CefScreensSignature()); }));
+#endif
+}
+
+static bool Backend_SetWindowTitlebarStyle(void* /*data*/, uint32_t window_id,
+                                           int style) {
+#if defined(__APPLE__)
+  bool ok = false;
+  cef_invoke_sync([&] {
+    if (CefRefPtr<CefWindow> window = CefWindowForId(window_id)) {
+      ok = laufey_common::MacSetTitlebarStyle(
+          NSWindowForCefHandle(window->GetWindowHandle()), style);
+    }
+  });
+  return ok;
+#else
+  (void)window_id;
+  (void)style;
+  return false;
+#endif
+}
+
+static bool Backend_SetWindowTrafficLightPosition(void* /*data*/,
+                                                  uint32_t window_id, int x,
+                                                  int y) {
+#if defined(__APPLE__)
+  bool ok = false;
+  cef_invoke_sync([&] {
+    if (CefRefPtr<CefWindow> window = CefWindowForId(window_id)) {
+      ok = laufey_common::MacSetTrafficLightPosition(
+          NSWindowForCefHandle(window->GetWindowHandle()), x, y);
+    }
+  });
+  return ok;
+#else
+  (void)window_id;
+  (void)x;
+  (void)y;
+  return false;
+#endif
+}
+
+static bool Backend_SetWindowBackdrop(void* /*data*/, uint32_t /*window_id*/,
+                                      int backdrop, int /*material*/) {
+  // See Backend_WindowCapabilities: nothing can show through the CEF view.
+  return backdrop == LAUFEY_BACKDROP_NONE;
+}
+
+static bool Backend_GetWindowNormalBounds(void* /*data*/, uint32_t window_id,
+                                          int* x, int* y, int* width,
+                                          int* height) {
+  bool found = false;
+  laufey_common::Bounds b;
+  cef_invoke_sync([&] {
+    CefRefPtr<CefWindow> window = CefWindowForId(window_id);
+    if (!window)
+      return;
+    found = true;
+    if (CefStateOf(window) != 0 &&
+        laufey_common::GetCommittedNormalBounds(window_id, &b))
+      return;
+    b = CefBoundsOf(window, window_id);
+  });
+  if (!found)
+    return false;
+  if (x)
+    *x = b.x;
+  if (y)
+    *y = b.y;
+  if (width)
+    *width = b.width;
+  if (height)
+    *height = b.height;
+  return true;
+}
+
+static void Backend_SetQuitOnLastWindowClosed(void* /*data*/, bool quit) {
+  laufey_common::SetQuitOnLastWindowClosed(quit);
 }
 
 void RuntimeLoader::InitializeBackendApi() {
@@ -1762,6 +3004,16 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.version = LAUFEY_API_VERSION;
   backend_api_.backend_data = this;
   backend_api_.test_click_menu_item = Backend_TestClickMenuItem;
+#ifdef __linux__
+  // backend-common's GTK work (clipboard, file dialogs, drag source) runs on
+  // the CEF UI thread, through CEF's own task queue.
+  laufey_common::SetGtkThread(
+      [](std::function<void()> fn) {
+        CefPostTask(TID_UI, base::BindOnce([](std::function<void()> f) { f(); },
+                                           std::move(fn)));
+      },
+      [] { return CefCurrentlyOn(TID_UI); });
+#endif
 
   backend_api_.create_window = Backend_CreateWindow;
   backend_api_.create_window_ex = Backend_CreateWindowEx;
@@ -1773,14 +3025,17 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.quit = Backend_Quit;
   backend_api_.set_window_size = Backend_SetWindowSize;
   backend_api_.get_window_size = Backend_GetWindowSize;
+  backend_api_.get_window_outer_size = Backend_GetWindowOuterSize;
   backend_api_.set_window_position = Backend_SetWindowPosition;
   backend_api_.get_window_position = Backend_GetWindowPosition;
+  backend_api_.get_window_inner_position = Backend_GetWindowInnerPosition;
   backend_api_.set_resizable = Backend_SetResizable;
   backend_api_.is_resizable = Backend_IsResizable;
   backend_api_.set_always_on_top = Backend_SetAlwaysOnTop;
   backend_api_.is_always_on_top = Backend_IsAlwaysOnTop;
   backend_api_.set_window_opacity = Backend_SetWindowOpacity;
   backend_api_.get_window_opacity = Backend_GetWindowOpacity;
+  backend_api_.get_window_scale_factor = Backend_GetWindowScaleFactor;
   backend_api_.set_click_passthrough = Backend_SetClickPassthrough;
   backend_api_.is_click_passthrough = Backend_IsClickPassthrough;
   backend_api_.set_click_passthrough_forward =
@@ -1831,6 +3086,25 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.set_move_handler = Backend_SetMoveHandler;
   backend_api_.set_close_requested_handler = Backend_SetCloseRequestedHandler;
   backend_api_.test_trigger_close_requested = Backend_TestTriggerCloseRequested;
+  backend_api_.test_inject_input = Backend_TestInjectInput;
+
+  // Window state, constraints, screens and chrome (API >= 38).
+  backend_api_.set_window_state = Backend_SetWindowState;
+  backend_api_.get_window_state = Backend_GetWindowState;
+  backend_api_.set_window_state_handler = Backend_SetWindowStateHandler;
+  backend_api_.set_window_size_constraints = Backend_SetWindowSizeConstraints;
+  backend_api_.get_window_size_constraints = Backend_GetWindowSizeConstraints;
+  backend_api_.get_screens = Backend_GetScreens;
+  backend_api_.get_window_screen = Backend_GetWindowScreen;
+  backend_api_.set_display_changed_handler = Backend_SetDisplayChangedHandler;
+  backend_api_.window_capabilities = Backend_WindowCapabilities;
+  backend_api_.set_window_titlebar_style = Backend_SetWindowTitlebarStyle;
+  backend_api_.set_window_traffic_light_position =
+      Backend_SetWindowTrafficLightPosition;
+  backend_api_.set_window_backdrop = Backend_SetWindowBackdrop;
+  backend_api_.get_window_normal_bounds = Backend_GetWindowNormalBounds;
+  backend_api_.set_quit_on_last_window_closed =
+      Backend_SetQuitOnLastWindowClosed;
 
   backend_api_.poll_js_calls = [](void* data) {
     RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
@@ -1849,24 +3123,29 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.scheme_response_write = Backend_SchemeResponseWrite;
   backend_api_.scheme_response_finish = Backend_SchemeResponseFinish;
 
-#if defined(_WIN32)
-  backend_api_.set_application_menu = Backend_SetApplicationMenu;
-  backend_api_.show_context_menu = Backend_ShowContextMenu;
-#elif defined(__APPLE__)
+#if defined(__APPLE__)
   backend_api_.set_application_menu = Backend_SetApplicationMenu_Mac;
   backend_api_.show_context_menu = Backend_ShowContextMenu_Mac;
+  backend_api_.show_context_menu_ex = Backend_ShowContextMenuEx_Mac;
+  backend_api_.menu_capabilities = [](void*) -> uint32_t {
+    return LAUFEY_MENU_CAP_APP_MENU | LAUFEY_MENU_CAP_ACCELERATORS |
+           LAUFEY_MENU_CAP_CONTEXT_MENU | LAUFEY_MENU_CAP_CONTEXT_CLOSED |
+           LAUFEY_MENU_CAP_ICONS | LAUFEY_MENU_CAP_TOOLTIPS;
+  };
+  backend_api_.test_trigger_menu_accelerator =
+      [](void*, uint32_t window_id, const char* accelerator) -> bool {
+    return laufey_common::TestTriggerMenuAcceleratorMac(window_id, accelerator);
+  };
 #else
-  // Linux: in-window menu bar (set_application_menu) requires packing a
-  // GtkMenuBar above the browser, which means the top-level window must be
-  // a GtkWindow we own. CEF Views creates the native window itself, so an
-  // embedded menubar isn't reachable without reparenting CEF into a GTK
-  // host — and that path breaks on XWayland (cross-client X11 child
-  // windows aren't supported in Wayland-native ways). Context menus and
-  // tray menus still work because GtkMenu popups don't need a GtkWindow.
-  backend_api_.set_application_menu = [](void*, uint32_t, laufey_value_t*,
-                                         laufey_menu_click_fn, void*) {};
-  backend_api_.show_context_menu = Backend_ShowContextMenu_Linux;
+  // Windows and Linux: a CEF Views menu bar with window accelerators.
+  backend_api_.set_application_menu = Backend_SetApplicationMenu;
+  backend_api_.show_context_menu = Backend_ShowContextMenu;
+  backend_api_.show_context_menu_ex = Backend_ShowContextMenuEx;
+  backend_api_.menu_capabilities = Backend_MenuCapabilities;
+  backend_api_.test_trigger_menu_accelerator =
+      Backend_TestTriggerMenuAccelerator;
 #endif
+  backend_api_.test_dismiss_context_menu = Backend_TestDismissContextMenu;
 
   backend_api_.open_devtools = Backend_OpenDevTools;
   backend_api_.print_to_pdf = Backend_PrintToPdf;
@@ -1883,6 +3162,12 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.set_dock_menu = Backend_SetDockMenu_Mac;
   backend_api_.set_dock_visible = Backend_SetDockVisible_Mac;
   backend_api_.set_dock_reopen_handler = Backend_SetDockReopenHandler_Mac;
+  // Deep links: macOS-only by design (see set_open_url_handler in laufey.h).
+  // Windows/Linux receive the URL as argv in a new process, which only the
+  // embedder can turn into "focus the running app", so the pointers stay
+  // NULL there and an embedder can detect the absence.
+  backend_api_.set_open_url_handler = Backend_SetOpenUrlHandler_Mac;
+  backend_api_.test_trigger_open_url = Backend_TestTriggerOpenUrl_Mac;
 #elif defined(_WIN32)
   backend_api_.bounce_dock = Backend_BounceDock_Win;
   backend_api_.set_dock_badge = Backend_SetDockBadge_TitlePrefix;
@@ -1893,6 +3178,63 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.set_dock_badge = Backend_SetDockBadge_TitlePrefix;
   // Menu/visible/reopen: left nullptr (no clean Linux analog).
 #endif
+
+  // Single instance (API >= 36), every OS: forwarded launches from
+  // laufey_single_instance (see docs/deep-links.md).
+  backend_api_.set_second_instance_handler = Backend_SetSecondInstanceHandler;
+  // Passkeys (API >= 37): see docs/passkeys.md.
+  backend_api_.passkey_capabilities = Backend_PasskeyCapabilities;
+  backend_api_.passkey_request = Backend_PasskeyRequest;
+
+  // Drag and drop, file dialogs and the rich clipboard (API >= 39).
+  backend_api_.set_file_drop_handler = Backend_SetFileDropHandler;
+  backend_api_.start_file_drag = Backend_StartFileDrag;
+  backend_api_.test_trigger_file_drop = Backend_TestTriggerFileDrop;
+  backend_api_.show_file_dialog = Backend_ShowFileDialog;
+  backend_api_.cancel_file_dialog = Backend_CancelFileDialog;
+  backend_api_.test_file_dialog_respond = Backend_TestFileDialogRespond;
+  backend_api_.clipboard_capabilities = Backend_ClipboardCapabilities;
+  backend_api_.read_clipboard_html = Backend_ReadClipboardHtml;
+  backend_api_.write_clipboard_html = Backend_WriteClipboardHtml;
+  backend_api_.read_clipboard_image = Backend_ReadClipboardImage;
+  backend_api_.write_clipboard_image = Backend_WriteClipboardImage;
+  backend_api_.read_clipboard_formats = Backend_ReadClipboardFormats;
+  backend_api_.set_clipboard_change_handler = Backend_SetClipboardChangeHandler;
+  backend_api_.buffer_free = Backend_BufferFree;
+
+  // Global shortcuts, launch at login, DevTools (API >= 40): see
+  // docs/global-shortcuts.md, docs/launch-at-login.md, docs/devtools.md.
+#if defined(__APPLE__)
+  laufey_common::InstallShortcutPlatform(
+      laufey_common::CreateShortcutPlatformMac());
+#elif defined(_WIN32)
+  // RegisterHotKey's window lives on the CEF UI thread.
+  laufey_common::InstallShortcutPlatform(
+      laufey_common::CreateShortcutPlatformWin([](std::function<void()> task) {
+        if (CefCurrentlyOn(TID_UI)) {
+          task();
+          return;
+        }
+        CefPostTask(TID_UI, base::BindOnce([](std::function<void()> t) { t(); },
+                                           std::move(task)));
+      }));
+#else
+  laufey_common::InstallShortcutPlatform(
+      laufey_common::CreateShortcutPlatformLinux());
+#endif
+  backend_api_.system_capabilities = Backend_SystemCapabilities;
+  backend_api_.set_shortcut_handler = Backend_SetShortcutHandler;
+  backend_api_.register_shortcut = Backend_RegisterShortcut;
+  backend_api_.unregister_shortcut = Backend_UnregisterShortcut;
+  backend_api_.unregister_all_shortcuts = Backend_UnregisterAllShortcuts;
+  backend_api_.list_shortcuts = Backend_ListShortcuts;
+  backend_api_.canonicalize_accelerator = Backend_CanonicalizeAccelerator;
+  backend_api_.test_trigger_shortcut = Backend_TestTriggerShortcut;
+  backend_api_.get_launch_at_login = Backend_GetLaunchAtLogin;
+  backend_api_.set_launch_at_login = Backend_SetLaunchAtLogin;
+  backend_api_.close_devtools = Backend_CloseDevTools;
+  backend_api_.is_devtools_open = Backend_IsDevToolsOpen;
+  backend_api_.is_devtools_enabled = Backend_IsDevToolsEnabled;
 
   // --- Tray / status bar ---
 #if defined(__APPLE__)
@@ -1932,26 +3274,27 @@ void RuntimeLoader::InitializeBackendApi() {
   // and Tray.getBounds() reports null.
 #endif
 
-  // --- Notifications ---
-#if defined(__APPLE__)
-  backend_api_.show_notification = Backend_ShowNotification_Mac;
-  backend_api_.close_notification = Backend_CloseNotification_Mac;
-#elif defined(_WIN32)
-  backend_api_.show_notification = Backend_ShowNotification_Win;
-  backend_api_.close_notification = Backend_CloseNotification_Win;
-#elif defined(__linux__)
-  backend_api_.show_notification = Backend_ShowNotification_Linux;
-  backend_api_.close_notification = Backend_CloseNotification_Linux;
-#endif
+  // --- Notifications and permissions (laufey_notifications.h) ---
+  backend_api_.show_notification = Backend_ShowNotification;
+  backend_api_.close_notification = Backend_CloseNotification;
+  backend_api_.query_permission = Backend_QueryPermission;
+  backend_api_.request_permission = Backend_RequestPermission;
+  backend_api_.notification_capabilities = Backend_NotificationCapabilities;
+  backend_api_.set_notification_response_handler =
+      Backend_SetNotificationResponseHandler;
+  backend_api_.list_scheduled_notifications =
+      Backend_ListScheduledNotifications;
+  backend_api_.cancel_notification = Backend_CancelNotification;
+  backend_api_.test_notification_respond = Backend_TestNotificationRespond;
 
-  // --- Permissions ---
-#if defined(__APPLE__)
-  backend_api_.query_permission = Backend_QueryPermission_Mac;
-  backend_api_.request_permission = Backend_RequestPermission_Mac;
-#else
-  backend_api_.query_permission = Backend_QueryPermission_Stub;
-  backend_api_.request_permission = Backend_RequestPermission_Stub;
-#endif
+  // UI-thread tasks and auth sessions (API >= 42): see docs/c-abi.md and
+  // docs/auth-session.md. The dispatcher is bound to TID_UI in Load.
+  backend_api_.dispatch_ui_task = Backend_DispatchUiTask;
+  backend_api_.is_ui_thread = Backend_IsUiThread;
+  backend_api_.auth_session_capabilities = Backend_AuthSessionCapabilities;
+  backend_api_.auth_session_start = Backend_AuthSessionStart;
+  backend_api_.test_cancel_auth_session = Backend_TestCancelAuthSession;
+  backend_api_.auth_session_cancel = Backend_AuthSessionCancel;
 }
 
 // --- RuntimeLoader lifecycle ---
@@ -1981,6 +3324,27 @@ RuntimeLoader* RuntimeLoader::GetInstance() {
 }
 
 bool RuntimeLoader::Load(const std::string& path) {
+  // Load runs on TID_UI (OnContextInitialized), or on the main thread of a
+  // headless worker, which has no loop (its host calls UiLoopEnded before
+  // starting the runtime). CefPostTask refuses once CEF has shut down.
+  laufey_common::UiTaskDispatcher::Get().Bind(
+      [](void (*task)(void*), void* task_data) {
+        return CefPostTask(
+            TID_UI, base::BindOnce([](void (*t)(void*), void* d) { t(d); },
+                                   task, task_data));
+      });
+#if defined(_WIN32)
+  // A context menu's TrackPopupMenu runs a native modal loop on TID_UI, and
+  // Chromium runs no tasks inside one unless told to: every CefPostTask (the
+  // runtime's synchronous UI-thread calls, dispatch_ui_task, the page's
+  // binding calls) would wait for the menu to close, and the runtime with
+  // them. Allow nestable tasks for the length of the loop (laufey_menu.h).
+  // The menu code is reentrancy safe for this: a task that shows another
+  // menu ends the open one first (win32_menu.h), and one that closes the
+  // window ends it too.
+  laufey_common::SetNativeModalLoopHook(
+      [](bool entering) { CefSetNestableTasksAllowed(entering); });
+#endif
 #ifndef _WIN32
   library_handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!library_handle_) {
@@ -2172,28 +3536,50 @@ void RuntimeLoader::SetSchemeRequestHandler(const std::string& scheme,
                                             laufey_scheme_request_fn handler,
                                             laufey_scheme_cancel_fn on_cancel,
                                             void* user_data) {
-  bool need_register = false;
-  std::string scheme_to_register;
+  // Schemes that still need a handler factory. The built-in "app" is served
+  // whenever any handler is registered, as on the WebView backends, so an
+  // embedder that registers only its own scheme keeps app:// working.
+  std::vector<std::string> to_register;
   {
     std::lock_guard<std::mutex> lock(scheme_mutex_);
     scheme_request_handler_ = handler;
     scheme_cancel_handler_ = on_cancel;
     scheme_user_data_ = user_data;
-    scheme_name_ = scheme;
-    if (handler && !scheme_factory_registered_) {
-      scheme_factory_registered_ = true;
-      need_register = true;
-      scheme_to_register = scheme;
+    if (handler) {
+      std::vector<std::string> wanted = {LAUFEY_APP_SCHEME};
+      if (!laufey_common::IsValidSchemeName(scheme)) {
+        std::cerr << "laufey: ignoring invalid URL scheme name \"" << scheme
+                  << "\" passed to register_scheme_handler" << std::endl;
+      } else {
+        wanted.push_back(laufey_common::NormalizeSchemeName(scheme));
+      }
+      for (const std::string& s : wanted) {
+        if (scheme_factories_.insert(s).second) {
+          to_register.push_back(s);
+        }
+      }
     }
   }
-  if (need_register) {
+  for (const std::string& s : to_register) {
+    if (!laufey_schemes::IsDeclared(s)) {
+      // The factory still serves the scheme, but Chromium registered its
+      // standard/secure/CORS flags at startup, so an undeclared scheme gets
+      // an opaque origin and no secure context.
+      std::cerr << "laufey: scheme \"" << s
+                << "\" was not declared at startup (--"
+                << laufey_schemes::kSwitch << " / " << laufey_schemes::kEnv
+                << " / \"customSchemes\" in laufey-launch.json); pages "
+                   "served over it will not be a secure "
+                   "`<scheme>://<host>` origin"
+                << std::endl;
+    }
     // CefRegisterSchemeHandlerFactory must run on the UI thread.
     CefPostTask(TID_UI, base::BindOnce(
-                            [](std::string s) {
+                            [](std::string name) {
                               CefRegisterSchemeHandlerFactory(
-                                  s, "", new LaufeySchemeHandlerFactory());
+                                  name, "", new LaufeySchemeHandlerFactory());
                             },
-                            scheme_to_register));
+                            s));
   }
 }
 

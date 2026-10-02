@@ -12,10 +12,11 @@
 #include "include/cef_resource_handler.h"
 #include "include/cef_scheme.h"
 
-// The custom standard scheme laufey registers for in-process app serving
-// (e.g. "app://..."). Declared as a standard, secure, fetch/CORS-enabled
-// scheme in LaufeyApp::OnRegisterCustomSchemes so pages served over it behave
-// like normal https origins.
+// The built-in custom standard scheme laufey registers for in-process app
+// serving (e.g. "app://..."). Declared as a standard, secure, fetch/CORS-
+// enabled scheme in every process's OnRegisterCustomSchemes (see
+// custom_schemes.h, which also declares the embedder's additional schemes) so
+// pages served over it behave like normal https origins.
 #define LAUFEY_APP_SCHEME "app"
 
 // A CefResourceHandler that bridges a single webview request to the laufey
@@ -66,6 +67,8 @@ class LaufeySchemeHandler : public CefResourceHandler {
   bool began_ = false;
   bool finished_ = false;
   bool cancelled_ = false;
+  // The body outgrew kMaxQueuedResponseBytes unread: the response failed.
+  bool failed_ = false;
 
   // Deferred CEF continuations. When a Read arrives with no body buffered, the
   // caller's output buffer (`pending_data_` / `pending_cap_`, valid until the

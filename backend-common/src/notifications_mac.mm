@@ -1,135 +1,415 @@
 // Copyright 2025 Divy Srivastava. All rights reserved. MIT license.
 //
-// Notifications (macOS, UNUserNotificationCenter).
+// Notifications on macOS (API 41): UNUserNotificationCenter.
 //
-// Uses the modern UN API (10.14+). Delivery is gated on UN authorization,
-// so the permission API reports the same state that governs whether
-// `show_notification` actually displays anything. UN requires the process
-// to run inside a bundled .app with a CFBundleIdentifier; when unbundled
-// or unauthorized, `addNotificationRequest` fails and we emit a synthetic
-// CLOSED event so callers see the lifecycle close out.
+// - Delivery now, or at "schedule_at" through a UNTimeIntervalNotification
+//   Trigger (under a minute away) or a UNCalendarNotificationTrigger (the
+//   wall-clock date, so a sleep in between doesn't shift it). The system
+//   holds a scheduled request: it fires whether or not the app runs.
+// - The tag is the request identifier (a later request with the same one
+//   replaces it), and the userInfo carries the tag, the "data" and the
+//   actions, so a click (or the pending list) after a relaunch has them.
+// - Actions are a UNNotificationCategory per action set, named by a hash of
+//   the set; categories registered by earlier runs are kept (a pending
+//   request from one still needs its category).
+// - The delegate is installed at launch (InitNotificationsAtLaunch, from each
+//   backend's applicationWillFinishLaunching:), so the click that launched
+//   the app reaches didReceiveNotificationResponse: and the response buffer.
+//
+// UN requires the process to run inside a bundled .app with a
+// CFBundleIdentifier; unbundled, every capability is off, permissions are
+// UNSUPPORTED and showing fails.
 
-#include "laufey_backend_common.h"
+#include "laufey_notifications.h"
 
 #import <Foundation/Foundation.h>
 #import <UserNotifications/UserNotifications.h>
 
-#include <atomic>
+#include <algorithm>
 #include <map>
+#include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace laufey_common {
-
 namespace {
 
-struct UnNotifEntry {
-  // UN identifies requests by string. We key our own map by nid but also
-  // need the identifier to look up entries from delegate callbacks (which
-  // only know the request).
-  std::string identifier;
-  laufey_notification_event_fn on_event;
-  void* user_data;
-  std::vector<std::string> action_ids;
+NSString* const kTagKey = @"laufey.tag";
+NSString* const kDataKey = @"laufey.data";
+NSString* const kActionsKey = @"laufey.actions";
+
+bool MacProcessIsBundled() {
+  static const bool bundled = [] {
+    NSBundle* mb = [NSBundle mainBundle];
+    if (!mb || ![mb bundleIdentifier])
+      return false;
+    // Reject the synthetic bundle `cargo run` etc. produce for a bare exe.
+    NSString* path = [mb bundlePath];
+    return path && [path hasSuffix:@".app"];
+  }();
+  return bundled;
+}
+
+NSString* NSStr(const std::string& s) {
+  NSString* r = [NSString stringWithUTF8String:s.c_str()];
+  return r ? r : @"";
+}
+
+std::string StdStr(NSString* s) {
+  return s ? std::string([s UTF8String]) : std::string();
+}
+
+int MapUNStatus(UNAuthorizationStatus s) {
+  switch (s) {
+    case UNAuthorizationStatusNotDetermined:
+      return LAUFEY_PERMISSION_STATUS_PROMPT;
+    case UNAuthorizationStatusDenied:
+      return LAUFEY_PERMISSION_STATUS_DENIED;
+    case UNAuthorizationStatusAuthorized:
+    case UNAuthorizationStatusProvisional:
+      return LAUFEY_PERMISSION_STATUS_GRANTED;
+    default:
+      return LAUFEY_PERMISSION_STATUS_UNSUPPORTED;
+  }
+}
+
+// FNV-1a 64 of the action set: the category identifier, stable across runs.
+NSString* CategoryIdFor(const std::vector<NotificationAction>& actions) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](const std::string& s) {
+    for (unsigned char c : s) {
+      h ^= c;
+      h *= 1099511628211ull;
+    }
+    h ^= 0x1f;
+    h *= 1099511628211ull;
+  };
+  for (const NotificationAction& a : actions) {
+    mix(a.id);
+    mix(a.title);
+  }
+  return [NSString stringWithFormat:@"laufey.cat.%016llx",
+                                    static_cast<unsigned long long>(h)];
+}
+
+UNNotificationCategory* CategoryFor(
+    NSString* category_id, const std::vector<NotificationAction>& actions) {
+  NSMutableArray<UNNotificationAction*>* arr = [NSMutableArray array];
+  for (const NotificationAction& a : actions) {
+    [arr addObject:
+             [UNNotificationAction
+                 actionWithIdentifier:NSStr(a.id)
+                                title:NSStr(a.title)
+                              options:UNNotificationActionOptionForeground]];
+  }
+  return [UNNotificationCategory
+      categoryWithIdentifier:category_id
+                     actions:arr
+           intentIdentifiers:@[]
+                     options:UNNotificationCategoryOptionCustomDismissAction];
+}
+
+// Makes sure `category_id` is registered (merged with the categories already
+// registered, this run's or an earlier one's), then runs `then`. Main queue.
+void EnsureCategory(NSString* category_id,
+                    const std::vector<NotificationAction>& actions,
+                    void (^then)(void)) {
+  static NSMutableSet<NSString*>* known = [NSMutableSet set];
+  if (!category_id || [known containsObject:category_id]) {
+    then();
+    return;
+  }
+  UNNotificationCategory* category = CategoryFor(category_id, actions);
+  UNUserNotificationCenter* center =
+      [UNUserNotificationCenter currentNotificationCenter];
+  [center getNotificationCategoriesWithCompletionHandler:^(
+              NSSet<UNNotificationCategory*>* existing) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      NSMutableSet<UNNotificationCategory*>* all = [NSMutableSet set];
+      for (UNNotificationCategory* c in existing) {
+        if (![c.identifier isEqualToString:category.identifier])
+          [all addObject:c];
+      }
+      [all addObject:category];
+      [center setNotificationCategories:all];
+      for (UNNotificationCategory* c in all)
+        [known addObject:c.identifier];
+      then();
+    });
+  }];
+}
+
+UNNotificationTrigger* TriggerFor(int64_t at_ms) {
+  if (at_ms <= 0)
+    return nil;
+  double delay = (at_ms - UnixTimeMs()) / 1000.0;
+  if (delay <= 0)
+    return nil;
+  if (delay < 60) {
+    return [UNTimeIntervalNotificationTrigger
+        triggerWithTimeInterval:std::max(delay, 0.1)
+                        repeats:NO];
+  }
+  NSDate* date = [NSDate dateWithTimeIntervalSince1970:at_ms / 1000.0];
+  NSDateComponents* parts = [[NSCalendar currentCalendar]
+      components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay |
+                 NSCalendarUnitHour | NSCalendarUnitMinute |
+                 NSCalendarUnitSecond
+        fromDate:date];
+  return [UNCalendarNotificationTrigger triggerWithDateMatchingComponents:parts
+                                                                  repeats:NO];
+}
+
+std::string TagOf(UNNotificationRequest* request) {
+  id tag = request.content.userInfo[kTagKey];
+  if ([tag isKindOfClass:[NSString class]])
+    return StdStr(tag);
+  return StdStr(request.identifier);
+}
+
+bool DataOf(UNNotificationRequest* request, std::string* out) {
+  id data = request.content.userInfo[kDataKey];
+  if (![data isKindOfClass:[NSString class]])
+    return false;
+  *out = StdStr(data);
+  return true;
+}
+
+class MacNotificationPlatform : public NotificationPlatform {
+ public:
+  uint32_t Capabilities() override {
+    if (!MacProcessIsBundled())
+      return 0;
+    return LAUFEY_NOTIFICATION_CAP_SHOW | LAUFEY_NOTIFICATION_CAP_SCHEDULE |
+           LAUFEY_NOTIFICATION_CAP_SCHEDULE_PERSISTS |
+           LAUFEY_NOTIFICATION_CAP_ACTIONS | LAUFEY_NOTIFICATION_CAP_CLICKS |
+           LAUFEY_NOTIFICATION_CAP_COLD_START;
+  }
+
+  bool Show(const NotificationOptions& opts) override {
+    if (!MacProcessIsBundled())
+      return false;
+    InitNotificationsAtLaunch();
+    std::string tag = opts.tag;
+    NSString* ident = NSStr(tag);
+    NSMutableDictionary* info = [NSMutableDictionary dictionary];
+    info[kTagKey] = ident;
+    if (opts.has_data)
+      info[kDataKey] = NSStr(opts.data);
+    if (!opts.actions.empty()) {
+      NSMutableArray* acts = [NSMutableArray array];
+      for (const NotificationAction& a : opts.actions)
+        [acts addObject:@[ NSStr(a.id), NSStr(a.title) ]];
+      info[kActionsKey] = acts;
+    }
+    UNMutableNotificationContent* content =
+        [[UNMutableNotificationContent alloc] init];
+    content.title = NSStr(opts.title);
+    content.body = NSStr(opts.body);
+    content.userInfo = info;
+    if (!opts.silent)
+      content.sound = [UNNotificationSound defaultSound];
+    NSString* category_id =
+        opts.actions.empty() ? nil : CategoryIdFor(opts.actions);
+    if (category_id)
+      content.categoryIdentifier = category_id;
+    UNNotificationTrigger* trigger = TriggerFor(opts.schedule_at_ms);
+    UNNotificationRequest* request =
+        [UNNotificationRequest requestWithIdentifier:ident
+                                             content:content
+                                             trigger:trigger];
+    std::vector<NotificationAction> actions = opts.actions;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      EnsureCategory(category_id, actions, ^{
+        [[UNUserNotificationCenter currentNotificationCenter]
+            addNotificationRequest:request
+             withCompletionHandler:^(NSError* error) {
+               if (!error)
+                 return;
+               // Most often: not authorized. The ABI has no "error" event;
+               // the lifecycle closes out.
+               NSLog(@"laufey: notification not posted: %@", error);
+               DispatchNotificationClosed(tag);
+             }];
+      });
+    });
+    return true;
+  }
+
+  void Remove(const std::string& tag) override {
+    if (!MacProcessIsBundled())
+      return;
+    NSString* ident = NSStr(tag);
+    UNUserNotificationCenter* center =
+        [UNUserNotificationCenter currentNotificationCenter];
+    [center removePendingNotificationRequestsWithIdentifiers:@[ ident ]];
+    [center removeDeliveredNotificationsWithIdentifiers:@[ ident ]];
+  }
+
+  void ListScheduled(
+      std::function<void(std::vector<ScheduledNotification>)> done) override {
+    if (!MacProcessIsBundled()) {
+      done({});
+      return;
+    }
+    auto* heap = new std::function<void(std::vector<ScheduledNotification>)>(
+        std::move(done));
+    [[UNUserNotificationCenter currentNotificationCenter]
+        getPendingNotificationRequestsWithCompletionHandler:^(
+            NSArray<UNNotificationRequest*>* requests) {
+          std::vector<ScheduledNotification> list;
+          for (UNNotificationRequest* r in requests) {
+            if (![r.content.userInfo[kTagKey] isKindOfClass:[NSString class]])
+              continue;  // not one of laufey's
+            ScheduledNotification n;
+            n.tag = TagOf(r);
+            n.title = StdStr(r.content.title);
+            n.body = StdStr(r.content.body);
+            n.has_data = DataOf(r, &n.data);
+            NSDate* next = nil;
+            if ([r.trigger isKindOfClass:[UNCalendarNotificationTrigger class]])
+              next =
+                  [(UNCalendarNotificationTrigger*)r.trigger nextTriggerDate];
+            else if ([r.trigger isKindOfClass:[UNTimeIntervalNotificationTrigger
+                                                  class]])
+              next = [(UNTimeIntervalNotificationTrigger*)
+                          r.trigger nextTriggerDate];
+            n.at_ms = next ? static_cast<int64_t>([next timeIntervalSince1970] *
+                                                  1000.0)
+                           : 0;
+            id acts = r.content.userInfo[kActionsKey];
+            if ([acts isKindOfClass:[NSArray class]]) {
+              for (id pair in (NSArray*)acts) {
+                if ([pair isKindOfClass:[NSArray class]] &&
+                    [(NSArray*)pair count] == 2)
+                  n.actions.push_back({StdStr(pair[0]), StdStr(pair[1])});
+              }
+            }
+            n.silent = r.content.sound == nil;
+            list.push_back(std::move(n));
+          }
+          (*heap)(std::move(list));
+          delete heap;
+        }];
+  }
+
+  void QueryPermission(int /*kind*/, std::function<void(int)> done) override {
+    if (!MacProcessIsBundled()) {
+      done(LAUFEY_PERMISSION_STATUS_UNSUPPORTED);
+      return;
+    }
+    auto* heap = new std::function<void(int)>(std::move(done));
+    [[UNUserNotificationCenter currentNotificationCenter]
+        getNotificationSettingsWithCompletionHandler:^(
+            UNNotificationSettings* settings) {
+          int status = MapUNStatus(settings.authorizationStatus);
+          dispatch_async(dispatch_get_main_queue(), ^{
+            (*heap)(status);
+            delete heap;
+          });
+        }];
+  }
+
+  void RequestPermission(int kind, std::function<void(int)> done) override {
+    if (!MacProcessIsBundled()) {
+      done(LAUFEY_PERMISSION_STATUS_UNSUPPORTED);
+      return;
+    }
+    auto* heap = new std::function<void(int)>(std::move(done));
+    UNUserNotificationCenter* center =
+        [UNUserNotificationCenter currentNotificationCenter];
+    UNAuthorizationOptions opts = UNAuthorizationOptionAlert |
+                                  UNAuthorizationOptionSound |
+                                  UNAuthorizationOptionBadge;
+    if (kind == LAUFEY_PERMISSION_NOTIFICATIONS_PROVISIONAL)
+      opts |= UNAuthorizationOptionProvisional;
+    [center
+        requestAuthorizationWithOptions:opts
+                      completionHandler:^(BOOL granted, NSError* error) {
+                        if (error)
+                          NSLog(@"laufey: notification authorization: %@",
+                                error);
+                        // The settings tell PROVISIONAL from AUTHORIZED,
+                        // both GRANTED.
+                        [center getNotificationSettingsWithCompletionHandler:^(
+                                    UNNotificationSettings* settings) {
+                          int status;
+                          if (granted) {
+                            status = MapUNStatus(settings.authorizationStatus);
+                          } else {
+                            status =
+                                settings.authorizationStatus ==
+                                        UNAuthorizationStatusNotDetermined
+                                    ? LAUFEY_PERMISSION_STATUS_DENIED
+                                    : MapUNStatus(settings.authorizationStatus);
+                          }
+                          dispatch_async(dispatch_get_main_queue(), ^{
+                            (*heap)(status);
+                            delete heap;
+                          });
+                        }];
+                      }];
+  }
 };
-
-// All access happens on the main queue (delegate callbacks below hop
-// there before touching these maps), so no mutex needed.
-std::map<uint32_t, UnNotifEntry>& UnNotifMap() {
-  static std::map<uint32_t, UnNotifEntry> map;
-  return map;
-}
-
-std::map<std::string, uint32_t>& UnIdentToNid() {
-  static std::map<std::string, uint32_t> map;
-  return map;
-}
-
-// UN requires categories to be pre-registered before content tagged with
-// that category id can be delivered. We accumulate one category per
-// unique action-list shape (keyed by the joined id/title pairs) and
-// re-set the full set whenever a new shape appears.
-std::map<std::string, UNNotificationCategory*>& UnCategories() {
-  static std::map<std::string, UNNotificationCategory*> map;
-  return map;
-}
-
-std::atomic<uint32_t> g_next_notif_id_mac{1};
 
 }  // namespace
 }  // namespace laufey_common
 
 @interface LaufeyUnDelegate : NSObject <UNUserNotificationCenterDelegate>
-+ (instancetype)shared;
 @end
 
 @implementation LaufeyUnDelegate
-+ (instancetype)shared {
-  static LaufeyUnDelegate* instance = nil;
-  static dispatch_once_t once;
-  dispatch_once(&once, ^{
-    instance = [[LaufeyUnDelegate alloc] init];
-  });
-  return instance;
-}
 
-// Foreground delivery: UN's default is to NOT present banners when the
-// app is frontmost. Override so the user sees the notification regardless
-// of activation state — matches what `new Notification(...)` does in a
-// browser. Also the place we hook for SHOWN, since UN doesn't have a
-// separate "did deliver" callback that fires in all activation states.
+// Foreground delivery: UN's default is to NOT present banners when the app
+// is frontmost. Override so the user sees the notification regardless of
+// activation state — matches what `new Notification(...)` does in a browser.
+// Also where SHOWN comes from: UN has no "did deliver" callback otherwise.
 - (void)userNotificationCenter:(UNUserNotificationCenter*)center
        willPresentNotification:(UNNotification*)notification
          withCompletionHandler:
              (void (^)(UNNotificationPresentationOptions))completionHandler {
   (void)center;
-  NSString* ident = notification.request.identifier;
+  std::string tag = laufey_common::TagOf(notification.request);
   dispatch_async(dispatch_get_main_queue(), ^{
-    std::string key = [ident UTF8String];
-    auto& im = laufey_common::UnIdentToNid();
-    auto it = im.find(key);
-    if (it == im.end()) return;
-    auto& nm = laufey_common::UnNotifMap();
-    auto nit = nm.find(it->second);
-    if (nit != nm.end() && nit->second.on_event) {
-      nit->second.on_event(nit->second.user_data, it->second,
-                           LAUFEY_NOTIFICATION_SHOWN, nullptr);
-    }
+    laufey_common::DispatchNotificationShown(tag);
   });
-  completionHandler(UNNotificationPresentationOptionBanner |
-                    UNNotificationPresentationOptionSound |
-                    UNNotificationPresentationOptionBadge);
+  UNNotificationPresentationOptions options =
+      UNNotificationPresentationOptionSound |
+      UNNotificationPresentationOptionBadge;
+  if (@available(macOS 11.0, *)) {
+    options |= UNNotificationPresentationOptionBanner |
+               UNNotificationPresentationOptionList;
+  } else {
+    options |= UNNotificationPresentationOptionAlert;
+  }
+  completionHandler(options);
 }
 
 - (void)userNotificationCenter:(UNUserNotificationCenter*)center
     didReceiveNotificationResponse:(UNNotificationResponse*)response
              withCompletionHandler:(void (^)(void))completionHandler {
   (void)center;
-  NSString* ident = response.notification.request.identifier;
+  UNNotificationRequest* request = response.notification.request;
+  std::string tag = laufey_common::TagOf(request);
+  std::string data;
+  bool has_data = laufey_common::DataOf(request, &data);
   NSString* actId = response.actionIdentifier;
+  bool is_default =
+      [actId isEqualToString:UNNotificationDefaultActionIdentifier];
+  bool is_dismiss =
+      [actId isEqualToString:UNNotificationDismissActionIdentifier];
+  std::string action = laufey_common::StdStr(actId);
   dispatch_async(dispatch_get_main_queue(), ^{
-    std::string key = [ident UTF8String];
-    auto& im = laufey_common::UnIdentToNid();
-    auto it = im.find(key);
-    if (it == im.end()) return;
-    auto& nm = laufey_common::UnNotifMap();
-    auto nit = nm.find(it->second);
-    if (nit == nm.end() || !nit->second.on_event) return;
-    if ([actId isEqualToString:UNNotificationDefaultActionIdentifier]) {
-      // The user clicked the notification body (not an action button).
-      nit->second.on_event(nit->second.user_data, it->second,
-                           LAUFEY_NOTIFICATION_CLICKED, nullptr);
-    } else if ([actId
-                   isEqualToString:UNNotificationDismissActionIdentifier]) {
-      // User explicitly dismissed (Close button on the banner). Requires
-      // the category to opt in via UNNotificationCategoryOptionCustomDismissAction.
-      nit->second.on_event(nit->second.user_data, it->second,
-                           LAUFEY_NOTIFICATION_CLOSED, nullptr);
+    if (is_dismiss) {
+      // The banner's Close button (the category opts into
+      // UNNotificationCategoryOptionCustomDismissAction).
+      laufey_common::DispatchNotificationClosed(tag);
     } else {
-      std::string aid = [actId UTF8String];
-      nit->second.on_event(nit->second.user_data, it->second,
-                           LAUFEY_NOTIFICATION_ACTION, aid.c_str());
+      laufey_common::DispatchNotificationClick(
+          tag, is_default ? nullptr : action.c_str(),
+          has_data ? &data : nullptr);
     }
   });
   completionHandler();
@@ -138,164 +418,23 @@ std::atomic<uint32_t> g_next_notif_id_mac{1};
 
 namespace laufey_common {
 
-namespace {
-
-void EnsureUnDelegate() {
-  static dispatch_once_t once;
-  dispatch_once(&once, ^{
-    [UNUserNotificationCenter currentNotificationCenter].delegate =
-        [LaufeyUnDelegate shared];
-  });
+std::unique_ptr<NotificationPlatform> CreateNotificationPlatform() {
+  return std::make_unique<MacNotificationPlatform>();
 }
 
-// Register a category for the given action set if we haven't seen this
-// shape before. Returns the category identifier to assign to content.
-// Must be called on the main queue.
-NSString* RegisterCategoryIfNeeded(
-    const std::vector<std::pair<std::string, std::string>>& actions) {
-  if (actions.empty()) return nil;
-  std::string key;
-  for (auto& a : actions) {
-    key += a.first;
-    key += '\x1f';
-    key += a.second;
-    key += '\x1e';
-  }
-  auto& cats = UnCategories();
-  auto it = cats.find(key);
-  if (it != cats.end()) return it->second.identifier;
-  NSString* catId =
-      [NSString stringWithFormat:@"laufey.cat.%lu", (unsigned long)cats.size()];
-  NSMutableArray<UNNotificationAction*>* arr = [NSMutableArray array];
-  for (auto& a : actions) {
-    UNNotificationAction* act = [UNNotificationAction
-        actionWithIdentifier:[NSString stringWithUTF8String:a.first.c_str()]
-                       title:[NSString stringWithUTF8String:a.second.c_str()]
-                     options:UNNotificationActionOptionForeground];
-    [arr addObject:act];
-  }
-  UNNotificationCategory* cat = [UNNotificationCategory
-        categoryWithIdentifier:catId
-                       actions:arr
-             intentIdentifiers:@[]
-                       options:UNNotificationCategoryOptionCustomDismissAction];
-  cats[key] = cat;
-  NSMutableSet<UNNotificationCategory*>* all = [NSMutableSet set];
-  for (auto& kv : cats) [all addObject:kv.second];
-  [[UNUserNotificationCenter currentNotificationCenter]
-      setNotificationCategories:all];
-  return catId;
-}
-
-}  // namespace
-
-uint32_t ShowNotificationMac(const NotificationOptions& opts,
-                             laufey_notification_event_fn on_event,
-                             void* user_data) {
-  std::vector<std::pair<std::string, std::string>> actions;
-  actions.reserve(opts.actions.size());
-  for (auto& a : opts.actions) {
-    actions.emplace_back(a.id, a.title);
-  }
-
-  uint32_t nid = g_next_notif_id_mac.fetch_add(1, std::memory_order_relaxed);
-
-  // UN identifies requests by string. Tag (if given) acts as the
-  // identifier so `add` with the same tag replaces the live notification
-  // — matches the Web Notifications "tag" semantics. Without a tag we
-  // synthesize a unique id from our nid.
-  std::string identifier =
-      opts.tag.empty() ? std::string("laufey.notif.") + std::to_string(nid)
-                       : opts.tag;
-
-  NSString* nsTitle = [NSString stringWithUTF8String:opts.title.c_str()];
-  NSString* nsBody = [NSString stringWithUTF8String:opts.body.c_str()];
-  NSString* nsIdent = [NSString stringWithUTF8String:identifier.c_str()];
-
-  std::vector<std::string> action_ids;
-  action_ids.reserve(actions.size());
-  for (auto& a : actions) action_ids.push_back(a.first);
-
-  bool silent = opts.silent;
-
-  dispatch_async(dispatch_get_main_queue(), ^{
-    EnsureUnDelegate();
-    UNUserNotificationCenter* center =
-        [UNUserNotificationCenter currentNotificationCenter];
-
-    // If we're reusing a tag, the old nid->entry mapping is stale.
-    // UN will replace the delivered notification automatically, but our
-    // bookkeeping needs a fresh nid keyed off the same identifier.
-    auto& im = UnIdentToNid();
-    auto prev = im.find(identifier);
-    if (prev != im.end()) {
-      UnNotifMap().erase(prev->second);
-      im.erase(prev);
-    }
-
-    NSString* catId = RegisterCategoryIfNeeded(actions);
-
-    UNMutableNotificationContent* content =
-        [[UNMutableNotificationContent alloc] init];
-    content.title = nsTitle;
-    content.body = nsBody;
-    if (!silent) content.sound = [UNNotificationSound defaultSound];
-    if (catId) content.categoryIdentifier = catId;
-
-    UNNotificationRequest* req =
-        [UNNotificationRequest requestWithIdentifier:nsIdent
-                                             content:content
-                                             trigger:nil];
-
-    UnNotifEntry entry = {};
-    entry.identifier = identifier;
-    entry.on_event = on_event;
-    entry.user_data = user_data;
-    entry.action_ids = action_ids;
-    UnNotifMap()[nid] = entry;
-    UnIdentToNid()[identifier] = nid;
-
-    [center addNotificationRequest:req
-             withCompletionHandler:^(NSError* error) {
-               if (!error) return;
-               // Most common failures: process not bundled, or
-               // authorizationStatus != authorized. There's no spec
-               // event for "never showed", so we collapse it into
-               // CLOSED — the JS Notification spec also fires
-               // "error" + "close" in that order, but the laufey ABI
-               // only has CLOSED in this list.
-               dispatch_async(dispatch_get_main_queue(), ^{
-                 auto& nm = UnNotifMap();
-                 auto nit = nm.find(nid);
-                 if (nit == nm.end()) return;
-                 laufey_notification_event_fn cb = nit->second.on_event;
-                 void* ud = nit->second.user_data;
-                 UnIdentToNid().erase(nit->second.identifier);
-                 nm.erase(nit);
-                 if (cb) cb(ud, nid, LAUFEY_NOTIFICATION_CLOSED, nullptr);
-               });
-             }];
-  });
-
-  return nid;
-}
-
-void CloseNotificationMac(uint32_t notification_id) {
-  dispatch_async(dispatch_get_main_queue(), ^{
-    auto& nm = UnNotifMap();
-    auto it = nm.find(notification_id);
-    if (it == nm.end()) return;
-    std::string ident = it->second.identifier;
-    laufey_notification_event_fn cb = it->second.on_event;
-    void* ud = it->second.user_data;
-    NSString* nsIdent = [NSString stringWithUTF8String:ident.c_str()];
-    UNUserNotificationCenter* center =
-        [UNUserNotificationCenter currentNotificationCenter];
-    [center removeDeliveredNotificationsWithIdentifiers:@[ nsIdent ]];
-    [center removePendingNotificationRequestsWithIdentifiers:@[ nsIdent ]];
-    UnIdentToNid().erase(ident);
-    nm.erase(it);
-    if (cb) cb(ud, notification_id, LAUFEY_NOTIFICATION_CLOSED, nullptr);
+void InitNotificationsAtLaunch() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (!MacProcessIsBundled())
+      return;
+    void (^install)(void) = ^{
+      static LaufeyUnDelegate* delegate = [[LaufeyUnDelegate alloc] init];
+      [UNUserNotificationCenter currentNotificationCenter].delegate = delegate;
+    };
+    if ([NSThread isMainThread])
+      install();
+    else
+      dispatch_async(dispatch_get_main_queue(), install);
   });
 }
 

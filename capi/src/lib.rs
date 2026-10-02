@@ -24,12 +24,30 @@ pub use keyboard::*;
 mod mouse;
 pub use mouse::*;
 
+mod window_state;
+pub use window_state::*;
+
+mod io;
+pub use io::*;
+
+mod system;
+pub use system::*;
+
+mod menus_notifications;
+pub use menus_notifications::*;
+
+mod ui_thread;
+pub use ui_thread::*;
+
+mod auth_session;
+pub use auth_session::*;
+
 /// Version of this laufey crate. Used by downstream consumers (e.g. the Deno CLI)
 /// to locate matching prebuilt backend binaries in GitHub releases
 /// (`github.com/denoland/laufey/releases/tag/v{VERSION}`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const LAUFEY_API_VERSION: u32 = 34;
+pub const LAUFEY_API_VERSION: u32 = 43;
 
 /// Creation-time window style flags for [`Window::new_with_options`].
 /// Mirror the `LAUFEY_WINDOW_FLAG_*` constants in `laufey.h`.
@@ -68,6 +86,12 @@ static DOCK_MENU_HANDLER: OnceLock<
 static DOCK_REOPEN_HANDLER: OnceLock<
   Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>,
 > = OnceLock::new();
+static OPEN_URL_HANDLER: OnceLock<
+  Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>,
+> = OnceLock::new();
+type SecondInstanceHandler = Box<dyn Fn(&[String], &str) + Send + Sync>;
+static SECOND_INSTANCE_HANDLER: OnceLock<Mutex<Option<SecondInstanceHandler>>> =
+  OnceLock::new();
 static TRAY_MENU_HANDLERS: OnceLock<
   Mutex<HashMap<u32, Box<dyn Fn(&str) + Send + Sync>>>,
 > = OnceLock::new();
@@ -78,8 +102,11 @@ static TRAY_DBLCLICK_HANDLERS: OnceLock<
   Mutex<HashMap<u32, Box<dyn Fn() + Send + Sync>>>,
 > = OnceLock::new();
 static NOTIFICATION_HANDLERS: OnceLock<
-  Mutex<HashMap<u32, Arc<dyn Fn(NotificationEvent) + Send + Sync>>>,
+  Mutex<HashMap<u32, NotificationHandler>>,
 > = OnceLock::new();
+
+/// A notification's event callback: the notification id and the event.
+type NotificationHandler = Arc<dyn Fn(u32, NotificationEvent) + Send + Sync>;
 
 enum BindingHandler {
   Sync(Box<dyn Fn(JsCall) + Send + Sync>),
@@ -638,6 +665,36 @@ unsafe extern "C" fn scheme_request_trampoline(
 /// scheme name only, e.g. `"app"`). The handler runs on a backend-internal
 /// thread and must not block it; offload work (e.g. onto a tokio task).
 /// Requires a backend built against laufey API version 26 or newer.
+///
+/// Call it once per scheme (the built-in `"app"` plus any of your own). One
+/// handler serves every registered scheme — a later call replaces the handler
+/// for all of them and adds the new scheme — so dispatch on `request.url`.
+/// Each registered scheme is a real origin in the page (`<scheme>://<host>`,
+/// secure context, CORS, per-origin storage).
+///
+/// Register every scheme **before creating the first window**: the system
+/// web views read their scheme tables when a web view is created, so a later
+/// registration is not served by existing windows (WebKitGTK excepted;
+/// WebView2 fixes the set for the whole process). The CEF backend instead
+/// needs the schemes declared at launch — `--laufey-custom-schemes=myapp` or
+/// `LAUFEY_CUSTOM_SCHEMES=myapp` — because Chromium registers them before the
+/// runtime is loaded.
+///
+/// ```no_run
+/// // Before the first window: the engines read their scheme tables then.
+/// laufey::register_scheme_handler("myapp", |req| {
+///   let (status, body): (i32, &[u8]) = match req.url.as_str() {
+///     "myapp://app/" => (200, b"<!doctype html><h1>Hello</h1>"),
+///     _ => (404, b"not found"),
+///   };
+///   let headers = [("content-type".to_string(), "text/html".to_string())];
+///   req.exchange.begin(status, &headers);
+///   req.exchange.write(body);
+///   req.exchange.finish();
+/// });
+/// // location.origin in this window is "myapp://app".
+/// let _window = laufey::Window::new(800, 600).load("myapp://app/");
+/// ```
 pub fn register_scheme_handler<F>(scheme: &str, handler: F)
 where
   F: Fn(SchemeRequest) + Send + Sync + 'static,
@@ -658,10 +715,99 @@ where
   }
 }
 
+/// Whether the backend implements custom scheme handlers (API >= 26 and a
+/// web engine). `false` on engine-less backends such as Winit, where
+/// [`register_scheme_handler`] is a no-op. Lets capability-probed tests tell
+/// "unsupported here" from "supported but broken".
+///
+/// ```no_run
+/// if !laufey::scheme_handlers_supported() {
+///   // Engine-less backend: serve the app over a loopback socket instead.
+/// }
+/// ```
+pub fn scheme_handlers_supported() -> bool {
+  supports_scheme_handlers(api())
+}
+
+fn supports_scheme_handlers(api: &LaufeyBackendApi) -> bool {
+  api.register_scheme_handler.is_some()
+}
+
 pub fn quit() {
   let api = api();
   if let Some(f) = api.quit {
     unsafe { f(api.backend_data) };
+  }
+}
+
+/// Run `f` on the backend UI thread and block until it returns.
+///
+/// AppKit requires main-thread access (e.g. `raw-window-metal` / `NSView`),
+/// and so do Win32 windows and GTK objects for their own threads. With a
+/// backend of API 42 or newer this hops through `dispatch_ui_task` on every
+/// platform (inline when already on the UI thread); see
+/// [`try_run_on_ui_thread`], which returns an error instead of panicking,
+/// and [`spawn_on_ui_thread`], which doesn't block.
+///
+/// Without `dispatch_ui_task` it only hops on Apple platforms, through the
+/// C ABI `post_ui_task` (winit event loop / GCD main / CEF `TID_UI`), unless
+/// already on the process main thread (`pthread_main_np`) or the backend has
+/// no `post_ui_task`; elsewhere `f` runs inline. Prefer this over
+/// `dispatch_sync`, which deadlocks against a backend that owns the main run
+/// loop (winit).
+///
+/// # Panics
+///
+/// Panics if the UI task can't run: the backend's event loop has ended (the
+/// app is quitting) or ends before the task got to run. A panic in `f` is
+/// resumed on the caller's thread.
+pub fn run_on_ui_thread<F, R>(f: F) -> R
+where
+  F: FnOnce() -> R + Send + 'static,
+  R: Send + 'static,
+{
+  if api().dispatch_ui_task.is_some() {
+    return match try_run_on_ui_thread(f) {
+      Ok(value) => value,
+      Err(e) => panic!("run_on_ui_thread: {e}"),
+    };
+  }
+  #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+  {
+    f()
+  }
+
+  #[cfg(any(target_os = "macos", target_os = "ios"))]
+  {
+    unsafe extern "C" {
+      fn pthread_main_np() -> i32;
+    }
+    // SAFETY: libSystem symbol on Apple.
+    if unsafe { pthread_main_np() != 0 } {
+      return f();
+    }
+    let api = api();
+    let Some(post) = api.post_ui_task else {
+      return f();
+    };
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(0);
+    type Job = Box<dyn FnOnce() + Send>;
+    let job = Box::into_raw(Box::new(Box::new(move || {
+      let _ = tx.send(f());
+    }) as Job));
+
+    unsafe extern "C" fn trampoline(data: *mut c_void) {
+      // SAFETY: `data` is the `Box<Job>` passed to `post_ui_task`; not retained.
+      let job = unsafe { Box::from_raw(data as *mut Job) };
+      (*job)();
+    }
+
+    // SAFETY: trampoline owns and frees `job`; we block until it runs.
+    unsafe {
+      post(api.backend_data, Some(trampoline), job as *mut c_void);
+    }
+    rx.recv().expect("UI task dropped without running")
   }
 }
 
@@ -830,6 +976,31 @@ impl Window {
     (width, height)
   }
 
+  /// Chrome-inclusive size (`window.outerWidth` / `outerHeight`).
+  /// Falls back to [`Window::get_size`] when the backend does not report it.
+  pub fn get_outer_size(&self) -> (i32, i32) {
+    let api = api();
+    if let Some(f) = api.get_window_outer_size {
+      let mut width: c_int = 0;
+      let mut height: c_int = 0;
+      unsafe { f(api.backend_data, self.id, &mut width, &mut height) };
+      (width, height)
+    } else {
+      self.get_size()
+    }
+  }
+
+  /// Physical pixels per DIP for this window (`window.devicePixelRatio`).
+  /// Returns `1.0` when the backend does not report a scale.
+  pub fn get_scale_factor(&self) -> f64 {
+    let api = api();
+    if let Some(f) = api.get_window_scale_factor {
+      unsafe { f(api.backend_data, self.id) }
+    } else {
+      1.0
+    }
+  }
+
   pub fn position(self, x: i32, y: i32) -> Self {
     self.set_position(x, y);
     self
@@ -850,6 +1021,20 @@ impl Window {
       unsafe { f(api.backend_data, self.id, &mut x, &mut y) };
     }
     (x, y)
+  }
+
+  /// Top-left of the content view in screen DIP. Falls back to
+  /// [`Window::get_position`] when the backend does not report it.
+  pub fn get_inner_position(&self) -> (i32, i32) {
+    let api = api();
+    if let Some(f) = api.get_window_inner_position {
+      let mut x: c_int = 0;
+      let mut y: c_int = 0;
+      unsafe { f(api.backend_data, self.id, &mut x, &mut y) };
+      (x, y)
+    } else {
+      self.get_position()
+    }
   }
 
   pub fn resizable(self, resizable: bool) -> Self {
@@ -1470,7 +1655,9 @@ impl Window {
     }
   }
 
-  /// Open the DevTools inspector for this window.
+  /// Open the DevTools inspector for this window. A no-op when DevTools are
+  /// disabled ([`devtools_enabled`]). See also [`Window::close_devtools`],
+  /// [`Window::toggle_devtools`] and [`Window::is_devtools_open`].
   pub fn open_devtools(&self) {
     let api = api();
     if let Some(f) = api.open_devtools {
@@ -1573,7 +1760,9 @@ fn show_dialog_blocking(
 ///
 /// Returns `None` if the clipboard is empty, holds no text representation, or
 /// the backend does not support clipboard access. Mirrors the web
-/// `navigator.clipboard.readText()` API. Must be called on the UI thread.
+/// `navigator.clipboard.readText()` API. Any thread on API 39 backends (they
+/// hop to their UI thread where the platform needs it); older backends
+/// expected the UI thread.
 pub fn read_clipboard_text() -> Option<String> {
   let api = api();
   let f = api.read_clipboard_text?;
@@ -1597,7 +1786,7 @@ pub fn read_clipboard_text() -> Option<String> {
 ///
 /// Passing an empty string clears the clipboard. Mirrors the web
 /// `navigator.clipboard.writeText()` API. No-op if the backend does not
-/// support clipboard access. Must be called on the UI thread.
+/// support clipboard access. Any thread on API 39 backends.
 pub fn write_clipboard_text(text: &str) {
   let api = api();
   if let Some(f) = api.write_clipboard_text {
@@ -1650,6 +1839,184 @@ pub fn test_trigger_close_requested(window_id: u32) -> bool {
     return false;
   };
   unsafe { f(api.backend_data, window_id) }
+}
+
+/// Test-only. Synthesizes a deep-link delivery of `url` through the same
+/// dispatch path a real OS-routed URL takes, buffer included: called before
+/// any [`on_open_url`] handler is registered, the URL is replayed on
+/// registration exactly like a cold-start link. Returns `true` if a handler
+/// consumed it, `false` if it was buffered — or if the backend does not
+/// implement the test hook (API < 35, or any non-macOS backend).
+///
+/// Intended for automated e2e tests, so a deep-link round-trip can be covered
+/// without registering a URL scheme with the OS. See `examples/native_e2e`
+/// and `docs/e2e-testing.md`.
+pub fn test_trigger_open_url(url: &str) -> bool {
+  let api = api();
+  let Some(f) = api.test_trigger_open_url else {
+    return false;
+  };
+  let Ok(c_url) = CString::new(url) else {
+    return false;
+  };
+  // SAFETY: `c_url` outlives the call; the backend only reads the string.
+  unsafe { f(api.backend_data, c_url.as_ptr()) }
+}
+
+pub const LAUFEY_TEST_INPUT_KEY: i32 = 0;
+pub const LAUFEY_TEST_INPUT_MOUSE_MOVE: i32 = 1;
+pub const LAUFEY_TEST_INPUT_MOUSE_BUTTON: i32 = 2;
+pub const LAUFEY_TEST_INPUT_WHEEL: i32 = 3;
+pub const LAUFEY_TEST_INPUT_CURSOR_ENTER: i32 = 4;
+pub const LAUFEY_TEST_INPUT_CURSOR_LEAVE: i32 = 5;
+pub const LAUFEY_TEST_INPUT_MODIFIERS: i32 = 6;
+
+/// A synthetic input event for [`test_inject_input`].
+#[derive(Clone, Debug)]
+pub enum TestInput {
+  Key {
+    key: String,
+    code: String,
+    pressed: bool,
+    repeat: bool,
+    modifiers: u32,
+  },
+  MouseMove {
+    x: f64,
+    y: f64,
+    modifiers: u32,
+  },
+  MouseButton {
+    button: i32,
+    pressed: bool,
+    x: f64,
+    y: f64,
+    modifiers: u32,
+  },
+  Wheel {
+    delta_x: f64,
+    delta_y: f64,
+    delta_mode: i32,
+    x: f64,
+    y: f64,
+    modifiers: u32,
+  },
+  CursorEnter {
+    x: f64,
+    y: f64,
+    modifiers: u32,
+  },
+  CursorLeave {
+    x: f64,
+    y: f64,
+    modifiers: u32,
+  },
+  Modifiers {
+    modifiers: u32,
+  },
+}
+
+/// Test-only. Posts `event` through the same dispatch a real OS event uses.
+/// Returns `false` if the backend has no hook, the window is unknown (winit),
+/// or the event was rejected (unknown kind / modifier sent as `Key`).
+///
+/// Wheel deltas are DOM-signed (positive Y is scroll down).
+pub fn test_inject_input(window_id: u32, event: &TestInput) -> bool {
+  let api = api();
+  let Some(f) = api.test_inject_input else {
+    return false;
+  };
+  let mut key = None;
+  let mut code = None;
+  let mut raw = ffi::laufey_test_input {
+    kind: 0,
+    modifiers: 0,
+    key: std::ptr::null(),
+    code: std::ptr::null(),
+    pressed: false,
+    repeat: false,
+    button: 0,
+    x: 0.0,
+    y: 0.0,
+    delta_x: 0.0,
+    delta_y: 0.0,
+    delta_mode: 0,
+  };
+  match event {
+    TestInput::Key {
+      key: k,
+      code: c,
+      pressed,
+      repeat,
+      modifiers,
+    } => {
+      raw.kind = LAUFEY_TEST_INPUT_KEY;
+      raw.modifiers = *modifiers;
+      raw.pressed = *pressed;
+      raw.repeat = *repeat;
+      key = CString::new(k.as_str()).ok();
+      code = CString::new(c.as_str()).ok();
+      raw.key = key.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
+      raw.code = code
+        .as_ref()
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null());
+    }
+    TestInput::MouseMove { x, y, modifiers } => {
+      raw.kind = LAUFEY_TEST_INPUT_MOUSE_MOVE;
+      raw.modifiers = *modifiers;
+      raw.x = *x;
+      raw.y = *y;
+    }
+    TestInput::MouseButton {
+      button,
+      pressed,
+      x,
+      y,
+      modifiers,
+    } => {
+      raw.kind = LAUFEY_TEST_INPUT_MOUSE_BUTTON;
+      raw.modifiers = *modifiers;
+      raw.pressed = *pressed;
+      raw.button = *button;
+      raw.x = *x;
+      raw.y = *y;
+    }
+    TestInput::Wheel {
+      delta_x,
+      delta_y,
+      delta_mode,
+      x,
+      y,
+      modifiers,
+    } => {
+      raw.kind = LAUFEY_TEST_INPUT_WHEEL;
+      raw.modifiers = *modifiers;
+      raw.delta_x = *delta_x;
+      raw.delta_y = *delta_y;
+      raw.delta_mode = *delta_mode;
+      raw.x = *x;
+      raw.y = *y;
+    }
+    TestInput::CursorEnter { x, y, modifiers } => {
+      raw.kind = LAUFEY_TEST_INPUT_CURSOR_ENTER;
+      raw.modifiers = *modifiers;
+      raw.x = *x;
+      raw.y = *y;
+    }
+    TestInput::CursorLeave { x, y, modifiers } => {
+      raw.kind = LAUFEY_TEST_INPUT_CURSOR_LEAVE;
+      raw.modifiers = *modifiers;
+      raw.x = *x;
+      raw.y = *y;
+    }
+    TestInput::Modifiers { modifiers } => {
+      raw.kind = LAUFEY_TEST_INPUT_MODIFIERS;
+      raw.modifiers = *modifiers;
+    }
+  }
+  let _ = (&key, &code);
+  unsafe { f(api.backend_data, window_id, &raw) }
 }
 
 /// A menu item in an application menu template.
@@ -1938,6 +2305,294 @@ where
         Some(dock_reopen_callback),
         std::ptr::null_mut(),
       );
+    }
+  }
+}
+
+// --- Deep links / custom URL schemes ---
+
+fn open_url_handler() -> &'static Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>
+{
+  OPEN_URL_HANDLER.get_or_init(|| Mutex::new(None))
+}
+
+unsafe extern "C" fn open_url_callback(
+  _user_data: *mut c_void,
+  url: *const c_char,
+) {
+  if url.is_null() {
+    return;
+  }
+  // The OS is the source here, so don't assume well-formed UTF-8.
+  let url = CStr::from_ptr(url).to_string_lossy();
+  if let Some(handler) = open_url_handler().lock().unwrap().as_ref() {
+    handler(&url);
+  }
+}
+
+/// Register a callback invoked when the OS routes a custom URL scheme this app
+/// has registered — `acme://open/document/42` — to the app, either at launch
+/// or while it is already running.
+///
+/// Registering the scheme with the OS is *not* laufey's job: the embedder
+/// declares it in the bundle it ships (macOS `CFBundleURLTypes`, Linux
+/// `.desktop` `x-scheme-handler/<scheme>`, Windows
+/// `HKCU\Software\Classes\<scheme>`). See `docs/deep-links.md`.
+///
+/// URLs that arrive before this is called — which a launch URL always does,
+/// since the runtime is still coming up — are buffered by the backend and
+/// delivered as soon as the handler is registered.
+///
+/// The URL is whatever the OS handed over, unvalidated: check the scheme
+/// against the ones you registered before acting on it.
+///
+/// macOS only, for the same reason as [`on_dock_reopen`]: AppKit delivers the
+/// URL to the running app as an Apple Event, so one process handles every
+/// link. Windows and Linux spawn a new process with the URL in argv instead,
+/// which needs a single-instance lock and an app identity that only the
+/// embedder has — read `std::env::args` there. No-op on those platforms.
+pub fn on_open_url<F>(handler: F)
+where
+  F: Fn(&str) + Send + Sync + 'static,
+{
+  // Install the Rust-side handler first: the backend flushes buffered URLs
+  // synchronously inside the call below, and they'd be dropped if the slot
+  // were still empty.
+  {
+    let mut slot = open_url_handler().lock().unwrap();
+    *slot = Some(Box::new(handler));
+  }
+
+  let api = api();
+  if let Some(f) = api.set_open_url_handler {
+    unsafe {
+      f(
+        api.backend_data,
+        Some(open_url_callback),
+        std::ptr::null_mut(),
+      );
+    }
+  }
+}
+
+// --- Single instance ---
+
+fn second_instance_handler() -> &'static Mutex<Option<SecondInstanceHandler>> {
+  SECOND_INSTANCE_HANDLER.get_or_init(|| Mutex::new(None))
+}
+
+unsafe extern "C" fn second_instance_callback(
+  _user_data: *mut c_void,
+  argv: *const *const c_char,
+  argc: usize,
+  cwd: *const c_char,
+) {
+  // The backend validated the strings as UTF-8; convert lossily anyway, the
+  // source is another process.
+  let mut args = Vec::with_capacity(argc);
+  if !argv.is_null() {
+    for i in 0..argc {
+      let arg = *argv.add(i);
+      if !arg.is_null() {
+        args.push(CStr::from_ptr(arg).to_string_lossy().into_owned());
+      }
+    }
+  }
+  let cwd = if cwd.is_null() {
+    String::new()
+  } else {
+    CStr::from_ptr(cwd).to_string_lossy().into_owned()
+  };
+  if let Some(handler) = second_instance_handler().lock().unwrap().as_ref() {
+    handler(&args, &cwd);
+  }
+}
+
+/// Register a callback invoked in the running instance when the app is
+/// launched again, with the new launch's arguments (after the executable
+/// name) and working directory — like Electron's `second-instance` event.
+///
+/// Single-instance mode is opt-in and decided by the backend before the
+/// runtime loads: `"singleInstance": true` in `laufey-launch.json` (or
+/// `LAUFEY_SINGLE_INSTANCE=1`) together with an app id (`"appId"` /
+/// `LAUFEY_APP_ID`). The second launch then forwards its arguments to this
+/// process and exits without starting; this process brings its window to the
+/// front and calls `handler` on the UI thread. Launches that arrive before
+/// the handler is registered are buffered and delivered when it is.
+///
+/// This is how a deep link or a file reaches an already-running app on
+/// Windows and Linux (the OS starts `app "<url>"`); on macOS, LaunchServices
+/// uses [`on_open_url`] instead. laufey doesn't interpret the arguments: they
+/// come from another process of the same user, so treat them as untrusted
+/// input, as you would your own `std::env::args()` at a cold start.
+///
+/// No-op on backends without single-instance support (Winit) and on
+/// backends older than API 36. See `docs/deep-links.md`.
+pub fn on_second_instance<F>(handler: F)
+where
+  F: Fn(&[String], &str) + Send + Sync + 'static,
+{
+  // As in on_open_url: install first, the backend flushes buffered launches
+  // synchronously inside the call below.
+  {
+    let mut slot = second_instance_handler().lock().unwrap();
+    *slot = Some(Box::new(handler));
+  }
+
+  let api = api();
+  if let Some(f) = api.set_second_instance_handler {
+    unsafe {
+      f(
+        api.backend_data,
+        Some(second_instance_callback),
+        std::ptr::null_mut(),
+      );
+    }
+  }
+}
+
+// --- Passkeys ---
+
+/// `passkey_request` kind: a registration (`navigator.credentials.create`).
+/// Mirrors `LAUFEY_PASSKEY_CREATE` in `laufey.h`.
+pub const LAUFEY_PASSKEY_CREATE: u32 = 0;
+/// `passkey_request` kind: an authentication (`navigator.credentials.get`).
+/// Mirrors `LAUFEY_PASSKEY_GET` in `laufey.h`.
+pub const LAUFEY_PASSKEY_GET: u32 = 1;
+/// Capability flag: a platform authenticator (Touch ID / iCloud Keychain,
+/// Windows Hello) can serve requests.
+pub const LAUFEY_PASSKEY_PLATFORM_AUTHENTICATOR: u32 = 1 << 0;
+/// Capability flag: roaming security keys can serve requests.
+pub const LAUFEY_PASSKEY_SECURITY_KEYS: u32 = 1 << 1;
+
+/// What [`passkey_create`] / [`passkey_get`] can use right now — the shape of
+/// `@clerk/electron-passkeys`' `capabilities()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PasskeyCapabilities {
+  pub platform_authenticator: bool,
+  pub security_keys: bool,
+}
+
+/// The passkey capabilities of this backend: both on macOS 12+, security keys
+/// (and Windows Hello when set up) on Windows 10 1903+, none on Linux, on the
+/// Winit backend and on backends older than API 37. Any thread.
+pub fn passkey_capabilities() -> PasskeyCapabilities {
+  passkey_capabilities_with(api())
+}
+
+fn passkey_capabilities_with(api: &LaufeyBackendApi) -> PasskeyCapabilities {
+  let flags = match api.passkey_capabilities {
+    Some(f) => unsafe { f(api.backend_data) },
+    None => 0,
+  };
+  PasskeyCapabilities {
+    platform_authenticator: flags & LAUFEY_PASSKEY_PLATFORM_AUTHENTICATOR != 0,
+    security_keys: flags & LAUFEY_PASSKEY_SECURITY_KEYS != 0,
+  }
+}
+
+/// Run a WebAuthn registration ceremony through the OS platform
+/// authenticator.
+///
+/// `options_json` is `PublicKeyCredentialCreationOptions` as JSON with
+/// base64url binary fields — exactly what `@clerk/electron` sends to
+/// `@clerk/electron-passkeys` — and the future resolves with its JSON
+/// envelope, `{"ok":true,"credential":{...}}` or
+/// `{"ok":false,"error":{"code","message"}}` with `code` one of `cancelled`,
+/// `invalid_rp`, `not_supported`, `timeout`, `unknown`. It never fails
+/// otherwise. `window_id` anchors the OS sheet / dialog (0: the focused
+/// window).
+///
+/// The options are untrusted input as far as the backend is concerned: it
+/// parses them strictly and lets the OS decide whether the app may use the
+/// RP ID (macOS: the `webcredentials:` associated domain). Only call this from
+/// the app's own trusted code. One ceremony runs at a time per app; another
+/// request meanwhile resolves with `unknown` ("a passkey request is already in
+/// progress").
+///
+/// The request is made when this function is called, not when the future is
+/// first polled. See `docs/passkeys.md`.
+pub fn passkey_create(
+  window_id: u32,
+  options_json: &str,
+) -> impl Future<Output = String> + Send + 'static {
+  passkey_request_with(api(), window_id, LAUFEY_PASSKEY_CREATE, options_json)
+}
+
+/// Run a WebAuthn authentication ceremony through the OS platform
+/// authenticator. `options_json` is `PublicKeyCredentialRequestOptions` as
+/// JSON with base64url binary fields; otherwise as [`passkey_create`].
+pub fn passkey_get(
+  window_id: u32,
+  options_json: &str,
+) -> impl Future<Output = String> + Send + 'static {
+  passkey_request_with(api(), window_id, LAUFEY_PASSKEY_GET, options_json)
+}
+
+/// The error envelope the backends write, for the answers the capi gives
+/// itself. `message` must not need JSON escaping.
+fn passkey_error_envelope(code: &str, message: &str) -> String {
+  format!(r#"{{"ok":false,"error":{{"code":"{code}","message":"{message}"}}}}"#)
+}
+
+unsafe extern "C" fn passkey_result_trampoline(
+  user_data: *mut c_void,
+  result_json: *const c_char,
+) {
+  // The backend calls this exactly once per request (laufey.h), so the box
+  // is reclaimed exactly once.
+  let tx =
+    Box::from_raw(user_data as *mut tokio::sync::oneshot::Sender<String>);
+  let result = if result_json.is_null() {
+    passkey_error_envelope("unknown", "the backend returned no result")
+  } else {
+    CStr::from_ptr(result_json).to_string_lossy().into_owned()
+  };
+  // The receiver may be gone (the future was dropped); nothing to do then.
+  let _ = tx.send(result);
+}
+
+fn passkey_request_with(
+  api: &LaufeyBackendApi,
+  window_id: u32,
+  kind: u32,
+  options_json: &str,
+) -> impl Future<Output = String> + Send + 'static {
+  let pending: Result<tokio::sync::oneshot::Receiver<String>, String> =
+    match (api.passkey_request, CString::new(options_json)) {
+      (None, _) => Err(passkey_error_envelope(
+        "not_supported",
+        "Native passkeys are not supported by this backend.",
+      )),
+      (Some(_), Err(_)) => Err(passkey_error_envelope(
+        "unknown",
+        "invalid passkey options: contains a NUL byte",
+      )),
+      (Some(f), Ok(options)) => {
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let user_data = Box::into_raw(Box::new(tx)) as *mut c_void;
+        unsafe {
+          f(
+            api.backend_data,
+            window_id,
+            kind,
+            options.as_ptr(),
+            Some(passkey_result_trampoline),
+            user_data,
+          );
+        }
+        Ok(rx)
+      }
+    };
+  async move {
+    match pending {
+      Err(envelope) => envelope,
+      Ok(rx) => rx.await.unwrap_or_else(|_| {
+        passkey_error_envelope(
+          "unknown",
+          "the passkey request ended without a result",
+        )
+      }),
     }
   }
 }
@@ -2348,7 +3003,7 @@ pub enum NotificationEvent {
 }
 
 /// An action button on a notification.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotificationAction {
   pub id: String,
   pub title: String,
@@ -2367,6 +3022,8 @@ pub struct Notification {
   silent: Option<bool>,
   require_interaction: Option<bool>,
   actions: Vec<NotificationAction>,
+  schedule_at_ms: Option<i64>,
+  data: Option<String>,
 }
 
 /// Handle to a shown notification. Use [`NotificationHandle::close`] to
@@ -2455,9 +3112,45 @@ impl Notification {
     self
   }
 
+  /// Deliver the notification at `at` instead of now (API 41; see
+  /// [`notification_capabilities`]). A scheduled notification is identified
+  /// by its [`tag`](Notification::tag): give it one to cancel it
+  /// ([`cancel_notification`]) or recognize its clicks
+  /// ([`set_notification_response_handler`]); without one, `show` makes one
+  /// up. A time in the past shows it now.
+  pub fn schedule_at(self, at: std::time::SystemTime) -> Self {
+    let ms = at
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis() as i64)
+      .unwrap_or(0);
+    self.schedule_at_ms(ms)
+  }
+
+  /// [`Notification::schedule_at`] with a Unix time in milliseconds.
+  pub fn schedule_at_ms(mut self, unix_ms: i64) -> Self {
+    self.schedule_at_ms = if unix_ms > 0 { Some(unix_ms) } else { None };
+    self
+  }
+
+  /// Opaque data handed back with the notification's clicks (API 41), at
+  /// most [`LAUFEY_NOTIFICATION_MAX_DATA_BYTES`].
+  pub fn data(mut self, data: impl Into<String>) -> Self {
+    self.data = Some(data.into());
+    self
+  }
+
   fn to_value(&self) -> Value {
     let mut dict = HashMap::new();
     dict.insert("title".to_string(), Value::String(self.title.clone()));
+    if let Some(at) = self.schedule_at_ms {
+      dict.insert("schedule_at".to_string(), Value::Double(at as f64));
+      if self.tag.is_none() {
+        dict.insert("tag".to_string(), Value::String(generated_tag()));
+      }
+    }
+    if let Some(data) = &self.data {
+      dict.insert("data".to_string(), Value::String(data.clone()));
+    }
     if let Some(body) = &self.body {
       dict.insert("body".to_string(), Value::String(body.clone()));
     }
@@ -2493,7 +3186,7 @@ impl Notification {
   /// it programmatically. Returns a handle with id 0 if the backend
   /// doesn't support notifications.
   pub fn show(self) -> NotificationHandle {
-    self.show_with_handler::<fn(NotificationEvent)>(None)
+    self.show_with_handler(None)
   }
 
   /// Show the notification and register a callback for events
@@ -2502,13 +3195,23 @@ impl Notification {
   where
     F: Fn(NotificationEvent) + Send + Sync + 'static,
   {
-    self.show_with_handler(Some(handler))
+    self.show_with_handler(Some(Arc::new(move |_id, event| handler(event))))
   }
 
-  fn show_with_handler<F>(self, handler: Option<F>) -> NotificationHandle
+  /// [`Notification::on_event`] with the notification id passed to the
+  /// callback, so an event that arrives before `on_event_with_id` returned
+  /// (the shown event, on a backend thread) can still be attributed.
+  pub fn on_event_with_id<F>(self, handler: F) -> NotificationHandle
   where
-    F: Fn(NotificationEvent) + Send + Sync + 'static,
+    F: Fn(u32, NotificationEvent) + Send + Sync + 'static,
   {
+    self.show_with_handler(Some(Arc::new(handler)))
+  }
+
+  fn show_with_handler(
+    self,
+    handler: Option<NotificationHandler>,
+  ) -> NotificationHandle {
     let api = api();
     let Some(show_fn) = api.show_notification else {
       return NotificationHandle { id: 0 };
@@ -2525,18 +3228,35 @@ impl Notification {
     let id = unsafe { show_fn(api.backend_data, raw, cb, user_data) };
     if id != 0 {
       if let Some(h) = handler {
-        notification_handlers()
-          .lock()
-          .unwrap()
-          .insert(id, Arc::new(h));
+        // An event can arrive (on a backend thread) before the handler is
+        // in the map: the callback holds it in the pending map, under the
+        // same lock, and it is delivered here.
+        let early = {
+          let mut state = notification_handlers().lock().unwrap();
+          state.insert(id, h.clone());
+          early_notification_events().lock().unwrap().remove(&id)
+        };
+        for event in early.unwrap_or_default() {
+          let terminal = matches!(event, NotificationEvent::Closed);
+          h(id, event);
+          if terminal {
+            notification_handlers().lock().unwrap().remove(&id);
+          }
+        }
       }
     }
     NotificationHandle { id }
   }
 }
 
-fn notification_handlers(
-) -> &'static Mutex<HashMap<u32, Arc<dyn Fn(NotificationEvent) + Send + Sync>>>
+fn early_notification_events(
+) -> &'static Mutex<HashMap<u32, Vec<NotificationEvent>>> {
+  static EARLY: OnceLock<Mutex<HashMap<u32, Vec<NotificationEvent>>>> =
+    OnceLock::new();
+  EARLY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn notification_handlers() -> &'static Mutex<HashMap<u32, NotificationHandler>>
 {
   NOTIFICATION_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -2565,14 +3285,35 @@ unsafe extern "C" fn notification_event_callback(
   };
   let is_terminal = matches!(event, NotificationEvent::Closed);
   // Clone the Arc out of the map so the handler runs without the lock
-  // held — handlers may legitimately call back into the laufey API.
-  let handler = notification_handlers()
-    .lock()
-    .unwrap()
-    .get(&notification_id)
-    .cloned();
+  // held — handlers may legitimately call back into the laufey API. An
+  // event for a notification whose `show` hasn't returned yet (so its
+  // handler isn't in the map) waits in the early-event map, decided under
+  // the handlers lock so `show_with_handler` can't miss it.
+  let handler = {
+    let handlers = notification_handlers().lock().unwrap();
+    match handlers.get(&notification_id).cloned() {
+      Some(h) => Some(h),
+      None => {
+        let mut early = early_notification_events().lock().unwrap();
+        // Bounded: ids that never get a handler (another caller's) can't
+        // grow it without limit.
+        if early.len() >= 256 && !early.contains_key(&notification_id) {
+          if let Some(&oldest) = early.keys().min() {
+            early.remove(&oldest);
+          }
+        }
+        early
+          .entry(notification_id)
+          .or_default()
+          .push(event.clone());
+        None
+      }
+    }
+  };
   if let Some(h) = handler {
-    h(event);
+    h(notification_id, event);
+  } else {
+    return;
   }
   if is_terminal {
     notification_handlers()
@@ -2586,6 +3327,7 @@ unsafe extern "C" fn notification_event_callback(
 
 pub const LAUFEY_PERMISSION_INVALID: i32 = 0;
 pub const LAUFEY_PERMISSION_NOTIFICATIONS: i32 = 1;
+pub const LAUFEY_PERMISSION_NOTIFICATIONS_PROVISIONAL: i32 = 2;
 
 pub const LAUFEY_PERMISSION_STATUS_GRANTED: i32 = 0;
 pub const LAUFEY_PERMISSION_STATUS_DENIED: i32 = 1;
@@ -2597,6 +3339,10 @@ pub const LAUFEY_PERMISSION_STATUS_UNSUPPORTED: i32 = 3;
 #[repr(i32)]
 pub enum PermissionKind {
   Notifications = LAUFEY_PERMISSION_NOTIFICATIONS,
+  /// (API 41) Request only: quiet ("provisional") notification
+  /// authorization, which macOS grants without a prompt; elsewhere the same
+  /// as `Notifications`.
+  NotificationsProvisional = LAUFEY_PERMISSION_NOTIFICATIONS_PROVISIONAL,
 }
 
 /// Result of [`request_permission`] / [`query_permission`]. Mirrors the
@@ -3222,6 +3968,169 @@ mod tests {
     );
   }
 
+  unsafe extern "C" fn fake_register_scheme_handler(
+    _backend_data: *mut c_void,
+    _scheme: *const std::os::raw::c_char,
+    _handler: ffi::laufey_scheme_request_fn,
+    _on_cancel: ffi::laufey_scheme_cancel_fn,
+    _user_data: *mut c_void,
+  ) {
+  }
+
+  // scheme_handlers_supported() reports whether the backend filled in
+  // register_scheme_handler: NULL on engine-less backends (Winit) and on
+  // backends predating API 26, set on every web-engine backend. Checked
+  // against local vtables because BACKEND_API is a set-once global owned by
+  // the pdf tests below.
+  #[test]
+  fn scheme_handlers_supported_follows_the_vtable() {
+    let mut fake: LaufeyBackendApi = unsafe { std::mem::zeroed() };
+    assert!(!supports_scheme_handlers(&fake));
+    fake.register_scheme_handler = Some(fake_register_scheme_handler);
+    assert!(supports_scheme_handlers(&fake));
+  }
+
+  // --- Passkeys ---
+  //
+  // Local fake vtables (BACKEND_API belongs to the pdf tests), driven through
+  // the `_with` bodies of passkey_capabilities / passkey_create / passkey_get.
+
+  fn block_on<F: Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap()
+      .block_on(fut)
+  }
+
+  static PASSKEY_CALLS: Mutex<Vec<(u32, u32, String)>> = Mutex::new(Vec::new());
+
+  unsafe extern "C" fn fake_passkey_capabilities(
+    _backend_data: *mut c_void,
+  ) -> u32 {
+    // Unknown bits are ignored.
+    LAUFEY_PASSKEY_PLATFORM_AUTHENTICATOR | 0x80
+  }
+
+  // window_id 1: answers synchronously; 2: from another thread, later; 3: a
+  // NULL result; 4: never (the backend broke its contract).
+  unsafe extern "C" fn fake_passkey_request(
+    _backend_data: *mut c_void,
+    window_id: u32,
+    kind: u32,
+    options_json: *const c_char,
+    callback: ffi::laufey_passkey_result_fn,
+    user_data: *mut c_void,
+  ) {
+    let options = CStr::from_ptr(options_json).to_string_lossy().into_owned();
+    PASSKEY_CALLS
+      .lock()
+      .unwrap()
+      .push((window_id, kind, options));
+    let cb = callback.expect("callback must be set");
+    match window_id {
+      1 => cb(
+        user_data,
+        c"{\"ok\":true,\"credential\":{\"id\":\"AQ\"}}".as_ptr(),
+      ),
+      2 => {
+        let ud = user_data as usize;
+        std::thread::spawn(move || {
+          std::thread::sleep(std::time::Duration::from_millis(50));
+          unsafe {
+            cb(
+              ud as *mut c_void,
+              c"{\"ok\":false,\"error\":{\"code\":\"cancelled\",\"message\":\"m\"}}"
+                .as_ptr(),
+            )
+          };
+        });
+      }
+      3 => cb(user_data, std::ptr::null()),
+      _ => {
+        // Never answers: drop the sender so the future still resolves.
+        drop(Box::from_raw(
+          user_data as *mut tokio::sync::oneshot::Sender<String>,
+        ));
+      }
+    }
+  }
+
+  fn assert_send_static<T: Send + 'static>(_: &T) {}
+
+  #[test]
+  fn passkeys_without_backend_support() {
+    let fake: LaufeyBackendApi = unsafe { std::mem::zeroed() };
+    assert_eq!(
+      passkey_capabilities_with(&fake),
+      PasskeyCapabilities::default()
+    );
+    let fut = passkey_request_with(&fake, 0, LAUFEY_PASSKEY_GET, "{}");
+    assert_send_static(&fut);
+    assert_eq!(
+      block_on(fut),
+      r#"{"ok":false,"error":{"code":"not_supported","message":"Native passkeys are not supported by this backend."}}"#
+    );
+  }
+
+  #[test]
+  fn passkey_capabilities_follow_the_flags() {
+    let mut fake: LaufeyBackendApi = unsafe { std::mem::zeroed() };
+    fake.passkey_capabilities = Some(fake_passkey_capabilities);
+    assert_eq!(
+      passkey_capabilities_with(&fake),
+      PasskeyCapabilities {
+        platform_authenticator: true,
+        security_keys: false,
+      }
+    );
+  }
+
+  #[test]
+  fn passkey_requests_pass_through_and_resolve() {
+    let mut fake: LaufeyBackendApi = unsafe { std::mem::zeroed() };
+    fake.passkey_request = Some(fake_passkey_request);
+    let opts = r#"{"challenge":"AAAA","rpId":"example.com","x":"\u00e9 é"}"#;
+
+    // Synchronous answer, create kind, options passed byte for byte.
+    let out =
+      block_on(passkey_request_with(&fake, 1, LAUFEY_PASSKEY_CREATE, opts));
+    assert_eq!(out, r#"{"ok":true,"credential":{"id":"AQ"}}"#);
+    // Later answer from another thread, get kind.
+    let out =
+      block_on(passkey_request_with(&fake, 2, LAUFEY_PASSKEY_GET, opts));
+    assert!(out.contains(r#""code":"cancelled""#));
+    // A NULL result is an error envelope, not a crash.
+    let out =
+      block_on(passkey_request_with(&fake, 3, LAUFEY_PASSKEY_GET, opts));
+    assert!(out.contains(r#""code":"unknown""#));
+    // A backend that never answers (and drops its sender) still resolves.
+    let out =
+      block_on(passkey_request_with(&fake, 4, LAUFEY_PASSKEY_GET, opts));
+    assert!(out.contains("ended without a result"));
+
+    let calls = PASSKEY_CALLS.lock().unwrap();
+    let mine: Vec<_> = calls.iter().filter(|c| c.2 == opts).collect();
+    assert_eq!(mine.len(), 4);
+    assert_eq!((mine[0].0, mine[0].1), (1, LAUFEY_PASSKEY_CREATE));
+    assert_eq!((mine[1].0, mine[1].1), (2, LAUFEY_PASSKEY_GET));
+  }
+
+  #[test]
+  fn passkey_options_with_nul_never_reach_the_backend() {
+    let mut fake: LaufeyBackendApi = unsafe { std::mem::zeroed() };
+    fake.passkey_request = Some(fake_passkey_request);
+    let opts = "{\"marker\":\"nul-test\0\"}";
+    let out =
+      block_on(passkey_request_with(&fake, 1, LAUFEY_PASSKEY_GET, opts));
+    assert!(out.contains(r#""code":"unknown""#));
+    assert!(out.contains("NUL"));
+    assert!(PASSKEY_CALLS
+      .lock()
+      .unwrap()
+      .iter()
+      .all(|c| !c.2.contains("nul-test")));
+  }
+
   // Fake print_to_pdf backend shared by the pdf tests, dispatching on
   // window_id: 999 completes with empty bytes, 777 never completes (watchdog
   // path), 778 completes late from another thread (after the test watchdog's
@@ -3258,12 +4167,32 @@ mod tests {
     }
   }
 
+  // Mimic real backends: deliver the task on another thread so
+  // `run_on_ui_thread` must actually wait (inline delivery would not
+  // exercise the channel rendezvous).
+  unsafe extern "C" fn fake_post_ui_task(
+    _backend_data: *mut c_void,
+    task: Option<unsafe extern "C" fn(*mut c_void)>,
+    data: *mut c_void,
+  ) {
+    let Some(task) = task else {
+      return;
+    };
+    let data = data as usize;
+    std::thread::spawn(move || {
+      // SAFETY: caller of run_on_ui_thread keeps `data` live until the
+      // rendezvous send inside the trampoline.
+      unsafe { task(data as *mut c_void) };
+    });
+  }
+
   // Install the shared fake backend. BACKEND_API is a set-once global and the
-  // pdf tests run concurrently, so every caller installs the *same* fake and
-  // the first one wins.
+  // pdf / run_on_ui_thread tests run concurrently, so every caller installs
+  // the *same* fake and the first one wins.
   fn install_pdf_fake() {
     let mut fake: LaufeyBackendApi = unsafe { std::mem::zeroed() };
     fake.print_to_pdf = Some(fake_print_to_pdf);
+    fake.post_ui_task = Some(fake_post_ui_task);
     let _ = BACKEND_API.set(Box::leak(Box::new(fake)));
   }
 
@@ -3353,5 +4282,32 @@ mod tests {
       rx.try_recv().is_err(),
       "late completion must not invoke the callback a second time"
     );
+  }
+
+  // run_on_ui_thread returns the closure's value. On Apple the hop path is
+  // exercised from a worker (the test runner is main and would inline);
+  // elsewhere the function is a plain call.
+  #[test]
+  fn run_on_ui_thread_hops_and_returns_value() {
+    install_pdf_fake();
+
+    let run = || {
+      assert_eq!(run_on_ui_thread(|| 42u32), 42);
+      let err: Result<(), &str> = run_on_ui_thread(|| Err("surface failed"));
+      assert_eq!(err, Err("surface failed"));
+      let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+      let flag2 = flag.clone();
+      run_on_ui_thread(move || {
+        flag2.store(true, std::sync::atomic::Ordering::SeqCst);
+      });
+      assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    };
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    std::thread::spawn(run)
+      .join()
+      .expect("run_on_ui_thread worker panicked");
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    run();
   }
 }
