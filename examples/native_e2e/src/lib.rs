@@ -1795,6 +1795,37 @@ async fn window_api_checks() {
   eprintln!("[e2e] window capabilities = {:#x}", caps.bits);
   check("window capabilities are reported (API 38)", caps.bits != 0);
 
+  if std::env::var_os("LAUFEY_E2E_EARLY_RESIZE").is_some() {
+    // Experiment: set_size at various delays after creating a window; does
+    // the page follow?
+    let mut lost = 0;
+    for round in 0..3 {
+      for delay in [0u64, 20, 50, 100, 200, 300, 400, 600] {
+        let x = Window::new(520, 420).title("early-resize");
+        x.show();
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        x.set_size(600, 400);
+        let mut got = None;
+        for _ in 0..40 {
+          got = page_inner_size(&x).await;
+          if got == Some((600, 400)) {
+            break;
+          }
+          tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if got != Some((600, 400)) {
+          lost += 1;
+        }
+        eprintln!(
+          "[e2e] EARLY round {round} delay {delay} ms: page {got:?} size {:?}",
+          x.get_size()
+        );
+        x.close();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+      }
+    }
+    eprintln!("[e2e] EARLY lost {lost} of 24");
+  }
   const TITLE: &str = "native-e2e-window-api";
   let w = Window::new(520, 420).title(TITLE);
   let id = w.id();
