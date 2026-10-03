@@ -522,6 +522,45 @@ fn e2e_main() {
       );
     }
 
+    // ---- open_devtools on a window that isn't key -------------------------
+    // Showing the inspector can make its window key, and the WKWebView
+    // backend's key-window observer takes the window lock, which
+    // OpenDevTools held while showing it: the main thread then blocked on
+    // itself, and every later UI call waited forever. After open_devtools
+    // on a window other than the key one, a synchronous UI-thread call (a
+    // clipboard read, a main-queue round trip on macOS) must still return.
+    // macOS WKWebView only; the other backends report N/A.
+    let backend = std::env::var("LAUFEY_E2E_BACKEND").unwrap_or_default();
+    if cfg!(target_os = "macos") && backend == "webview" {
+      let dt_loaded = Arc::new(AtomicBool::new(false));
+      let dl = dt_loaded.clone();
+      let dt_win = Window::new(640, 480)
+        .title("native-e2e-devtools")
+        .on_page_load(move |_e| dl.store(true, Ordering::SeqCst))
+        .load("data:text/html,<!doctype html><title>devtools</title>");
+      let _ = wait_for(|| dt_loaded.load(Ordering::SeqCst), 100, 50).await;
+      // Make the first window key again, so the inspector opens on one that
+      // isn't.
+      win.focus();
+      tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+      dt_win.open_devtools();
+      tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+      let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(laufey::read_clipboard_text),
+      )
+      .await
+      .is_ok();
+      check(
+        "the UI thread still answers after open_devtools on a window that \
+         isn't key",
+        answered,
+      );
+      let _ = &dt_win;
+    } else {
+      na("open_devtools keeps the UI thread responsive (macOS WKWebView)");
+    }
+
     // ---- Layer-1 hold ----------------------------------------------------
     // When driven by the D-Bus observer (native_e2e_driver), stay alive with
     // the tray + menu registered so it can read the StatusNotifierItem, walk

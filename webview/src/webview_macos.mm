@@ -164,6 +164,7 @@ class WKWebViewBackend : public LaufeyBackend {
 
  private:
   MacWindowState* GetWindow(uint32_t window_id);
+  WKWebView* WebViewOf(uint32_t window_id);
   void RemoveWindowState(uint32_t window_id);
   void InstallGlobalMonitors();
   void RemoveGlobalMonitors();
@@ -2007,20 +2008,28 @@ void WKWebViewBackend::ShowContextMenu(uint32_t window_id, int x, int y,
   });
 }
 
+// The window's web view, read under the lock. Callers act on it after the
+// lock is released: showing the inspector can make the window key, and the
+// key-window observer takes the same lock on the same (main) thread.
+WKWebView* WKWebViewBackend::WebViewOf(uint32_t window_id) {
+  std::lock_guard<std::mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  return state ? state->webview : nil;
+}
+
 void WKWebViewBackend::OpenDevTools(uint32_t window_id) {
   dispatch_async(dispatch_get_main_queue(), ^{
-    std::lock_guard<std::mutex> lock(windows_mutex_);
-    auto* state = GetWindow(window_id);
-    if (state && state->webview) {
-      // WKWebView._inspector.show is available on macOS 13.3+
-      @try {
-        id inspector = [state->webview valueForKey:@"_inspector"];
-        if (inspector) {
-          [inspector performSelector:@selector(show)];
-        }
-      } @catch (NSException*) {
-        // Fallback: not available on this macOS version
+    WKWebView* webview = WebViewOf(window_id);
+    if (!webview)
+      return;
+    // WKWebView._inspector.show is available on macOS 13.3+
+    @try {
+      id inspector = [webview valueForKey:@"_inspector"];
+      if (inspector) {
+        [inspector performSelector:@selector(show)];
       }
+    } @catch (NSException*) {
+      // Fallback: not available on this macOS version
     }
   });
 }
