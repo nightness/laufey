@@ -39,13 +39,17 @@ One handler serves every registered scheme and every window: a later
 `register_scheme_handler` call replaces the handler for all of them and adds the
 new scheme, so dispatch on `req.url` (and `req.window_id` if windows serve
 different content). The handler runs on a backend thread and must not block it;
-move slow work onto your own thread or async runtime. Both the request body
-(`req.exchange.read_body`) and the response are streamed, so the page's `fetch`
-sees each `write` as it happens. Scheme names follow RFC 3986 (a letter, then
-letters, digits, `+`, `-`, or `.`), are case-insensitive, and are stored in
-lowercase; an invalid name is logged and ignored. Engine-less backends such as
-Winit have no scheme support; `laufey::scheme_handlers_supported()` returns
-`false` there, and the application should fall back to a loopback server.
+move slow work onto your own thread or async runtime. Read the request body with
+`req.exchange.read_body`. On WKWebView, WebKitGTK and CEF the response is
+streamed: the page's `fetch` sees each `write` as it happens. WebView2 is the
+exception. It reads a custom-scheme response to the end before the page sees any
+of it, so there the body arrives whole once the handler calls `finish`, and a
+response that never finishes (server-sent events, for example) never arrives.
+Scheme names follow RFC 3986 (a letter, then letters, digits, `+`, `-`, or `.`),
+are case-insensitive, and are stored in lowercase; an invalid name is logged and
+ignored. Engine-less backends such as Winit have no scheme support;
+`laufey::scheme_handlers_supported()` returns `false` there, and the application
+should fall back to a loopback server.
 
 Register every scheme before creating the first window. The system web views
 read their scheme tables when a web view is created, so on most backends a
