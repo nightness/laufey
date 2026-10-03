@@ -615,16 +615,23 @@ std::string LaunchSettingFrom(const std::string& env_value, bool file_has,
   return file_has ? file_value : std::string();
 }
 
+std::string LaunchPinnedSettingFrom(const std::string& env_value, bool file_has,
+                                    const std::string& file_value) {
+  if (file_has)
+    return file_value;
+  return env_value;
+}
+
 std::string LaunchAppId() {
   const LaunchConfig& file = ProcessLaunchConfig();
-  return LaunchSettingFrom(GetEnv("LAUFEY_APP_ID"), file.has_app_id,
-                           file.app_id);
+  return LaunchPinnedSettingFrom(GetEnv("LAUFEY_APP_ID"), file.has_app_id,
+                                 file.app_id);
 }
 
 std::string LaunchDataDir() {
   const LaunchConfig& file = ProcessLaunchConfig();
-  return LaunchSettingFrom(GetEnv("LAUFEY_DATA_DIR"), file.has_data_dir,
-                           file.data_dir);
+  return LaunchPinnedSettingFrom(GetEnv("LAUFEY_DATA_DIR"), file.has_data_dir,
+                                 file.data_dir);
 }
 
 std::string LaunchCustomSchemes() {

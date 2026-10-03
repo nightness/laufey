@@ -177,6 +177,12 @@ static void TestPrecedence() {
   EXPECT(LaunchSettingFrom("", false, "file") == "");
   EXPECT(LaunchSettingFrom("env", false, "") == "env");
   EXPECT(LaunchSettingFrom("", false, "") == "");
+  // App id and data dir: the shipped file wins over an inherited environment
+  // (another app that launched this one must not move it into its profile).
+  EXPECT(LaunchPinnedSettingFrom("env", true, "file") == "file");
+  EXPECT(LaunchPinnedSettingFrom("", true, "file") == "file");
+  EXPECT(LaunchPinnedSettingFrom("env", false, "") == "env");
+  EXPECT(LaunchPinnedSettingFrom("", false, "") == "");
 }
 
 static void TestPaths() {
@@ -261,10 +267,12 @@ static void TestProcessLaunchConfig() {
   EXPECT(LaunchDataDir() == "/from/file");
   EXPECT(LaunchCustomSchemes() == "one,two");
 
-  // The environment wins, key by key.
+  // The environment wins, key by key, except for the app id and data dir
+  // the file pins (an inherited environment can't move the app's profile).
   SetEnv("LAUFEY_APP_ID", "from.env");
+  SetEnv("LAUFEY_DATA_DIR", "/from/env");
   SetEnv("LAUFEY_CUSTOM_SCHEMES", "envscheme");
-  EXPECT(LaunchAppId() == "from.env");
+  EXPECT(LaunchAppId() == "dev.laufey.test");
   EXPECT(LaunchDataDir() == "/from/file");
   EXPECT(LaunchCustomSchemes() == "envscheme");
   SetEnv("LAUFEY_APP_ID", nullptr);

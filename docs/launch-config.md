@@ -52,6 +52,12 @@ value wins over the file. So a launcher can still force a value, and setups that
 rely on the environment keep working unchanged. A key absent from the file and
 from the environment is simply unset. The file is read once per process.
 
+The exceptions are `appId` and `dataDir`, which identify the installed app. For
+them the shipped file wins: when the file has the key, `LAUFEY_APP_ID` /
+`LAUFEY_DATA_DIR` are ignored. Environment variables are inherited, so an app
+started by another laufey app would otherwise open that app's profile. A
+launcher can still set them for an app whose file leaves them out.
+
 ## Validation
 
 A problem with the file never stops the app. It is reported on stderr as
