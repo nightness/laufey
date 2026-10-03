@@ -24,7 +24,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use laufey::{Value, Window};
 use tokio::sync::oneshot;
@@ -171,10 +171,13 @@ async fn eval(win: &Window, script: &str, wait: Duration) -> Eval {
   }
 }
 
-/// Runs `script` in the page and returns its string result, if any.
-async fn eval_string(win: &Window, script: &str) -> Option<String> {
-  eval(win, script, Duration::from_secs(5)).await.ok()
-}
+/// How long a script the scenario depends on (the storage write and read)
+/// may take to answer once the page is up. A launch is a cold start: the
+/// renderer answers its first scripts in milliseconds on an idle machine, but
+/// on a loaded Windows runner they took 5-11 s to come back (measured with CPU
+/// contention on a 2-core VM), and the old 5 s bound read that as "no value"
+/// and quit before the write had run.
+const SCRIPT_WAIT: Duration = Duration::from_secs(30);
 
 /// `"<localStorage value>|<cookie value>"`, each "" when absent.
 const READ_JS: &str = r#"(() => {
@@ -214,19 +217,31 @@ fn e2e_main() {
       .load(&format!("{origin}/"));
 
     // Wait until the page's own origin answers (not about:blank or an error
-    // page). Polled rather than via on_page_load, which CEF doesn't fire.
+    // page). Polled rather than via on_page_load, which CEF doesn't fire. A
+    // poll sent while the first navigation commits can go unanswered; the
+    // next one follows its 5 s wait.
+    let started = Instant::now();
     let mut ready = false;
+    let mut polls = 0;
+    let mut unanswered = 0;
     if served {
       for _ in 0..100 {
-        if eval_string(&win, "location.origin").await.as_deref()
-          == Some(origin.as_str())
-        {
-          ready = true;
-          break;
+        polls += 1;
+        match eval(&win, "location.origin", Duration::from_secs(5)).await {
+          Eval::String(o) if o == origin => {
+            ready = true;
+            break;
+          }
+          Eval::Timeout(_) => unanswered += 1,
+          _ => {}
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
       }
     }
+    eprintln!(
+      "[e2e] page check: {} ms, {polls} polls, {unanswered} unanswered",
+      started.elapsed().as_millis()
+    );
     check(&format!("page loaded at {origin}"), ready);
 
     if ready {
@@ -241,8 +256,12 @@ fn e2e_main() {
   return {READ_JS};
 }})()"#
           );
-          let result = eval(&win, &script, Duration::from_secs(5)).await;
-          eprintln!("[e2e] write script: {result}");
+          let t = Instant::now();
+          let result = eval(&win, &script, SCRIPT_WAIT).await;
+          eprintln!(
+            "[e2e] write script ({} ms): {result}",
+            t.elapsed().as_millis()
+          );
           let got = result.ok().unwrap_or_default();
           let (ls, cookie) = split(&got);
           eprintln!("[e2e] wrote localStorage={ls:?} cookie={cookie:?}");
@@ -252,8 +271,12 @@ fn e2e_main() {
           tokio::time::sleep(Duration::from_millis(1500)).await;
         }
         "read" => {
-          let result = eval(&win, READ_JS, Duration::from_secs(5)).await;
-          eprintln!("[e2e] read script: {result}");
+          let t = Instant::now();
+          let result = eval(&win, READ_JS, SCRIPT_WAIT).await;
+          eprintln!(
+            "[e2e] read script ({} ms): {result}",
+            t.elapsed().as_millis()
+          );
           let got = result.ok();
           check("read storage", got.is_some());
           let (ls, cookie) = split(&got.unwrap_or_default());
