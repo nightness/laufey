@@ -31,7 +31,7 @@ using laufey_common::SchemeRegistry;
 
 static void TestSchemeNameGrammar() {
   EXPECT(IsValidSchemeName("app"));
-  EXPECT(IsValidSchemeName("t3code"));
+  EXPECT(IsValidSchemeName("mail2"));
   EXPECT(IsValidSchemeName("my-app.v2+x"));
   EXPECT(IsValidSchemeName("A"));
   EXPECT(IsValidSchemeName("MyApp"));
@@ -47,7 +47,7 @@ static void TestSchemeNameGrammar() {
 
   EXPECT(NormalizeSchemeName("MyApp") == "myapp");
   EXPECT(NormalizeSchemeName("app") == "app");
-  EXPECT(NormalizeSchemeName("T3-Code.X+Y") == "t3-code.x+y");
+  EXPECT(NormalizeSchemeName("Mail2-Web.X+Y") == "mail2-web.x+y");
 }
 
 static void TestRegistryDefaults() {
@@ -55,7 +55,7 @@ static void TestRegistryDefaults() {
   EXPECT(registry.size() == 1);
   EXPECT(registry.Contains("app"));
   EXPECT(registry.Contains("APP"));
-  EXPECT(!registry.Contains("t3code"));
+  EXPECT(!registry.Contains("mail2"));
   std::vector<std::string> snapshot = registry.Snapshot();
   EXPECT(snapshot.size() == 1);
   EXPECT(snapshot[0] == "app");
@@ -71,11 +71,11 @@ static void TestRegistryAdd() {
 
   // A new scheme reports true once, then false (already present), and is
   // stored lowercase regardless of how it was spelled.
-  EXPECT(registry.Add("t3code"));
-  EXPECT(!registry.Add("t3code"));
-  EXPECT(!registry.Add("T3Code"));
-  EXPECT(registry.Contains("t3code"));
-  EXPECT(registry.Contains("T3CODE"));
+  EXPECT(registry.Add("mail2"));
+  EXPECT(!registry.Add("mail2"));
+  EXPECT(!registry.Add("Mail2"));
+  EXPECT(registry.Contains("mail2"));
+  EXPECT(registry.Contains("MAIL2"));
 
   // Invalid names are rejected without being stored.
   EXPECT(!registry.Add(""));
@@ -89,7 +89,7 @@ static void TestRegistryAdd() {
   std::vector<std::string> snapshot = registry.Snapshot();
   EXPECT(snapshot.size() == 4);
   EXPECT(snapshot[0] == "app");
-  EXPECT(snapshot[1] == "t3code");
+  EXPECT(snapshot[1] == "mail2");
   EXPECT(snapshot[2] == "zeta");
   EXPECT(snapshot[3] == "alpha");
   EXPECT(registry.size() == 4);
@@ -140,14 +140,14 @@ static void TestParseSchemeList() {
   EXPECT(empty.empty());
   EXPECT(rejected.empty());
 
-  std::vector<std::string> one = ParseSchemeList("t3code", &rejected);
-  EXPECT(one.size() == 1 && one[0] == "t3code");
+  std::vector<std::string> one = ParseSchemeList("mail2", &rejected);
+  EXPECT(one.size() == 1 && one[0] == "mail2");
 
   // Whitespace, case, duplicates and empty entries.
   std::vector<std::string> many =
-      ParseSchemeList(" T3Code , other,,t3code, third ", &rejected);
+      ParseSchemeList(" Mail2 , other,,mail2, third ", &rejected);
   EXPECT(many.size() == 3);
-  EXPECT(many[0] == "t3code");
+  EXPECT(many[0] == "mail2");
   EXPECT(many[1] == "other");
   EXPECT(many[2] == "third");
   EXPECT(rejected.empty());
