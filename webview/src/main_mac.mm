@@ -137,8 +137,11 @@ void EnsureEditMenu(NSMenu* menubar) {
 // applicationWillTerminate:) or through quit()'s -stop: (after [NSApp run]
 // returns in main), and which one wins is a race.
 - (void)shutDownRuntime {
-  RuntimeLoader::GetInstance()->Shutdown();
-  delete self.backend;
+  // A runtime thread that outlived the bounded wait may still call into the
+  // backend: leave it alive then (the process is exiting).
+  if (RuntimeLoader::GetInstance()->Shutdown()) {
+    delete self.backend;
+  }
   self.backend = nullptr;
 }
 
@@ -198,8 +201,8 @@ static int run_headless(const char* runtimePath) {
     return 1;
   }
 
-  // Wait for the runtime thread to finish
-  loader->Shutdown();
+  // Wait for the runtime thread to finish, however long the worker runs.
+  loader->Shutdown(/*bounded=*/false);
   return 0;
 }
 

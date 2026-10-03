@@ -83,6 +83,19 @@ fn expected_handle_type() -> (&'static str, &'static [i32]) {
 }
 
 fn e2e_main() {
+  // ---- headless worker -------------------------------------------------
+  // scripts/native-e2e-run.sh --headless-worker starts the macOS WebView
+  // backend as a worker (`run <script>`: no window, no event loop). The
+  // backend must wait for the runtime however long it runs: the bounded
+  // shutdown wait is for a UI app whose loop has ended, and must not cut a
+  // worker off. So outlive that bound, then return normally; the script
+  // checks that this line was printed.
+  if std::env::var("LAUFEY_E2E_ONLY").as_deref() == Ok("headless-worker") {
+    std::thread::sleep(std::time::Duration::from_secs(12));
+    eprintln!("[e2e] PASS a headless worker runs until its runtime returns");
+    return;
+  }
+
   let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
   rt.block_on(async move {
     // Pump the laufey event loop (JS-call dispatch, timers).

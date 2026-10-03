@@ -985,12 +985,16 @@ void RuntimeLoader::RuntimeThread() {
   runtime_exit_cv_.notify_all();
 }
 
-void RuntimeLoader::Shutdown() {
+bool RuntimeLoader::Shutdown(bool bounded) {
   if (shutdown_fn_) {
     shutdown_fn_();
   }
 
   if (runtime_thread_.joinable()) {
+    if (!bounded) {
+      runtime_thread_.join();
+      return true;
+    }
     // The loop has ended, so the UI thread no longer runs tasks: a runtime
     // thread blocked in a synchronous call to it (a getter that waits on the
     // main queue, for example) would never return, and an unbounded join
@@ -1008,8 +1012,10 @@ void RuntimeLoader::Shutdown() {
                 << kRuntimeShutdownTimeout.count()
                 << " ms of shutdown; exiting without it" << std::endl;
       runtime_thread_.detach();
+      runtime_detached_ = true;
     }
   }
+  return !runtime_detached_;
 }
 
 void RuntimeLoader::SetSchemeRequestHandler(const std::string& scheme,
