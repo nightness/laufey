@@ -7,6 +7,7 @@
 #include <gtk/gtk.h>
 
 #include "laufey_backend_common.h"
+#include "laufey_menu.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,8 @@ int ShowDialogLinux(int dialog_type, const std::string& title,
   if (out_input_value)
     *out_input_value = nullptr;
 
+  // gtk_dialog_run is a nested main loop on this (the UI) thread.
+  ScopedNativeModalLoop modal_loop;
   GtkWindow* parent = nullptr;
 
   if (dialog_type == LAUFEY_DIALOG_ALERT) {

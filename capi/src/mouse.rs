@@ -183,8 +183,13 @@ unsafe extern "C" fn mouse_click_trampoline(
     click_count,
   };
 
-  let guard = mouse_click_handlers().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = mouse_click_handlers()
+    .lock()
+    .unwrap()
+    .get(&window_id)
+    .cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }
@@ -224,8 +229,13 @@ unsafe extern "C" fn mouse_move_trampoline(
     modifiers: KeyModifiers::from_raw(modifiers),
   };
 
-  let guard = mouse_move_handlers().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = mouse_move_handlers()
+    .lock()
+    .unwrap()
+    .get(&window_id)
+    .cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }
@@ -291,8 +301,9 @@ unsafe extern "C" fn wheel_trampoline(
     delta_mode: WheelDeltaMode::from_raw(delta_mode),
   };
 
-  let guard = wheel_handlers().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = wheel_handlers().lock().unwrap().get(&window_id).cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }
@@ -335,8 +346,13 @@ unsafe extern "C" fn cursor_enter_leave_trampoline(
     modifiers: KeyModifiers::from_raw(modifiers),
   };
 
-  let guard = cursor_enter_leave_handlers().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = cursor_enter_leave_handlers()
+    .lock()
+    .unwrap()
+    .get(&window_id)
+    .cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }
@@ -370,8 +386,9 @@ unsafe extern "C" fn focused_trampoline(
     focused: focused != 0,
   };
 
-  let guard = focused_handlers().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = focused_handlers().lock().unwrap().get(&window_id).cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }
@@ -408,8 +425,9 @@ unsafe extern "C" fn resize_trampoline(
     height,
   };
 
-  let guard = resize_handlers().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = resize_handlers().lock().unwrap().get(&window_id).cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }
@@ -442,8 +460,9 @@ unsafe extern "C" fn move_trampoline(
 ) {
   let event = MoveEvent { window_id, x, y };
 
-  let guard = move_handlers().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = move_handlers().lock().unwrap().get(&window_id).cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }
@@ -524,8 +543,13 @@ unsafe extern "C" fn page_load_trampoline(
 ) {
   let event = PageLoadEvent { window_id };
 
-  let guard = page_load_handlers().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = page_load_handlers()
+    .lock()
+    .unwrap()
+    .get(&window_id)
+    .cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }

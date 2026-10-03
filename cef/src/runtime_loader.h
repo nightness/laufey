@@ -4,6 +4,7 @@
 #define LAUFEY_RUNTIME_LOADER_H_
 
 #include <string>
+#include <chrono>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -11,6 +12,7 @@
 #include <queue>
 #include <map>
 #include <set>
+#include <vector>
 
 #include "include/cef_browser.h"
 #include "include/cef_values.h"
@@ -20,6 +22,7 @@
 // (backend-common/include/laufey_value.h). CEF stores values as laufey::Value
 // and converts to/from CefValue only at the renderer<->browser IPC boundary
 // (CefValueToLaufey / LaufeyToCefValue in runtime_loader.cc).
+#include "laufey_sync_call.h"
 #include "laufey_value.h"
 
 class RuntimeLoader {
@@ -78,6 +81,15 @@ class RuntimeLoader {
   bool IsCloseAllowed(uint32_t window_id) {
     std::lock_guard<std::mutex> lock(windows_mutex_);
     return close_allowed_.count(window_id) > 0;
+  }
+
+  // Every open browser, in window id (creation) order.
+  std::vector<CefRefPtr<CefBrowser>> GetAllBrowsers() {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    std::vector<CefRefPtr<CefBrowser>> all;
+    for (const auto& entry : browsers_)
+      all.push_back(entry.second);
+    return all;
   }
 
   CefRefPtr<CefBrowser> GetBrowserForWindow(uint32_t window_id) {
@@ -142,6 +154,18 @@ class RuntimeLoader {
   void UnregisterNSWindow(void* nswindow) {
     std::lock_guard<std::mutex> lock(windows_mutex_);
     nswindow_to_laufey_id_.erase(nswindow);
+  }
+
+  // The NSWindow registered for `window_id`, or nullptr. Still answers
+  // while the window is being torn down, when its content view may already
+  // be detached from it.
+  void* GetNSWindowForLaufeyId(uint32_t window_id) {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    for (const auto& [nswindow, id] : nswindow_to_laufey_id_) {
+      if (id == window_id)
+        return nswindow;
+    }
+    return nullptr;
   }
 
   uint32_t GetLaufeyIdForNSWindow(void* nswindow) {
@@ -342,9 +366,13 @@ class RuntimeLoader {
   }
 
   // --- Custom URL scheme handler (API >= 26) ---
-  // Store the runtime's scheme request handler and lazily install the CEF
-  // scheme handler factory (on the UI thread) the first time a scheme is
-  // registered.
+  // Store the runtime's scheme request handler and install the CEF scheme
+  // handler factory (on the UI thread) for `scheme` the first time that
+  // scheme is registered (and for the built-in "app" alongside the first
+  // one). One handler serves every registered scheme; the runtime dispatches
+  // on the request URL. A scheme that was not declared at process start (see
+  // custom_schemes.h) is still served, but as a non-standard scheme — a
+  // warning is logged.
   void SetSchemeRequestHandler(const std::string& scheme,
                                laufey_scheme_request_fn handler,
                                laufey_scheme_cancel_fn on_cancel,
@@ -355,6 +383,11 @@ class RuntimeLoader {
   void DispatchSchemeRequest(uint32_t window_id, void* exchange,
                              const std::string& method, const std::string& url,
                              const std::string& flat_headers);
+  // The engine cancelled `exchange` before the runtime finished it: call the
+  // registered on_cancel, if any. Backends call it through their
+  // SchemeCancelGate (laufey_scheme_cancel.h): at most once, never after
+  // the exchange was finished.
+  void DispatchSchemeCancel(void* exchange);
 
   void SetJsCallNotify(void (*notify_fn)(void*), void* notify_data) {
     std::lock_guard<std::mutex> lock(notify_mutex_);
@@ -395,6 +428,10 @@ class RuntimeLoader {
   laufey_runtime_shutdown_fn shutdown_fn_ = nullptr;
 
   std::thread runtime_thread_;
+  // Signalled as the runtime thread ends (laufey_start returned).
+  laufey_common::ThreadExit runtime_exit_;
+  // How long Shutdown waits for the runtime thread before abandoning it.
+  static constexpr std::chrono::milliseconds kRuntimeShutdownTimeout{10000};
   std::atomic<bool> running_{false};
 
   std::map<uint32_t, CefRefPtr<CefBrowser>> browsers_;
@@ -463,8 +500,8 @@ class RuntimeLoader {
   laufey_scheme_request_fn scheme_request_handler_ = nullptr;
   laufey_scheme_cancel_fn scheme_cancel_handler_ = nullptr;
   void* scheme_user_data_ = nullptr;
-  std::string scheme_name_;
-  bool scheme_factory_registered_ = false;
+  // Normalized names a handler factory has been installed for.
+  std::set<std::string> scheme_factories_;
   std::mutex scheme_mutex_;
 
   std::string js_namespace_ = "Laufey";
@@ -511,6 +548,7 @@ bool IsNSWindowResizable(void* cef_handle);
 // Overall window opacity in [0.0, 1.0] via NSWindow.alphaValue.
 void SetNSWindowOpacity(void* cef_handle, double opacity);
 double GetNSWindowOpacity(void* cef_handle);
+bool GetNSWindowOuterSize(void* cef_handle, int* width, int* height);
 // Click passthrough via NSWindow.ignoresMouseEvents: while enabled all mouse
 // input falls through to whatever is beneath the window.
 void SetNSWindowClickPassthrough(void* cef_handle, bool enabled);
@@ -532,6 +570,9 @@ void ConfigureNSWindowAsPanelForCefHandle(void* cef_handle);
 // (Electron `titleBarStyle: 'hidden'`). For
 // LAUFEY_WINDOW_FLAG_TRANSPARENT_TITLEBAR.
 void ConfigureNSWindowTransparentTitlebarForCefHandle(void* cef_handle);
+// The NSWindow* (bridged, unretained) behind a CEF window handle (an
+// NSView*), or nullptr. Main thread only; use it right away.
+void* NSWindowForCefHandle(void* cef_handle);
 #endif
 
 #ifdef _WIN32
@@ -561,6 +602,9 @@ bool IsLinuxWindowClickPassthrough(unsigned long xid);
 // skip taskbar/pager) so the WM treats it as an auxiliary panel that doesn't
 // take part in normal focus/taskbar handling. Implemented in main_linux.cc.
 void ConfigureLinuxWindowAsPanel(unsigned long xid);
+// gtk_init_check, once (runtime_loader_linux.cc). Call it on the GTK / CEF UI
+// thread before GTK is used.
+void CefEnsureGtkInit();
 #endif
 
 #endif

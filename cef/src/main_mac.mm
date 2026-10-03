@@ -11,8 +11,12 @@
 #include "include/wrapper/cef_helpers.h"
 #include "include/wrapper/cef_library_loader.h"
 #include "app.h"
+#include "laufey_launch_config.h"
 #include "runtime_loader.h"
 #include "laufey_backend_common.h"
+#include "laufey_auth_session.h"
+#include "laufey_notifications.h"
+#include "laufey_single_instance.h"
 
 void LaufeyOpenExternalURL(const std::string& url) {
   @autoreleasepool {
@@ -113,6 +117,25 @@ void LaufeyOpenExternalURL(const std::string& url) {
   // Always swallow the default "show last hidden window" behavior — the
   // embedder's callback decides what to do.
   return NO;
+}
+
+// Deep links. AppKit routes the kAEGetURL Apple Event here for every scheme
+// the bundle claims in CFBundleURLTypes, both at launch and while running.
+// Implementing this selector is what makes AppKit install its own handler for
+// that event, so there's no NSAppleEventManager registration to do.
+//
+// This delegate is installed before [NSApp run], so no launch URL is missed:
+// AppKit can't dispatch the event before the run loop starts. It can still
+// arrive before the runtime registers a handler, which is what the buffer in
+// FireOpenUrlMac covers.
+- (void)application:(NSApplication*)application
+           openURLs:(NSArray<NSURL*>*)urls {
+  for (NSURL* url in urls) {
+    NSString* absolute = [url absoluteString];
+    if (absolute) {
+      laufey_common::FireOpenUrlMac([absolute UTF8String]);
+    }
+  }
 }
 
 - (NSMenu*)applicationDockMenu:(NSApplication*)sender {
@@ -277,6 +300,9 @@ static int run_headless(const char* runtimePath) {
     return 1;
   }
 
+  // No UI loop in a headless worker: UI tasks are answered "not run" at
+  // once instead of waiting for a loop that never runs.
+  laufey_common::UiLoopEnded();
   if (!loader->Start()) {
     std::cerr << "Failed to start headless worker runtime." << std::endl;
     return 1;
@@ -340,6 +366,16 @@ int main(int argc, char* argv[]) {
     return run_headless(runtimePathArg ? [runtimePathArg UTF8String] : nullptr);
   }
 
+  // Single-instance mode (docs/deep-links.md): a second launch forwards its
+  // arguments to the running instance and exits here, before CefInitialize
+  // (so CEF's own profile singleton is never reached) and before the runtime
+  // loads.
+  int single_instance_exit = 0;
+  if (!laufey_common::SingleInstanceStartup(argc, argv,
+                                            &single_instance_exit)) {
+    return single_instance_exit;
+  }
+
   CefScopedLibraryLoader library_loader;
   if (!library_loader.LoadInMain()) {
     return 1;
@@ -390,11 +426,25 @@ int main(int argc, char* argv[]) {
     // libdispatch queue is serviced — required for tray/status items.
     settings.external_message_pump = true;
 
-    std::string cache_path = std::string(NSTemporaryDirectory().UTF8String) +
-                             "laufey_cef_" + std::to_string(getpid());
-    CefString(&settings.root_cache_path) = cache_path;
+    // With a per-app data dir (LAUFEY_DATA_DIR / LAUFEY_APP_ID) the profile
+    // persists there; cache_path must be set too (equal to the root) or CEF
+    // runs the browser "incognito" and keeps localStorage/cookies in memory.
+    // Without one, keep the throwaway per-process temp root.
+    std::string cache_path = laufey_common::AppDataSubdir("CEF");
+    if (!cache_path.empty()) {
+      CefString(&settings.root_cache_path) = cache_path;
+      CefString(&settings.cache_path) = cache_path;
+    } else {
+      cache_path = std::string(NSTemporaryDirectory().UTF8String) +
+                   "laufey_cef_" + std::to_string(getpid());
+      CefString(&settings.root_cache_path) = cache_path;
+    }
 
-    if (const char* port_env = getenv("LAUFEY_REMOTE_DEBUGGING_PORT")) {
+    // No remote debugging while DevTools are off (API 40, inspectable).
+    const char* port_env = laufey_common::LaunchInspectable()
+                               ? getenv("LAUFEY_REMOTE_DEBUGGING_PORT")
+                               : nullptr;
+    if (port_env) {
       int port = atoi(port_env);
       if (port > 0 && port < 65536) {
         settings.remote_debugging_port = port;
@@ -408,6 +458,7 @@ int main(int argc, char* argv[]) {
     g_pump = [[LaufeyPumpTarget alloc] init];
 
     if (!CefInitialize(main_args, settings, app.get(), nullptr)) {
+      LaufeyReportCefInitializeFailure(cache_path);
       return CefGetExitCode();
     }
 
@@ -417,6 +468,15 @@ int main(int argc, char* argv[]) {
     // the delegate isn't released immediately under ARC.
     static LaufeyAppDelegate* delegate = [[LaufeyAppDelegate alloc] init];
     NSApp.delegate = delegate;
+    // The notification-center delegate must be in place before AppKit
+    // finishes launching, or the click that launched the app is lost.
+    laufey_common::InitNotificationsAtLaunch();
+
+    // Files and URLs reach the runtime through argv (direct exec) or the
+    // open-url handler (LaunchServices), never both; forwarded launches are
+    // delivered on the main queue, which [NSApp run] drains.
+    laufey_common::DisableArgvOpenEventsMac();
+    LaufeyInstallSecondInstanceHooks();
 
     [NSApp activateIgnoringOtherApps:YES];
 
@@ -425,6 +485,11 @@ int main(int argc, char* argv[]) {
     [g_pump start];  // begin the steady pump so the runtime starts
     [NSApp run];
 
+    // The loop is over: UI tasks still queued are answered "not run" and an
+    // auth session in progress ends cancelled, so a runtime thread waiting on
+    // either is released before Shutdown waits for it.
+    laufey_common::UiLoopEnded();
+    LaufeyClearSecondInstanceHooks();
     RuntimeLoader::GetInstance()->Shutdown();
 
     CefShutdown();

@@ -2,10 +2,17 @@
 //
 // NSAlert-based dialogs. `runModal` itself spins NSRunLoop, pumping AppKit
 // events for other windows while the dialog is up. Runs on main directly
-// when the caller is already there (the typical case for the Deno
-// runtime); otherwise dispatch_sync forwards.
+// when the caller is already there; from another thread (the runtime's) it
+// runs from a main run-loop block and the caller waits for it. Not from a
+// main-queue block (dispatch_sync): the main queue is serial, so while that
+// block ran the modal, no other main-queue work would run until the dialog
+// closed -- the backend's UI-thread calls and dispatch_ui_task among it.
+// The wait goes through the UI task dispatcher (laufey_ui_tasks.h): a call
+// still waiting when the loop ends returns as if cancelled.
 
 #include "laufey_backend_common.h"
+#include "laufey_menu.h"
+#include "laufey_ui_tasks.h"
 
 #import <Cocoa/Cocoa.h>
 
@@ -59,9 +66,17 @@ int ShowDialogMac(int dialog_type, const std::string& title,
   };
 
   if ([NSThread isMainThread]) {
+    ScopedNativeModalLoop modal_loop;
     body();
   } else {
-    dispatch_sync(dispatch_get_main_queue(), body);
+    auto run = [body] {
+      ScopedNativeModalLoop modal_loop;
+      body();
+    };
+    RunOnUiThreadAndWait(run, [](void (*task)(void*), void* data) {
+      RunFromMainRunLoopMac([task, data] { task(data); });
+      return true;
+    });
   }
 
   if (out_input_value && input_strdup)

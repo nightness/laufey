@@ -4,6 +4,10 @@
 
 #include "runtime_loader.h"
 #include "laufey_backend_common.h"
+#include "laufey_auth_session.h"
+#include "laufey_notifications.h"
+#include "laufey_single_instance.h"
+#include "laufey_window.h"
 
 #include <iostream>
 #include <string>
@@ -63,6 +67,7 @@ void EnsureEditMenu(NSMenu* menubar) {
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, assign) LaufeyBackend* backend;
 @property(nonatomic, copy) NSString* runtimePath;
+- (void)shutDownRuntime;
 @end
 
 @implementation AppDelegate
@@ -128,13 +133,30 @@ void EnsureEditMenu(NSMenu* menubar) {
 }
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
+  [self shutDownRuntime];
+}
+
+// Tells the runtime the app is ending and waits for its thread. Safe to call
+// twice: the loop can end through -terminate: (this delegate's
+// applicationWillTerminate:) or through quit()'s -stop: (after [NSApp run]
+// returns in main), and which one wins is a race.
+- (void)shutDownRuntime {
+  // The loop is over: UI tasks still queued are answered "not run" and an
+  // auth session in progress ends cancelled, so a runtime thread waiting on
+  // either is released before Shutdown waits for it.
+  laufey_common::UiLoopEnded();
   RuntimeLoader::GetInstance()->Shutdown();
   delete self.backend;
   self.backend = nullptr;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
-  return YES;
+  // A menu-bar-only app uses the Accessory activation policy. Its windows can
+  // be transient (for example, a tray popover), so closing the last one must
+  // not terminate the process and remove its status item.
+  // A tray / menu-bar app can also ask to keep running with no window
+  // (set_quit_on_last_window_closed(false)); quit() ends it either way.
+  return laufey_common::ShouldQuitAfterLastWindowMac() ? YES : NO;
 }
 
 - (BOOL)applicationShouldHandleReopen:(NSApplication*)sender
@@ -143,6 +165,23 @@ void EnsureEditMenu(NSMenu* menubar) {
   // Always swallow the default "show last hidden window" behavior — the
   // embedder's callback decides what to do.
   return NO;
+}
+
+// Deep links. AppKit routes the kAEGetURL Apple Event here for every scheme
+// the bundle claims in CFBundleURLTypes, both at launch and while running.
+// Implementing this selector is what makes AppKit install its own handler for
+// that event, so there's no NSAppleEventManager registration to do.
+//
+// A launch URL lands before the runtime finished loading on its worker
+// thread, so FireOpenUrlMac buffers until a handler registers.
+- (void)application:(NSApplication*)application
+           openURLs:(NSArray<NSURL*>*)urls {
+  for (NSURL* url in urls) {
+    NSString* absolute = [url absoluteString];
+    if (absolute) {
+      laufey_common::FireOpenUrlMac([absolute UTF8String]);
+    }
+  }
 }
 
 - (NSMenu*)applicationDockMenu:(NSApplication*)sender {
@@ -184,6 +223,9 @@ static int run_headless(const char* runtimePath) {
     return 1;
   }
 
+  // No UI loop in a headless worker: UI tasks are answered "not run" at
+  // once instead of waiting for a loop that never runs.
+  laufey_common::UiLoopEnded();
   if (!loader->Start()) {
     std::cerr << "Failed to start headless worker runtime." << std::endl;
     return 1;
@@ -227,6 +269,15 @@ int main(int argc, char* argv[]) {
     return run_headless(runtimePathArg ? [runtimePathArg UTF8String] : nullptr);
   }
 
+  // Single-instance mode (docs/deep-links.md): a second launch forwards its
+  // arguments to the running instance and exits here, before any web
+  // engine or the runtime starts.
+  int single_instance_exit = 0;
+  if (!laufey_common::SingleInstanceStartup(argc, argv,
+                                            &single_instance_exit)) {
+    return single_instance_exit;
+  }
+
   @autoreleasepool {
     // Allow the host to override the user-visible app name (menu-bar app
     // menu, Dock, Cmd-Tab) at launch, e.g. the project name during
@@ -258,6 +309,15 @@ int main(int argc, char* argv[]) {
     delegate.runtimePath = runtimePathArg;
 
     [NSApp setDelegate:delegate];
+    // The notification-center delegate must be in place before AppKit
+    // finishes launching, or the click that launched the app is lost.
+    laufey_common::InitNotificationsAtLaunch();
+
+    // Files and URLs reach the runtime through argv (direct exec) or the
+    // open-url handler (LaunchServices), never both; forwarded launches are
+    // delivered on the main queue once [NSApp run] starts.
+    laufey_common::DisableArgvOpenEventsMac();
+    laufey_common::InstallSecondInstanceHooksMac();
 
     NSMenu* menubar = [[NSMenu alloc] init];
     NSMenuItem* appMenuItem = [[NSMenuItem alloc] init];
@@ -276,6 +336,13 @@ int main(int argc, char* argv[]) {
 
     [NSApp activateIgnoringOtherApps:YES];
     [NSApp run];
+
+    // quit() ends the loop with -stop:, which returns here without
+    // -terminate:'s applicationWillTerminate:. Unless AppKit's own
+    // terminate-after-last-window check got in first, the runtime has not
+    // been told yet; returning would exit the process under it, so shut it
+    // down here, as the other backends do after their loop.
+    [delegate shutDownRuntime];
   }
 
   return 0;

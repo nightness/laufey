@@ -3,8 +3,53 @@
 #include "render_process_handler.h"
 
 #include "laufey_external_links.h"
+#include "laufey_file_drop_observer.h"
 
 CefRefPtr<LaufeyRenderProcessHandler> g_render_handler;
+
+namespace {
+
+// `send` for the file-drop observer (laufey_file_drop_observer.h): forwards
+// (phase, x, y, count) to the browser process, which pairs them with the
+// paths CefDragHandler::OnDragEnter saw. The function object only ever lives
+// in the observer's closure, so page script can't call it.
+class FileDropSender : public CefV8Handler {
+ public:
+  explicit FileDropSender(CefRefPtr<CefFrame> frame) : frame_(frame) {}
+
+  bool Execute(const CefString& /*name*/, CefRefPtr<CefV8Value> /*object*/,
+               const CefV8ValueList& arguments, CefRefPtr<CefV8Value>& retval,
+               CefString& /*exception*/) override {
+    retval = CefV8Value::CreateUndefined();
+    if (arguments.size() < 4 || !frame_ || !frame_->IsValid())
+      return true;
+    auto number = [&](size_t i) -> double {
+      const CefRefPtr<CefV8Value>& v = arguments[i];
+      if (v->IsInt() || v->IsUInt() || v->IsDouble())
+        return v->GetDoubleValue();
+      return 0.0;
+    };
+    double phase = number(0);
+    double count = number(3);
+    if (phase < 0 || phase > 3 || count < 0 || count > 1e6)
+      return true;
+    CefRefPtr<CefProcessMessage> msg =
+        CefProcessMessage::Create("laufey_file_drop");
+    CefRefPtr<CefListValue> args = msg->GetArgumentList();
+    args->SetInt(0, static_cast<int>(phase));
+    args->SetDouble(1, number(1));
+    args->SetDouble(2, number(2));
+    args->SetInt(3, static_cast<int>(count));
+    frame_->SendProcessMessage(PID_BROWSER, msg);
+    return true;
+  }
+
+ private:
+  CefRefPtr<CefFrame> frame_;
+  IMPLEMENT_REFCOUNTING(FileDropSender);
+};
+
+}  // namespace
 
 LaufeyPathObject::LaufeyPathObject(std::vector<std::string> path,
                                    CefRefPtr<CefFrame> frame)
@@ -184,6 +229,19 @@ void LaufeyRenderProcessHandler::OnContextCreated(
   // intercepts before dispatching to the runtime.
   frame->ExecuteJavaScript(BuildExternalLinkInterceptScript(ns),
                            frame->GetURL(), 0);
+
+  // File drags (API 39): the observer runs now, before any page script, and
+  // gets its `send` as an argument, so it is reachable from nowhere else.
+  CefRefPtr<CefV8Value> observer;
+  CefRefPtr<CefV8Exception> exception;
+  if (context->Eval(laufey_common::BuildDomFileDropObserverScript(), "", 0,
+                    observer, exception) &&
+      observer && observer->IsFunction()) {
+    CefV8ValueList args;
+    args.push_back(
+        CefV8Value::CreateFunction("send", new FileDropSender(frame)));
+    observer->ExecuteFunctionWithContext(context, nullptr, args);
+  }
 }
 
 void LaufeyRenderProcessHandler::OnContextReleased(

@@ -1,16 +1,33 @@
 // Copyright 2025 Divy Srivastava. All rights reserved. MIT license.
 
 #import <Cocoa/Cocoa.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <UserNotifications/UserNotifications.h>
 #import <WebKit/WebKit.h>
 
 #include "runtime_loader.h"
+
+#import <objc/message.h>
 #include "laufey_backend_common.h"
+#include "laufey_io.h"
+#include "laufey_single_instance.h"
 #include "laufey_json.h"
+#include "laufey_launch_config.h"
+#include "laufey_menu.h"
+#include "laufey_notifications.h"
+#include "laufey_passkey.h"
+#include "laufey_auth_session.h"
+#include "laufey_scheme_cancel.h"
+#include "laufey_scheme_registry.h"
+#include "laufey_ui_tasks.h"
+#include "laufey_system.h"
+#include "laufey_window.h"
 #include "init_script.h"
 
 #include <atomic>
+#include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 
 @class LaufeyScriptMessageHandler;
@@ -55,6 +72,9 @@ class WKWebViewBackend : public LaufeyBackend {
   void CloseWindow(uint32_t window_id) override;
 
   void Navigate(uint32_t window_id, const std::string& url) override;
+  // Record a scheme the embedder registered; every window created afterwards
+  // installs the in-process URL scheme handler for it, next to "app".
+  void RegisterSchemeHandler(const std::string& scheme) override;
   void OpenExternalURL(const std::string& url) override;
   void SetTitle(uint32_t window_id, const std::string& title) override;
   void ExecuteJs(uint32_t window_id, const std::string& script,
@@ -62,8 +82,11 @@ class WKWebViewBackend : public LaufeyBackend {
   void Quit() override;
   void SetWindowSize(uint32_t window_id, int width, int height) override;
   void GetWindowSize(uint32_t window_id, int* width, int* height) override;
+  void GetWindowOuterSize(uint32_t window_id, int* width, int* height) override;
+  double GetWindowScaleFactor(uint32_t window_id) override;
   void SetWindowPosition(uint32_t window_id, int x, int y) override;
   void GetWindowPosition(uint32_t window_id, int* x, int* y) override;
+  void GetWindowInnerPosition(uint32_t window_id, int* x, int* y) override;
   void SetResizable(uint32_t window_id, bool resizable) override;
   bool IsResizable(uint32_t window_id) override;
   void SetAlwaysOnTop(uint32_t window_id, bool always_on_top) override;
@@ -78,7 +101,11 @@ class WKWebViewBackend : public LaufeyBackend {
   void Show(uint32_t window_id) override;
   void Hide(uint32_t window_id) override;
   void Focus(uint32_t window_id) override;
-  void PostUiTask(void (*task)(void*), void* data) override;
+  bool PostUiTask(void (*task)(void*), void* data) override;
+  void SetSecondInstanceHandler(laufey_second_instance_fn handler,
+                                void* user_data) override {
+    laufey_common::SetSecondInstanceHandler(handler, user_data);
+  }
 
   void InvokeJsCallback(uint32_t window_id, uint64_t callback_id,
                         laufey::ValuePtr args) override;
@@ -125,6 +152,25 @@ class WKWebViewBackend : public LaufeyBackend {
   void SetDockReopenHandler(laufey_dock_reopen_fn handler,
                             void* user_data) override;
 
+  void SetOpenUrlHandler(laufey_open_url_fn handler, void* user_data) override;
+  bool TestTriggerOpenUrl(const char* url) override;
+
+  uint32_t PasskeyCapabilities() override {
+    return laufey_common::PasskeyCapabilitiesMac();
+  }
+  void PasskeyRequest(uint32_t window_id, uint32_t kind,
+                      const char* options_json,
+                      laufey_passkey_result_fn callback,
+                      void* user_data) override;
+
+  uint32_t AuthSessionCapabilities() override {
+    return laufey_common::AuthSessionCapabilities();
+  }
+  void AuthSessionStart(uint32_t window_id, const char* url,
+                        const char* callback, uint32_t flags,
+                        laufey_auth_session_result_fn on_result,
+                        void* user_data) override;
+
   uint32_t CreateTrayIcon() override;
   void DestroyTrayIcon(uint32_t tray_id) override;
   void SetTrayIcon(uint32_t tray_id, const void* png_bytes,
@@ -153,6 +199,164 @@ class WKWebViewBackend : public LaufeyBackend {
   void RequestPermission(int kind, laufey_permission_callback_fn cb,
                          void* user_data) override;
 
+  // Notifications and menus (API >= 41): backend-common.
+  uint32_t NotificationCapabilities() override {
+    return laufey_common::NotificationCapabilities();
+  }
+  void SetNotificationResponseHandler(laufey_notification_response_fn handler,
+                                      void* user_data) override {
+    laufey_common::SetNotificationResponseHandler(handler, user_data);
+  }
+  void ListScheduledNotifications(laufey_notification_list_fn cb,
+                                  void* user_data) override {
+    laufey_common::ListScheduledNotifications(cb, user_data);
+  }
+  void CancelNotification(const char* tag) override {
+    laufey_common::CancelNotification(tag);
+  }
+  bool TestNotificationRespond(const char* tag,
+                               const char* action_id) override {
+    return laufey_common::TestNotificationRespond(tag, action_id);
+  }
+  uint32_t MenuCapabilities() override {
+    return LAUFEY_MENU_CAP_APP_MENU | LAUFEY_MENU_CAP_ACCELERATORS |
+           LAUFEY_MENU_CAP_CONTEXT_MENU | LAUFEY_MENU_CAP_CONTEXT_CLOSED |
+           LAUFEY_MENU_CAP_ICONS | LAUFEY_MENU_CAP_TOOLTIPS;
+  }
+  void ShowContextMenuEx(uint32_t window_id, int x, int y,
+                         laufey_value_t* menu_template,
+                         const laufey_backend_api_t* api,
+                         laufey_menu_click_fn on_click, void* on_click_data,
+                         laufey_menu_closed_fn on_closed,
+                         void* on_closed_data) override;
+  bool TestDismissContextMenu() override {
+    return laufey_common::DismissOpenContextMenu();
+  }
+  bool TestTriggerMenuAccelerator(uint32_t window_id,
+                                  const char* accelerator) override {
+    return laufey_common::TestTriggerMenuAcceleratorMac(window_id, accelerator);
+  }
+
+  // Drag and drop, file dialogs, rich clipboard (API >= 39).
+  void SetFileDropHandler(laufey_file_drop_fn handler,
+                          void* user_data) override {
+    laufey_common::SetFileDropHandler(handler, user_data);
+  }
+  bool TestTriggerFileDrop(uint32_t window_id, int phase, double x, double y,
+                           const char* const* paths, size_t count) override;
+  void StartFileDrag(uint32_t window_id, const char* const* paths, size_t count,
+                     const uint8_t* icon_png, size_t icon_len,
+                     laufey_drag_result_fn callback, void* user_data) override;
+  uint32_t ShowFileDialog(uint32_t window_id,
+                          const laufey_file_dialog_options_t* options,
+                          laufey_file_dialog_result_fn callback,
+                          void* user_data) override;
+  bool CancelFileDialog(uint32_t dialog_id) override {
+    return laufey_common::CancelFileDialogMac(dialog_id);
+  }
+  bool TestFileDialogRespond(int action, const char* path) override {
+    return laufey_common::TestFileDialogRespondMac(action, path);
+  }
+  uint32_t ClipboardCapabilities() override {
+    return laufey_common::ClipboardCapabilitiesMac();
+  }
+  char* ReadClipboardHtml() override {
+    return laufey_common::ClipboardReadHtmlMac();
+  }
+  bool WriteClipboardHtml(const std::string& html,
+                          const char* text_or_null) override {
+    return laufey_common::ClipboardWriteHtmlMac(html, text_or_null);
+  }
+  uint8_t* ReadClipboardImage(size_t* len_out) override {
+    return laufey_common::ClipboardReadImageMac(len_out);
+  }
+  bool WriteClipboardImage(const uint8_t* png, size_t len) override {
+    return laufey_common::ClipboardWriteImageMac(png, len);
+  }
+  char* ReadClipboardFormats() override {
+    return laufey_common::ClipboardReadFormatsMac();
+  }
+  void SetClipboardChangeHandler(laufey_clipboard_change_fn handler,
+                                 void* user_data) override {
+    laufey_common::SetClipboardChangeHandler(handler, user_data);
+  }
+
+  // Global shortcuts, launch at login, DevTools (API >= 40).
+  // The Carbon hot-key platform is installed on first use.
+  static void EnsureShortcuts() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+      laufey_common::InstallShortcutPlatform(
+          laufey_common::CreateShortcutPlatformMac());
+    });
+  }
+  uint32_t SystemCapabilities() override {
+    EnsureShortcuts();
+    uint32_t caps =
+        laufey_common::ShortcutCapabilities() | LAUFEY_SYSTEM_CAP_DEVTOOLS;
+    if (laufey_common::GetLaunchAtLogin() != LAUFEY_LOGIN_ITEM_NOT_SUPPORTED)
+      caps |= LAUFEY_SYSTEM_CAP_LAUNCH_AT_LOGIN;
+    return caps;
+  }
+  void SetShortcutHandler(laufey_shortcut_fn handler,
+                          void* user_data) override {
+    laufey_common::SetShortcutHandler(handler, user_data);
+  }
+  void RegisterShortcut(const char* accelerator,
+                        laufey_shortcut_result_fn callback,
+                        void* user_data) override {
+    EnsureShortcuts();
+    laufey_common::RegisterShortcut(accelerator, callback, user_data);
+  }
+  bool UnregisterShortcut(const char* accelerator) override {
+    return laufey_common::UnregisterShortcut(accelerator);
+  }
+  void UnregisterAllShortcuts() override {
+    laufey_common::UnregisterAllShortcuts();
+  }
+  char* ListShortcuts() override {
+    return laufey_common::ListShortcuts();
+  }
+  char* CanonicalizeAccelerator(const char* accelerator) override {
+    return laufey_common::CanonicalizeAccelerator(accelerator);
+  }
+  bool TestTriggerShortcut(const char* accelerator) override {
+    return laufey_common::TestTriggerShortcut(accelerator);
+  }
+  int GetLaunchAtLogin() override {
+    return laufey_common::GetLaunchAtLogin();
+  }
+  int SetLaunchAtLogin(bool enabled, std::string* error) override {
+    return laufey_common::SetLaunchAtLogin(enabled, error);
+  }
+  void CloseDevTools(uint32_t window_id) override;
+  bool IsDevToolsOpen(uint32_t window_id) override;
+  bool IsDevToolsEnabled(uint32_t window_id) override;
+
+  // Window state, constraints, screens and chrome (API >= 38).
+  uint32_t WindowCapabilities() override;
+  void SetWindowState(uint32_t window_id, int action) override;
+  uint32_t GetWindowState(uint32_t window_id) override;
+  void SetWindowStateHandler(laufey_window_state_fn handler,
+                             void* user_data) override;
+  void SetWindowSizeConstraints(uint32_t window_id, int min_width,
+                                int min_height, int max_width,
+                                int max_height) override;
+  void GetWindowSizeConstraints(uint32_t window_id, int* min_width,
+                                int* min_height, int* max_width,
+                                int* max_height) override;
+  size_t GetScreens(laufey_screen_t* out, size_t capacity) override;
+  int64_t GetWindowScreen(uint32_t window_id) override;
+  void SetDisplayChangedHandler(laufey_display_changed_fn handler,
+                                void* user_data) override;
+  bool SetWindowTitlebarStyle(uint32_t window_id, int style) override;
+  bool SetWindowTrafficLightPosition(uint32_t window_id, int x, int y) override;
+  bool SetWindowBackdrop(uint32_t window_id, int backdrop,
+                         int material) override;
+  bool GetWindowNormalBounds(uint32_t window_id, int* x, int* y, int* width,
+                             int* height) override;
+  void SetQuitOnLastWindowClosed(bool quit) override;
+
   void HandleJsMessage(uint32_t window_id, uint64_t call_id,
                        const std::string& method, laufey::ValuePtr args);
 
@@ -164,6 +368,7 @@ class WKWebViewBackend : public LaufeyBackend {
 
  private:
   MacWindowState* GetWindow(uint32_t window_id);
+  WKWebView* WebViewOf(uint32_t window_id);
   void RemoveWindowState(uint32_t window_id);
   void InstallGlobalMonitors();
   void RemoveGlobalMonitors();
@@ -178,6 +383,10 @@ class WKWebViewBackend : public LaufeyBackend {
 
   std::map<uint32_t, MacWindowState> windows_;
   std::mutex windows_mutex_;
+
+  // Set once the first WKWebViewConfiguration has been built, i.e. the
+  // registered-scheme set has been read; a later RegisterSchemeHandler warns.
+  std::atomic<bool> any_window_created_{false};
 
   // Global event monitors (installed once)
   id keyboard_monitor_ = nil;
@@ -234,6 +443,102 @@ static void UnregisterNSWindow(NSWindow* win) {
 }
 @end
 
+// The WKWebView every window uses. It is the window's drag destination, so it
+// is where file drags are seen: each phase goes to the file-drop handler with
+// the native paths (from the dragging pasteboard's file URLs) before WebKit
+// handles it, so the page keeps getting its own DOM drag events. A file drag
+// is always accepted (copy), even where the page doesn't handle it, so the
+// drop reaches the runtime; WebKit's answer still decides what the page does.
+@interface LaufeyWebView : WKWebView
+@property(nonatomic, assign) uint32_t laufeyWindowId;
+@end
+
+static std::vector<std::string> DraggedFilePaths(id<NSDraggingInfo> info) {
+  std::vector<std::string> paths;
+  NSArray<NSURL*>* urls = [[info draggingPasteboard]
+      readObjectsForClasses:@[ [NSURL class] ]
+                    options:@{
+                      NSPasteboardURLReadingFileURLsOnlyKey : @YES
+                    }];
+  for (NSURL* url in urls) {
+    if (url.isFileURL && url.path.length > 0)
+      paths.emplace_back(url.path.UTF8String);
+  }
+  return paths;
+}
+
+@implementation LaufeyWebView {
+  std::vector<std::string> _dragPaths;  // the current file drag's paths
+  bool _fileDrag;
+  NSDragOperation _webkitOp;  // WebKit's answer to the last enter / update
+  NSPoint _lastPoint;
+}
+
+- (NSPoint)laufeyDragPoint:(id<NSDraggingInfo>)info {
+  NSPoint p = [self convertPoint:[info draggingLocation] fromView:nil];
+  if (!self.isFlipped)
+    p.y = NSHeight(self.bounds) - p.y;
+  return p;
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info {
+  NSDragOperation op = [super draggingEntered:info];
+  _webkitOp = op;
+  _dragPaths = DraggedFilePaths(info);
+  _fileDrag = !_dragPaths.empty();
+  if (!_fileDrag)
+    return op;
+  _lastPoint = [self laufeyDragPoint:info];
+  laufey_common::DispatchFileDrop(self.laufeyWindowId, LAUFEY_DRAG_ENTER,
+                                  _lastPoint.x, _lastPoint.y, _dragPaths,
+                                  _dragPaths.size());
+  return op == NSDragOperationNone ? NSDragOperationCopy : op;
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)info {
+  NSDragOperation op = [super draggingUpdated:info];
+  _webkitOp = op;
+  if (!_fileDrag)
+    return op;
+  NSPoint p = [self laufeyDragPoint:info];
+  if (!NSEqualPoints(p, _lastPoint)) {
+    _lastPoint = p;
+    laufey_common::DispatchFileDrop(self.laufeyWindowId, LAUFEY_DRAG_OVER, p.x,
+                                    p.y, _dragPaths, _dragPaths.size());
+  }
+  return op == NSDragOperationNone ? NSDragOperationCopy : op;
+}
+
+- (void)draggingExited:(id<NSDraggingInfo>)info {
+  [super draggingExited:info];
+  if (!_fileDrag)
+    return;
+  _fileDrag = false;
+  _dragPaths.clear();
+  NSPoint p = [self laufeyDragPoint:info];
+  laufey_common::DispatchFileDrop(self.laufeyWindowId, LAUFEY_DRAG_LEAVE, p.x,
+                                  p.y, {}, 0);
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
+  if (!_fileDrag)
+    return [super performDragOperation:info];
+  std::vector<std::string> paths = std::move(_dragPaths);
+  _dragPaths.clear();
+  _fileDrag = false;
+  NSPoint p = [self laufeyDragPoint:info];
+  laufey_common::DispatchFileDrop(self.laufeyWindowId, LAUFEY_DRAG_DROP, p.x,
+                                  p.y, paths, paths.size());
+  if (_webkitOp == NSDragOperationNone) {
+    // WebKit refused this drop; we only accepted it for the runtime. End
+    // WebKit's drag session the way a cancelled drag would.
+    [super draggingExited:info];
+    return YES;
+  }
+  return [super performDragOperation:info];
+}
+@end
+
 @interface LaufeyScriptMessageHandler : NSObject <WKScriptMessageHandler>
 @property(nonatomic, assign) WKWebViewBackend* backend;
 @property(nonatomic, assign) uint32_t windowId;
@@ -241,10 +546,39 @@ static void UnregisterNSWindow(NSWindow* win) {
 
 @implementation LaufeyScriptMessageHandler
 
+// Whether a message from a document with `origin` may be the web view's page
+// at `url`: the same scheme, host and port (a missing port is the scheme's
+// default, which WebKit reports as 0). A page without a host (HTML loaded
+// with no base URL is about:blank, with an opaque origin) has no origin to
+// compare, so only the main-frame check applies to it.
+static bool LaufeyOriginMatchesURL(WKSecurityOrigin* origin, NSURL* url) {
+  if (!origin)
+    return false;
+  if (!url || url.host.length == 0)
+    return true;
+  NSString* host = url.host;
+  NSInteger port = url.port ? url.port.integerValue : 0;
+  return [origin.protocol caseInsensitiveCompare:url.scheme] == NSOrderedSame &&
+         [origin.host caseInsensitiveCompare:host] == NSOrderedSame &&
+         origin.port == port;
+}
+
 - (void)userContentController:(WKUserContentController*)userContentController
       didReceiveScriptMessage:(WKScriptMessage*)message {
   if (![message.name isEqualToString:@"laufey"])
     return;
+
+  // WebKit exposes a script message handler to every frame (only the bridge
+  // script is injected forMainFrameOnly), so a sub-frame, cross-origin
+  // content included, could post here directly. Accept only the main frame,
+  // and only while its document is still the web view's page (not a message
+  // from a page navigated away from). Mirrors WebView2's source check and
+  // CEF's main-frame-only binding.
+  WKFrameInfo* frame = message.frameInfo;
+  if (!frame || !frame.isMainFrame ||
+      !LaufeyOriginMatchesURL(frame.securityOrigin, message.webView.URL)) {
+    return;
+  }
 
   if (![message.body isKindOfClass:[NSDictionary class]])
     return;
@@ -282,15 +616,41 @@ static void UnregisterNSWindow(NSWindow* win) {
 
 @end
 
-// --- Custom app:// scheme handling (in-process transport) ---
+// --- Custom URL scheme handling (in-process transport) ---
+//
+// Serves "app" and every scheme the embedder registered (see
+// RegisterSchemeHandler); the same handler object is installed for each.
+
+class MacSchemeExchange;
+
+// One in-flight WKURLSchemeTask: `stopped` is set when WebKit stops it
+// (-stopURLSchemeTask:), after which it must not be messaged; `gate`
+// reports that stop to the runtime (on_cancel) unless it finished first.
+struct MacSchemeTaskState {
+  std::atomic<bool> stopped{false};
+  laufey_common::SchemeCancelGate gate;
+  // Set on the main thread before the runtime sees it; deleted (on the main
+  // thread) only after gate.Finish().
+  MacSchemeExchange* exchange = nullptr;
+};
+
+// The in-flight tasks of every scheme handler, by task. An entry goes when
+// WebKit stops the task or when its exchange finishes, whichever is first.
+static std::mutex g_scheme_tasks_mutex;
+static std::map<void*, std::shared_ptr<MacSchemeTaskState>>& SchemeTasks() {
+  static auto* tasks =
+      new std::map<void*, std::shared_ptr<MacSchemeTaskState>>();
+  return *tasks;
+}
 
 // Exchange wrapping a WKURLSchemeTask. WKURLSchemeTask methods must be invoked
-// on the main thread, so each response step hops there; a `stopped_` flag
-// (set from -stopURLSchemeTask:) prevents messaging an already-cancelled task.
+// on the main thread, so each response step hops there; the task's `stopped`
+// flag prevents messaging an already-cancelled task.
 class MacSchemeExchange : public SchemeExchangeBase {
  public:
-  MacSchemeExchange(id<WKURLSchemeTask> task, NSData* body)
-      : task_(task), body_(body) {}
+  MacSchemeExchange(id<WKURLSchemeTask> task, NSData* body,
+                    std::shared_ptr<MacSchemeTaskState> state)
+      : task_(task), body_(body), state_(std::move(state)) {}
 
   intptr_t ReadRequestBody(uint8_t* buf, size_t cap) override {
     if (cap == 0 || !body_)
@@ -307,13 +667,25 @@ class MacSchemeExchange : public SchemeExchangeBase {
   void Begin(int status, const char* headers, size_t headers_len) override {
     auto pairs = LaufeyParseFlatHeaders(headers, headers_len);
     NSMutableDictionary* hdr = [NSMutableDictionary dictionary];
-    for (const auto& [k, v] : pairs)
-      hdr[@(k.c_str())] = @(v.c_str());
+    for (const auto& [k, v] : pairs) {
+      NSString* name = [NSString stringWithUTF8String:k.c_str()];
+      NSString* value = [NSString stringWithUTF8String:v.c_str()];
+      if (!name || !value)
+        continue;  // not UTF-8
+      // A header field may repeat (Set-Cookie); NSHTTPURLResponse takes a
+      // dictionary, so join the values the way HTTP folds them, as
+      // CFNetwork does for a network response.
+      NSString* previous = hdr[name];
+      hdr[name] = previous
+                      ? [NSString stringWithFormat:@"%@, %@", previous, value]
+                      : value;
+    }
     NSURL* url = task_.request.URL;
     id<WKURLSchemeTask> task = task_;
-    std::atomic<bool>* stopped = &stopped_;
+    std::shared_ptr<MacSchemeTaskState> state = state_;
+    began_.store(true);
     dispatch_async(dispatch_get_main_queue(), ^{
-      if (stopped->load())
+      if (state->stopped.load())
         return;
       NSHTTPURLResponse* resp =
           [[NSHTTPURLResponse alloc] initWithURL:url
@@ -328,13 +700,13 @@ class MacSchemeExchange : public SchemeExchangeBase {
   }
 
   intptr_t WriteResponse(const uint8_t* buf, size_t len) override {
-    if (stopped_.load())
+    if (state_->stopped.load())
       return -1;
     NSData* data = [NSData dataWithBytes:buf length:len];
     id<WKURLSchemeTask> task = task_;
-    std::atomic<bool>* stopped = &stopped_;
+    std::shared_ptr<MacSchemeTaskState> state = state_;
     dispatch_async(dispatch_get_main_queue(), ^{
-      if (stopped->load())
+      if (state->stopped.load())
         return;
       @try {
         [task didReceiveData:data];
@@ -345,39 +717,54 @@ class MacSchemeExchange : public SchemeExchangeBase {
   }
 
   void Finish() override {
+    // No on_cancel from now on (and one in progress has returned).
+    state_->gate.Finish();
     id<WKURLSchemeTask> task = task_;
-    std::atomic<bool>* stopped = &stopped_;
+    std::shared_ptr<MacSchemeTaskState> state = state_;
+    bool began = began_.load();
     MacSchemeExchange* self = this;
     dispatch_async(dispatch_get_main_queue(), ^{
-      if (!stopped->load()) {
+      if (!state->stopped.load()) {
         @try {
-          [task didFinish];
+          if (began) {
+            [task didFinish];
+          } else {
+            // Finished without a head: no response, so the request fails
+            // (WebKit throws on didFinish before didReceiveResponse, which
+            // left the request pending forever).
+            [task
+                didFailWithError:[NSError
+                                     errorWithDomain:NSURLErrorDomain
+                                                code:NSURLErrorBadServerResponse
+                                            userInfo:nil]];
+          }
         } @catch (...) {
         }
       }
+      {
+        std::lock_guard<std::mutex> lock(g_scheme_tasks_mutex);
+        auto& tasks = SchemeTasks();
+        auto it = tasks.find((__bridge void*)task);
+        if (it != tasks.end() && it->second == state)
+          tasks.erase(it);
+      }
       delete self;
     });
-  }
-
-  void MarkStopped() {
-    stopped_.store(true);
   }
 
  private:
   id<WKURLSchemeTask> task_;
   NSData* body_;
   size_t cursor_ = 0;
-  std::atomic<bool> stopped_{false};
+  std::shared_ptr<MacSchemeTaskState> state_;
+  std::atomic<bool> began_{false};
 };
 
 @interface LaufeyURLSchemeHandler : NSObject <WKURLSchemeHandler>
 @property(nonatomic, assign) uint32_t windowId;
 @end
 
-@implementation LaufeyURLSchemeHandler {
-  std::map<void*, MacSchemeExchange*> _tasks;
-  std::mutex _mutex;
-}
+@implementation LaufeyURLSchemeHandler
 
 - (void)webView:(WKWebView*)webView
     startURLSchemeTask:(id<WKURLSchemeTask>)task {
@@ -395,31 +782,111 @@ class MacSchemeExchange : public SchemeExchangeBase {
   // Note: WKURLSchemeHandler does not expose the request body for all request
   // kinds (a long-standing WebKit limitation); HTTPBody is forwarded when
   // present.
-  MacSchemeExchange* exchange = new MacSchemeExchange(task, req.HTTPBody);
+  auto state = std::make_shared<MacSchemeTaskState>();
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _tasks[(__bridge void*)task] = exchange;
+    std::lock_guard<std::mutex> lock(g_scheme_tasks_mutex);
+    SchemeTasks()[(__bridge void*)task] = state;
   }
+  MacSchemeExchange* exchange =
+      new MacSchemeExchange(task, req.HTTPBody, state);
+  state->exchange = exchange;
   RuntimeLoader::GetInstance()->DispatchSchemeRequest(self.windowId, exchange,
                                                       method, url, flat);
 }
 
 - (void)webView:(WKWebView*)webView
     stopURLSchemeTask:(id<WKURLSchemeTask>)task {
-  std::lock_guard<std::mutex> lock(_mutex);
-  auto it = _tasks.find((__bridge void*)task);
-  if (it != _tasks.end()) {
-    it->second->MarkStopped();
-    _tasks.erase(it);
+  std::shared_ptr<MacSchemeTaskState> state;
+  {
+    std::lock_guard<std::mutex> lock(g_scheme_tasks_mutex);
+    auto& tasks = SchemeTasks();
+    auto it = tasks.find((__bridge void*)task);
+    if (it == tasks.end())
+      return;
+    state = it->second;
+    state->stopped.store(true);
+    tasks.erase(it);
   }
+  // The page gave up on the request: tell the runtime, unless it finished.
+  // The exchange is deleted on this thread, after gate.Finish().
+  MacSchemeExchange* exchange = state->exchange;
+  state->gate.Cancel([exchange] {
+    RuntimeLoader::GetInstance()->DispatchSchemeCancel(exchange);
+  });
 }
 
 @end
+
+// ============================================================================
+// Per-app website data store
+// ============================================================================
+
+// Namespace for the name-based (v5) UUIDs below. Fixed forever: changing it
+// would orphan every app's stored data.
+static const uuid_t kLaufeyDataStoreNamespace = {
+    0x91, 0x48, 0x13, 0xaa, 0x31, 0x15, 0x47, 0x24,
+    0x93, 0x7f, 0x29, 0xb5, 0x4f, 0x44, 0x13, 0x56};  // 914813aa-3115-4724-...
+
+// RFC 9562 UUIDv5 (SHA-1) of `name` in kLaufeyDataStoreNamespace.
+static NSUUID* LaufeyNameBasedUUID(const std::string& name) {
+  std::string input(reinterpret_cast<const char*>(kLaufeyDataStoreNamespace),
+                    sizeof(uuid_t));
+  input += name;
+  unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+  // SHA-1 is what RFC 9562 specifies for v5; this is an identifier, not a
+  // security boundary.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  CC_SHA1(input.data(), static_cast<CC_LONG>(input.size()), digest);
+#pragma clang diagnostic pop
+  uuid_t bytes;
+  memcpy(bytes, digest, sizeof(uuid_t));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;  // version 5
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;  // RFC 9562 variant
+  return [[NSUUID alloc] initWithUUIDBytes:bytes];
+}
+
+// The data store every WKWebView uses, or nil for the default store. WKWebView
+// can't be pointed at an arbitrary directory, so a configured app data dir
+// maps to a persistent identifier-based store (macOS 14+) instead: the UUIDv5
+// of LAUFEY_DATA_DIR when that is set, else of LAUFEY_APP_ID. Without either,
+// or before macOS 14, the default store (keyed by the host bundle id) is kept.
+static WKWebsiteDataStore* LaufeyWebsiteDataStore() {
+  static WKWebsiteDataStore* store = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    const std::string& dir = laufey_common::AppDataDir();
+    if (dir.empty())
+      return;
+    // AppDataDir() is non-empty, so it came from a valid data dir or,
+    // failing that, from a valid app id (each from its environment variable
+    // or the launch file, see laufey_launch_config.h).
+    std::string data_dir = laufey_common::LaunchDataDir();
+    std::string name = laufey_common::IsAbsolutePath(data_dir)
+                           ? dir
+                           : laufey_common::LaunchAppId();
+    if (@available(macOS 14.0, *)) {
+      store =
+          [WKWebsiteDataStore dataStoreForIdentifier:LaufeyNameBasedUUID(name)];
+    }
+  });
+  return store;
+}
 
 @interface LaufeyUIDelegate : NSObject <WKUIDelegate>
 @end
 
 @implementation LaufeyUIDelegate
+
+// The page's window.outerWidth / outerHeight and screenX / screenY. WebKit
+// asks its UI delegate for the window's frame through this informal
+// WKUIDelegatePrivate method (Safari implements it) and answers 0 for all
+// four when the delegate does not. WebKit flips the Cocoa frame itself.
+- (void)_webView:(WKWebView*)webView
+    getWindowFrameWithCompletionHandler:(void (^)(CGRect))completionHandler {
+  NSWindow* window = [webView window];
+  completionHandler(window ? NSRectToCGRect([window frame]) : CGRectZero);
+}
 
 // `target="_blank"` and `window.open()` request a new browsing context, which
 // the Navigation API interceptor never sees. WKWebView has no popup support, so
@@ -599,6 +1066,58 @@ inline std::string NSEventKeyCodeToCode(unsigned short keyCode) {
   return laufey_common::NSEventKeyToCode(keyCode);
 }
 
+// FlagsChanged has no `characters`. Map the hardware key to the Web `key`.
+std::string ModifierKeyFromKeyCode(unsigned short keyCode) {
+  switch (keyCode) {
+    case 56:
+    case 60:
+      return "Shift";
+    case 59:
+    case 62:
+      return "Control";
+    case 58:
+    case 61:
+      return "Alt";
+    case 54:
+    case 55:
+      return "Meta";
+    default:
+      return "";
+  }
+}
+
+bool ModifierFlagIsDown(unsigned short keyCode, NSEventModifierFlags flags) {
+  switch (keyCode) {
+    case 56:
+    case 60:
+      return (flags & NSEventModifierFlagShift) != 0;
+    case 59:
+    case 62:
+      return (flags & NSEventModifierFlagControl) != 0;
+    case 58:
+    case 61:
+      return (flags & NSEventModifierFlagOption) != 0;
+    case 54:
+    case 55:
+      return (flags & NSEventModifierFlagCommand) != 0;
+    default:
+      return false;
+  }
+}
+
+// NSEvent.clickCount is 0 on some mouse-up deliveries. Keep the press count
+// so `click.detail` matches a browser (1 for a single click).
+int32_t ResolveClickCount(int state, int32_t click_count) {
+  static int32_t last_click_count = 1;
+  if (state == LAUFEY_MOUSE_PRESSED) {
+    if (click_count < 1)
+      click_count = 1;
+    last_click_count = click_count;
+    return click_count;
+  }
+  return click_count >= 1 ? click_count : last_click_count;
+}
+
 uint32_t NSModifierFlagsToLaufey(NSEventModifierFlags flags) {
   uint32_t modifiers = 0;
   if (flags & NSEventModifierFlagShift)
@@ -694,18 +1213,33 @@ void WKWebViewBackend::RemoveWindowState(uint32_t window_id) {
     if (state.webview)
       [state.webview.configuration.userContentController
           removeScriptMessageHandlerForName:@"laufey"];
-    if (state.window)
+    if (state.window) {
       [state.window setDelegate:nil];
+      laufey_common::MacUnwatchWindowState((__bridge void*)state.window);
+    }
     UnregisterNSWindow(state.window);
   }
+  laufey_common::ForgetWindow(window_id);
   windows_.erase(it);
 }
 
 void WKWebViewBackend::OnWindowClosedByUser(uint32_t window_id) {
   // Main thread (AppKit delivers windowWillClose: there); safe to take the
   // lock and tear down state while the window finishes closing.
-  std::lock_guard<std::mutex> lock(windows_mutex_);
-  RemoveWindowState(window_id);
+  NSWindow* win = nil;
+  {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    if (auto* state = GetWindow(window_id))
+      win = state->window;
+    RemoveWindowState(window_id);
+  }
+  // A passkey sheet anchored to the window ends with it (`cancelled`).
+  // Outside the lock: the result callback may re-enter the backend.
+  if (win) {
+    laufey_common::PasskeyWindowClosing((__bridge const void*)win);
+    // So does an auth session sheet (`cancelled`).
+    laufey_common::AuthSessionWindowClosing((__bridge const void*)win);
+  }
 }
 
 void WKWebViewBackend::InstallGlobalMonitors() {
@@ -715,12 +1249,37 @@ void WKWebViewBackend::InstallGlobalMonitors() {
 
   keyboard_monitor_ = [NSEvent
       addLocalMonitorForEventsMatchingMask:(NSEventMaskKeyDown |
-                                            NSEventMaskKeyUp)
+                                            NSEventMaskKeyUp |
+                                            NSEventMaskFlagsChanged)
                                    handler:^NSEvent*(NSEvent* event) {
                                      NSWindow* win = [event window];
                                      uint32_t wid = LaufeyIdForNSWindow(win);
                                      if (wid == 0)
                                        return event;
+
+                                     uint32_t modifiers =
+                                         NSModifierFlagsToLaufey(
+                                             [event modifierFlags]);
+                                     if ([event type] ==
+                                         NSEventTypeFlagsChanged) {
+                                       unsigned short kc = [event keyCode];
+                                       std::string key =
+                                           ModifierKeyFromKeyCode(kc);
+                                       if (key.empty())
+                                         return event;
+                                       int state =
+                                           ModifierFlagIsDown(
+                                               kc, [event modifierFlags])
+                                               ? LAUFEY_KEY_PRESSED
+                                               : LAUFEY_KEY_RELEASED;
+                                       std::string code =
+                                           NSEventKeyCodeToCode(kc);
+                                       RuntimeLoader::GetInstance()
+                                           ->DispatchKeyboardEvent(
+                                               wid, state, key.c_str(),
+                                               code.c_str(), modifiers, false);
+                                       return event;
+                                     }
 
                                      int state =
                                          ([event type] == NSEventTypeKeyDown)
@@ -730,9 +1289,6 @@ void WKWebViewBackend::InstallGlobalMonitors() {
                                          NSEventKeyToString(event);
                                      std::string code =
                                          NSEventKeyCodeToCode([event keyCode]);
-                                     uint32_t modifiers =
-                                         NSModifierFlagsToLaufey(
-                                             [event modifierFlags]);
                                      bool repeat = [event isARepeat];
 
                                      RuntimeLoader::GetInstance()
@@ -773,8 +1329,8 @@ void WKWebViewBackend::InstallGlobalMonitors() {
                                      uint32_t modifiers =
                                          NSModifierFlagsToLaufey(
                                              [event modifierFlags]);
-                                     int32_t click_count =
-                                         (int32_t)[event clickCount];
+                                     int32_t click_count = ResolveClickCount(
+                                         state, (int32_t)[event clickCount]);
 
                                      NSPoint loc = [event locationInWindow];
                                      double x = loc.x;
@@ -990,18 +1546,39 @@ void WKWebViewBackend::CreateWindowEx(uint32_t window_id, int width, int height,
       handler.windowId = window_id;
 
       WKWebViewConfiguration* config = [[WKWebViewConfiguration alloc] init];
+      if (WKWebsiteDataStore* store = LaufeyWebsiteDataStore()) {
+        config.websiteDataStore = store;
+      }
       [config.userContentController addScriptMessageHandler:handler
                                                        name:@"laufey"];
 
-      // Install the in-process app:// scheme handler (must be set on the
-      // configuration before the WKWebView is created). Requests are bridged
-      // into the runtime's memory transport; if no runtime handler is
-      // registered the exchange is finished immediately.
+      // Install the in-process scheme handler for "app" and for every scheme
+      // the embedder registered through register_scheme_handler (must be set
+      // on the configuration before the WKWebView is created, which is why a
+      // scheme has to be registered before its first window). One handler
+      // serves them all: requests are bridged into the runtime's memory
+      // transport, which dispatches on the URL; if no runtime handler is
+      // registered the exchange is finished immediately. WKWebView treats
+      // handled schemes as secure contexts with `<scheme>://<host>` origins,
+      // so nothing else is needed for them to behave like https origins.
       LaufeyURLSchemeHandler* schemeHandler =
           [[LaufeyURLSchemeHandler alloc] init];
       schemeHandler.windowId = window_id;
-      [config setURLSchemeHandler:schemeHandler
-                     forURLScheme:@(LAUFEY_APP_SCHEME)];
+      for (const std::string& scheme :
+           laufey_common::SchemeRegistry::GetInstance()->Snapshot()) {
+        NSString* name = @(scheme.c_str());
+        // WebKit owns http/https/file/data/... and -setURLSchemeHandler:
+        // raises for them; skip rather than crash on a bad registration.
+        if ([WKWebView handlesURLScheme:name]) {
+          std::cerr << "laufey: scheme \"" << scheme
+                    << "\" is handled natively by WebKit; not installing the "
+                       "in-process handler for it"
+                    << std::endl;
+          continue;
+        }
+        [config setURLSchemeHandler:schemeHandler forURLScheme:name];
+      }
+      any_window_created_.store(true);
 
       std::string initScript =
           BuildInitScript(RuntimeLoader::GetInstance()->GetJsNamespace(),
@@ -1016,10 +1593,22 @@ void WKWebViewBackend::CreateWindowEx(uint32_t window_id, int width, int height,
           forMainFrameOnly:YES];
       [config.userContentController addUserScript:script];
 
-      WKWebView* webview = [[WKWebView alloc] initWithFrame:frame
-                                              configuration:config];
+      // DevTools (API 40): on unless the app launched with
+      // LAUFEY_INSPECTABLE=0 / "inspectable": false. `inspectable` (macOS
+      // 13.3+, set below) governs Safari's Web Inspector and the context
+      // menu's Inspect Element; developerExtrasEnabled (read when the web
+      // view is created) is the switch before 13.3.
+      const bool inspectable = laufey_common::LaunchInspectable();
+      @try {
+        [config.preferences setValue:@(inspectable)
+                              forKey:@"developerExtrasEnabled"];
+      } @catch (NSException*) {
+      }
+      LaufeyWebView* webview = [[LaufeyWebView alloc] initWithFrame:frame
+                                                      configuration:config];
+      webview.laufeyWindowId = window_id;
       if ([webview respondsToSelector:@selector(setInspectable:)]) {
-        [webview setInspectable:YES];
+        [webview setInspectable:inspectable];
       }
       LaufeyUIDelegate* uiDelegate = [[LaufeyUIDelegate alloc] init];
       webview.UIDelegate = uiDelegate;
@@ -1048,6 +1637,8 @@ void WKWebViewBackend::CreateWindowEx(uint32_t window_id, int width, int height,
       [window makeFirstResponder:webview];
 
       RegisterNSWindow(window, window_id);
+      // Window-state events and the normal-bounds tracker (API 38).
+      laufey_common::MacWatchWindowState((__bridge void*)window, window_id);
 
       // Per-window notification observers
       id focus_obs = [[NSNotificationCenter defaultCenter]
@@ -1141,7 +1732,7 @@ void WKWebViewBackend::CreateWindowEx(uint32_t window_id, int width, int height,
         // Show without activating the app / stealing focus.
         [window orderFrontRegardless];
       } else {
-        [window makeKeyAndOrderFront:nil];
+        laufey_common::MacRevealWindowAtLaunch((__bridge void*)window);
       }
     }
   });
@@ -1161,6 +1752,9 @@ void WKWebViewBackend::CloseWindow(uint32_t window_id) {
       }
       if (!win)
         return;
+      // See OnWindowClosedByUser.
+      laufey_common::PasskeyWindowClosing((__bridge const void*)win);
+      laufey_common::AuthSessionWindowClosing((__bridge const void*)win);
       [win close];
     }
   });
@@ -1177,6 +1771,26 @@ void WKWebViewBackend::OpenExternalURL(const std::string& url) {
       }
     }
   });
+}
+
+void WKWebViewBackend::RegisterSchemeHandler(const std::string& scheme) {
+  // Any thread (the runtime registers from its own thread). The registry is
+  // read when each WKWebViewConfiguration is built, so a scheme registered
+  // after a window exists only reaches windows created later — the documented
+  // contract is to register before the first window.
+  if (!laufey_common::IsValidSchemeName(scheme)) {
+    std::cerr << "laufey: ignoring invalid URL scheme name \"" << scheme
+              << "\" passed to register_scheme_handler" << std::endl;
+    return;
+  }
+  bool added = laufey_common::SchemeRegistry::GetInstance()->Add(scheme);
+  if (added && any_window_created_.load()) {
+    std::cerr << "laufey: scheme \"" << scheme
+              << "\" was registered after a window was created; existing "
+                 "windows will not serve it (register schemes before the "
+                 "first window)"
+              << std::endl;
+  }
 }
 
 void WKWebViewBackend::Navigate(uint32_t window_id, const std::string& url) {
@@ -1361,7 +1975,76 @@ void WKWebViewBackend::PrintToPdf(uint32_t window_id,
   });
 }
 
+void WKWebViewBackend::PasskeyRequest(uint32_t window_id, uint32_t kind,
+                                      const char* options_json,
+                                      laufey_passkey_result_fn callback,
+                                      void* user_data) {
+  // Any thread. Refusals (no API, invalid options, busy) answer here,
+  // synchronously; a started ceremony moves to the main thread.
+  if (laufey_common::PasskeyCapabilitiesMac() == 0) {
+    laufey_common::PasskeyReportNotSupported(callback, user_data);
+    return;
+  }
+  std::shared_ptr<laufey_common::PasskeyCeremony> ceremony =
+      laufey_common::PasskeyBegin(kind, options_json, callback, user_data);
+  if (!ceremony)
+    return;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      NSWindow* win = nil;
+      bool found = window_id == 0;
+      if (window_id != 0) {
+        std::lock_guard<std::mutex> lock(windows_mutex_);
+        if (auto* state = GetWindow(window_id)) {
+          win = state->window;
+          found = win != nil;
+        }
+      }
+      if (!found) {
+        ceremony->Finish(laufey_common::PasskeyErrorEnvelope(
+            laufey_common::kPasskeyUnknown,
+            "window " + std::to_string(window_id) + " not found"));
+        return;
+      }
+      // nil: the key / main window (see PasskeyStartMac).
+      laufey_common::PasskeyStartMac(ceremony, (__bridge void*)win);
+    }
+  });
+}
+
+void WKWebViewBackend::AuthSessionStart(uint32_t window_id, const char* url,
+                                        const char* callback, uint32_t flags,
+                                        laufey_auth_session_result_fn on_result,
+                                        void* user_data) {
+  // Any thread. Refusals (invalid arguments, busy) answer here,
+  // synchronously; a started session moves to the main thread.
+  std::shared_ptr<laufey_common::AuthSession> session =
+      laufey_common::AuthSessionBegin(laufey_common::AuthSessionCapabilities(),
+                                      url, callback, flags, on_result,
+                                      user_data);
+  if (!session)
+    return;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      NSWindow* win = nil;
+      if (window_id != 0) {
+        std::lock_guard<std::mutex> lock(windows_mutex_);
+        if (auto* state = GetWindow(window_id))
+          win = state->window;
+      }
+      if (window_id != 0 && !win) {
+        session->Finish(LAUFEY_AUTH_SESSION_INVALID,
+                        "window " + std::to_string(window_id) + " not found");
+        return;
+      }
+      // nil: the key / main window (see AuthSessionStartMac).
+      laufey_common::AuthSessionStartMac(session, (__bridge void*)win);
+    }
+  });
+}
+
 void WKWebViewBackend::Quit() {
+  laufey_common::MarkQuitting();
   dispatch_async(dispatch_get_main_queue(), ^{
     [NSApp stop:nil];
     NSEvent* event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
@@ -1399,16 +2082,31 @@ void WKWebViewBackend::SetWindowSize(uint32_t window_id, int width,
         // setting the *frame* size here made setSize(w, h) produce a window
         // whose page area was smaller than an identically-sized CreateWindow
         // by the title-bar height (denoland/deno#36119).
-        [state->window setContentSize:NSMakeSize(width, height)];
+        int w = width, h = height;
+        // -setContentSize: ignores contentMinSize / contentMaxSize.
+        laufey_common::ClampSizeForWindow(window_id, &w, &h);
+        [state->window setContentSize:NSMakeSize(w, h)];
       }
     }
   });
 }
 
+double WKWebViewBackend::GetWindowScaleFactor(uint32_t window_id) {
+  __block double result = 1.0;
+  laufey_common::RunOnMainSync(^{
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (state) {
+      result = (double)[state->window backingScaleFactor];
+    }
+  });
+  return result;
+}
+
 void WKWebViewBackend::GetWindowSize(uint32_t window_id, int* width,
                                      int* height) {
   __block int w = 0, h = 0;
-  dispatch_sync(dispatch_get_main_queue(), ^{
+  laufey_common::RunOnMainSync(^{
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
@@ -1418,6 +2116,24 @@ void WKWebViewBackend::GetWindowSize(uint32_t window_id, int* width,
           [state->window contentRectForFrameRect:[state->window frame]];
       w = static_cast<int>(content.size.width);
       h = static_cast<int>(content.size.height);
+    }
+  });
+  if (width)
+    *width = w;
+  if (height)
+    *height = h;
+}
+
+void WKWebViewBackend::GetWindowOuterSize(uint32_t window_id, int* width,
+                                          int* height) {
+  __block int w = 0, h = 0;
+  laufey_common::RunOnMainSync(^{
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (state) {
+      NSRect frame = [state->window frame];
+      w = static_cast<int>(frame.size.width);
+      h = static_cast<int>(frame.size.height);
     }
   });
   if (width)
@@ -1440,9 +2156,29 @@ void WKWebViewBackend::SetWindowPosition(uint32_t window_id, int x, int y) {
   });
 }
 
+void WKWebViewBackend::GetWindowInnerPosition(uint32_t window_id, int* x,
+                                              int* y) {
+  __block int px = 0, py = 0;
+  laufey_common::RunOnMainSync(^{
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (state) {
+      NSRect content =
+          [state->window contentRectForFrameRect:[state->window frame]];
+      px = static_cast<int>(content.origin.x);
+      py = static_cast<int>(PrimaryScreenHeight() - content.origin.y -
+                            content.size.height);
+    }
+  });
+  if (x)
+    *x = px;
+  if (y)
+    *y = py;
+}
+
 void WKWebViewBackend::GetWindowPosition(uint32_t window_id, int* x, int* y) {
   __block int px = 0, py = 0;
-  dispatch_sync(dispatch_get_main_queue(), ^{
+  laufey_common::RunOnMainSync(^{
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
@@ -1478,7 +2214,7 @@ void WKWebViewBackend::SetResizable(uint32_t window_id, bool resizable) {
 
 bool WKWebViewBackend::IsResizable(uint32_t window_id) {
   __block bool result = false;
-  dispatch_sync(dispatch_get_main_queue(), ^{
+  laufey_common::RunOnMainSync(^{
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
@@ -1503,7 +2239,7 @@ void WKWebViewBackend::SetAlwaysOnTop(uint32_t window_id, bool always_on_top) {
 
 bool WKWebViewBackend::IsAlwaysOnTop(uint32_t window_id) {
   __block bool result = false;
-  dispatch_sync(dispatch_get_main_queue(), ^{
+  laufey_common::RunOnMainSync(^{
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
@@ -1531,7 +2267,7 @@ void WKWebViewBackend::SetWindowOpacity(uint32_t window_id, double opacity) {
 
 double WKWebViewBackend::GetWindowOpacity(uint32_t window_id) {
   __block double result = 1.0;
-  dispatch_sync(dispatch_get_main_queue(), ^{
+  laufey_common::RunOnMainSync(^{
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
@@ -1555,7 +2291,7 @@ void WKWebViewBackend::SetClickPassthrough(uint32_t window_id, bool enabled) {
 
 bool WKWebViewBackend::IsClickPassthrough(uint32_t window_id) {
   __block bool result = false;
-  dispatch_sync(dispatch_get_main_queue(), ^{
+  laufey_common::RunOnMainSync(^{
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
@@ -1583,7 +2319,7 @@ void WKWebViewBackend::SetClickPassthroughForward(uint32_t window_id,
 
 bool WKWebViewBackend::IsClickPassthroughForward(uint32_t window_id) {
   __block bool result = false;
-  dispatch_sync(dispatch_get_main_queue(), ^{
+  laufey_common::RunOnMainSync(^{
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
@@ -1692,8 +2428,8 @@ void WKWebViewBackend::UpdateForwardMonitors() {
                                       uint32_t modifiers =
                                           NSModifierFlagsToLaufey(
                                               [event modifierFlags]);
-                                      int32_t click_count =
-                                          (int32_t)[event clickCount];
+                                      int32_t click_count = ResolveClickCount(
+                                          state, (int32_t)[event clickCount]);
 
                                       NSPoint local = [win
                                           convertPointFromScreen:screen_point];
@@ -1784,7 +2520,7 @@ void WKWebViewBackend::UpdateForwardMonitors() {
 
 bool WKWebViewBackend::IsVisible(uint32_t window_id) {
   __block bool result = false;
-  dispatch_sync(dispatch_get_main_queue(), ^{
+  laufey_common::RunOnMainSync(^{
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
@@ -1809,7 +2545,15 @@ void WKWebViewBackend::Show(uint32_t window_id) {
       }
       if (!win)
         return;
-      [win makeKeyAndOrderFront:nil];
+      if ([win styleMask] & NSWindowStyleMaskNonactivatingPanel) {
+        // A tray / menu-bar panel never activates the app.
+        [win makeKeyAndOrderFront:nil];
+      } else {
+        // The reveal of a window created hidden (Deno Desktop shows its
+        // first window once the page has loaded): at launch it must come
+        // in front of the app the user started it from.
+        laufey_common::MacRevealWindowAtLaunch((__bridge void*)win);
+      }
       if (web)
         [win makeFirstResponder:web];
     }
@@ -1857,10 +2601,11 @@ void WKWebViewBackend::Focus(uint32_t window_id) {
   });
 }
 
-void WKWebViewBackend::PostUiTask(void (*task)(void*), void* data) {
+bool WKWebViewBackend::PostUiTask(void (*task)(void*), void* data) {
   dispatch_async(dispatch_get_main_queue(), ^{
     task(data);
   });
+  return true;
 }
 
 void WKWebViewBackend::InvokeJsCallback(uint32_t window_id,
@@ -1949,25 +2694,26 @@ void WKWebViewBackend::SetApplicationMenu(uint32_t window_id,
                                           const laufey_backend_api_t* api,
                                           laufey_menu_click_fn on_click,
                                           void* on_click_data) {
+  // Parsed here: the template is the caller's only for this call.
+  auto entries = std::make_shared<std::vector<laufey_common::MenuEntry>>(
+      laufey_common::ParseMenuTemplate(menu_template, api, true));
   dispatch_async(dispatch_get_main_queue(), ^{
-    NSMenu* menubar = laufey_common::BuildNSMenuFromValue(
-        menu_template, api, on_click, on_click_data, window_id);
-    if (menubar) {
-      EnsureEditMenu(menubar);
-      // Store the menu for this window
-      {
-        std::lock_guard<std::mutex> lock(windows_mutex_);
-        auto* state = GetWindow(window_id);
-        if (state) {
-          state->menu = menubar;
-        }
-      }
-      // If this window is currently the key window, apply immediately
-      NSWindow* keyWin = [NSApp keyWindow];
-      uint32_t keyWid = LaufeyIdForNSWindow(keyWin);
-      if (keyWid == window_id) {
-        [NSApp setMainMenu:menubar];
-      }
+    NSMenu* menubar = laufey_common::BuildNSMenuFromEntries(
+        *entries, on_click, on_click_data, window_id);
+    EnsureEditMenu(menubar);
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      if (!state)
+        return;
+      state->menu = menubar;
+    }
+    laufey_common::RegisterWindowMenuMac(window_id, menubar);
+    // If this window is currently the key window, apply immediately
+    NSWindow* keyWin = [NSApp keyWindow];
+    uint32_t keyWid = LaufeyIdForNSWindow(keyWin);
+    if (keyWid == window_id) {
+      [NSApp setMainMenu:menubar];
     }
   });
 }
@@ -1977,12 +2723,24 @@ void WKWebViewBackend::ShowContextMenu(uint32_t window_id, int x, int y,
                                        const laufey_backend_api_t* api,
                                        laufey_menu_click_fn on_click,
                                        void* on_click_data) {
-  dispatch_async(dispatch_get_main_queue(), ^{
-    NSMenu* menu = laufey_common::BuildNSMenuFromValue(
-        menu_template, api, on_click, on_click_data, window_id);
-    if (!menu)
-      return;
+  ShowContextMenuEx(window_id, x, y, menu_template, api, on_click,
+                    on_click_data, nullptr, nullptr);
+}
 
+void WKWebViewBackend::ShowContextMenuEx(uint32_t window_id, int x, int y,
+                                         laufey_value_t* menu_template,
+                                         const laufey_backend_api_t* api,
+                                         laufey_menu_click_fn on_click,
+                                         void* on_click_data,
+                                         laufey_menu_closed_fn on_closed,
+                                         void* on_closed_data) {
+  auto entries = std::make_shared<std::vector<laufey_common::MenuEntry>>(
+      laufey_common::ParseMenuTemplate(menu_template, api, true));
+  // Not a main-queue block: the menu's tracking loop must leave the main
+  // queue free for the UI-thread calls made while it is open.
+  laufey_common::RunFromMainRunLoopMac([this, window_id, x, y, entries,
+                                        on_click, on_click_data, on_closed,
+                                        on_closed_data] {
     NSWindow* win = nil;
     {
       std::lock_guard<std::mutex> lock(windows_mutex_);
@@ -1990,39 +2748,105 @@ void WKWebViewBackend::ShowContextMenu(uint32_t window_id, int x, int y,
       if (state)
         win = state->window;
     }
-    if (!win)
-      return;
-
-    NSView* view = [win contentView];
-    // LAUFEY coordinates are window-relative with a top-left origin (the web
-    // convention). -popUpMenuPositioningItem:atLocation:inView: reads the
-    // location in the view's *own* coordinate system, which is top-left only
-    // when the view is flipped. The content view here is the WKWebView, and
-    // -[WKWebView isFlipped] is YES, so flipping unconditionally put the menu
-    // at (height - y) — mirrored about the window's midline. Only convert for
-    // views that really are bottom-left.
-    NSPoint loc =
-        NSMakePoint(x, [view isFlipped] ? y : [view frame].size.height - y);
-    [menu popUpMenuPositioningItem:nil atLocation:loc inView:view];
+    // The content view is the WKWebView (flipped: top-left, as the page).
+    laufey_common::ShowContextMenuMac(
+        win ? (__bridge void*)[win contentView] : nullptr, x, y, *entries,
+        on_click, on_click_data, on_closed, on_closed_data, window_id);
   });
 }
 
+// Runs `block` on the main thread and waits (inline when already there; see
+// laufey_ui_tasks.h).
+using laufey_common::RunOnMainSync;
+
+// The web view's _WKInspector (private; what Safari's Develop menu drives),
+// or nil.
+static id InspectorOf(WKWebView* webview) {
+  @try {
+    return [webview valueForKey:@"_inspector"];
+  } @catch (NSException*) {
+    return nil;
+  }
+}
+
+// The window's web view, read under the lock. Callers act on it after the
+// lock is released: opening or closing the inspector changes the key window,
+// and the key-window observers take the same lock.
+WKWebView* WKWebViewBackend::WebViewOf(uint32_t window_id) {
+  std::lock_guard<std::mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  return state ? state->webview : nil;
+}
+
 void WKWebViewBackend::OpenDevTools(uint32_t window_id) {
+  if (!laufey_common::LaunchInspectable())
+    return;
   dispatch_async(dispatch_get_main_queue(), ^{
-    std::lock_guard<std::mutex> lock(windows_mutex_);
-    auto* state = GetWindow(window_id);
-    if (state && state->webview) {
-      // WKWebView._inspector.show is available on macOS 13.3+
-      @try {
-        id inspector = [state->webview valueForKey:@"_inspector"];
-        if (inspector) {
-          [inspector performSelector:@selector(show)];
-        }
-      } @catch (NSException*) {
-        // Fallback: not available on this macOS version
+    WKWebView* webview = WebViewOf(window_id);
+    if (!webview)
+      return;
+    // WKWebView._inspector.show is available on macOS 13.3+
+    @try {
+      id inspector = [webview valueForKey:@"_inspector"];
+      if (inspector) {
+        [inspector performSelector:@selector(show)];
       }
+    } @catch (NSException*) {
+      // Fallback: not available on this macOS version
     }
   });
+}
+
+void WKWebViewBackend::CloseDevTools(uint32_t window_id) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    WKWebView* webview = WebViewOf(window_id);
+    if (!webview)
+      return;
+    id inspector = InspectorOf(webview);
+    if (inspector && [inspector respondsToSelector:@selector(close)])
+      [inspector performSelector:@selector(close)];
+  });
+}
+
+bool WKWebViewBackend::IsDevToolsOpen(uint32_t window_id) {
+  __block bool open = false;
+  RunOnMainSync(^{
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state || !state->webview)
+      return;
+    id inspector = InspectorOf(state->webview);
+    SEL visible = NSSelectorFromString(@"isVisible");
+    if (inspector && [inspector respondsToSelector:visible]) {
+      open =
+          reinterpret_cast<BOOL (*)(id, SEL)>(objc_msgSend)(inspector, visible);
+    }
+  });
+  return open;
+}
+
+bool WKWebViewBackend::IsDevToolsEnabled(uint32_t window_id) {
+  if (window_id == 0)
+    return laufey_common::LaunchInspectable();
+  __block bool enabled = false;
+  RunOnMainSync(^{
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state || !state->webview)
+      return;
+    // Read back what the engine was given.
+    if ([state->webview respondsToSelector:@selector(isInspectable)]) {
+      enabled = reinterpret_cast<BOOL (*)(id, SEL)>(objc_msgSend)(
+          state->webview, @selector(isInspectable));
+      return;
+    }
+    @try {
+      enabled = [[state->webview.configuration.preferences
+          valueForKey:@"developerExtrasEnabled"] boolValue];
+    } @catch (NSException*) {
+    }
+  });
+  return enabled;
 }
 
 int WKWebViewBackend::ShowDialog(uint32_t /*window_id*/, int dialog_type,
@@ -2074,9 +2898,292 @@ void WKWebViewBackend::SetDockReopenHandler(laufey_dock_reopen_fn handler,
   laufey_common::SetDockReopenHandlerMac(handler, user_data);
 }
 
+// --- Deep links / custom URL schemes (macOS) ---
+//
+// Storage and the cold-start buffer live in backend-common; AppDelegate's
+// application:openURLs: (main_mac.mm) is what feeds them.
+
+void WKWebViewBackend::SetOpenUrlHandler(laufey_open_url_fn handler,
+                                         void* user_data) {
+  laufey_common::SetOpenUrlHandlerMac(handler, user_data);
+}
+
+bool WKWebViewBackend::TestTriggerOpenUrl(const char* url) {
+  return laufey_common::TestTriggerOpenUrlMac(url);
+}
+
 // --- Tray / status-bar icon (macOS) ---
 //
 // Thin trampolines over backend-common/src/tray_mac.mm.
+
+// --- Window state, constraints, screens and chrome (API >= 38) ---
+//
+// The NSWindow work is laufey_common's (window_mac.mm, shared with CEF);
+// these resolve the window on the main thread and hand it over.
+
+// RunOnMainSync (above, with the DevTools code) runs the block on the main
+// thread and waits.
+
+// ---------------------------------------------------------------------------
+// Drag and drop, file dialogs (API >= 39)
+// ---------------------------------------------------------------------------
+
+bool WKWebViewBackend::TestTriggerFileDrop(uint32_t window_id, int phase,
+                                           double x, double y,
+                                           const char* const* paths,
+                                           size_t count) {
+  // The OS path dispatches on the main thread; so does the hook.
+  __block bool delivered = false;
+  void (^body)(void) = ^{
+    delivered = laufey_common::TestTriggerFileDrop(window_id, phase, x, y,
+                                                   paths, count);
+  };
+  laufey_common::RunOnMainSync(body);
+  return delivered;
+}
+
+void WKWebViewBackend::StartFileDrag(uint32_t window_id,
+                                     const char* const* paths, size_t count,
+                                     const uint8_t* icon_png, size_t icon_len,
+                                     laufey_drag_result_fn callback,
+                                     void* user_data) {
+  auto* req = new laufey_common::DragOutRequest();
+  req->callback = callback;
+  req->user_data = user_data;
+  WKWebView* webview = nil;
+  {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    if (auto* state = GetWindow(window_id))
+      webview = state->webview;
+  }
+  if (!webview ||
+      !laufey_common::ValidateDragPaths(paths, count, &req->paths)) {
+    req->Finish(LAUFEY_DRAG_RESULT_FAILED);
+    delete req;
+    return;
+  }
+  if (icon_png && icon_len > 0)
+    req->icon_png.assign(icon_png, icon_png + icon_len);
+  laufey_common::StartFileDragMac((__bridge void*)webview, req);
+}
+
+uint32_t WKWebViewBackend::ShowFileDialog(
+    uint32_t window_id, const laufey_file_dialog_options_t* options,
+    laufey_file_dialog_result_fn callback, void* user_data) {
+  laufey_common::ParentResolver parent;
+  if (window_id != 0) {
+    parent = [this, window_id]() -> void* {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      return state ? (__bridge void*)state->window : nullptr;
+    };
+  }
+  return laufey_common::ShowFileDialogMac(std::move(parent), options, callback,
+                                          user_data);
+}
+
+uint32_t WKWebViewBackend::WindowCapabilities() {
+  return LAUFEY_WINDOW_CAP_STATE | LAUFEY_WINDOW_CAP_STATE_EVENTS |
+         LAUFEY_WINDOW_CAP_SIZE_CONSTRAINTS | LAUFEY_WINDOW_CAP_SCREENS |
+         LAUFEY_WINDOW_CAP_DISPLAY_EVENTS | LAUFEY_WINDOW_CAP_TITLEBAR_HIDDEN |
+         LAUFEY_WINDOW_CAP_TITLEBAR_HIDDEN_INSET |
+         LAUFEY_WINDOW_CAP_TRAFFIC_LIGHT_POSITION | LAUFEY_WINDOW_CAP_VIBRANCY |
+         LAUFEY_WINDOW_CAP_NORMAL_BOUNDS | LAUFEY_WINDOW_CAP_KEEP_ALIVE |
+         LAUFEY_WINDOW_CAP_SET_POSITION | LAUFEY_WINDOW_CAP_FILE_DROP |
+         LAUFEY_WINDOW_CAP_FILE_DROP_ENTER_PATHS |
+         LAUFEY_WINDOW_CAP_FILE_DRAG_OUT | LAUFEY_WINDOW_CAP_FILE_DIALOGS |
+         LAUFEY_WINDOW_CAP_FILE_DIALOG_FILES_AND_DIRECTORIES |
+         LAUFEY_WINDOW_CAP_FILE_DIALOG_MODAL;
+}
+
+void WKWebViewBackend::SetWindowState(uint32_t window_id, int action) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      NSWindow* window = nil;
+      {
+        std::lock_guard<std::mutex> lock(windows_mutex_);
+        if (auto* state = GetWindow(window_id))
+          window = state->window;
+      }
+      // Outside the lock: zoom / miniaturize post notifications whose
+      // observers take it.
+      if (window)
+        laufey_common::MacSetWindowState((__bridge void*)window, action);
+    }
+  });
+}
+
+uint32_t WKWebViewBackend::GetWindowState(uint32_t window_id) {
+  __block uint32_t result = 0;
+  RunOnMainSync(^{
+    NSWindow* window = nil;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      if (auto* state = GetWindow(window_id))
+        window = state->window;
+    }
+    if (window)
+      result = laufey_common::MacGetWindowState((__bridge void*)window);
+  });
+  return result;
+}
+
+void WKWebViewBackend::SetWindowStateHandler(laufey_window_state_fn handler,
+                                             void* user_data) {
+  laufey_common::SetWindowStateHandler(handler, user_data);
+}
+
+void WKWebViewBackend::SetWindowSizeConstraints(uint32_t window_id,
+                                                int min_width, int min_height,
+                                                int max_width, int max_height) {
+  laufey_common::SizeConstraints c = laufey_common::SetSizeConstraints(
+      window_id, min_width, min_height, max_width, max_height);
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      NSWindow* window = nil;
+      {
+        std::lock_guard<std::mutex> lock(windows_mutex_);
+        if (auto* state = GetWindow(window_id))
+          window = state->window;
+      }
+      if (window)
+        laufey_common::MacApplySizeConstraints((__bridge void*)window, c);
+    }
+  });
+}
+
+void WKWebViewBackend::GetWindowSizeConstraints(uint32_t window_id,
+                                                int* min_width, int* min_height,
+                                                int* max_width,
+                                                int* max_height) {
+  laufey_common::SizeConstraints c =
+      laufey_common::GetSizeConstraints(window_id);
+  if (min_width)
+    *min_width = c.min_width;
+  if (min_height)
+    *min_height = c.min_height;
+  if (max_width)
+    *max_width = c.max_width;
+  if (max_height)
+    *max_height = c.max_height;
+}
+
+size_t WKWebViewBackend::GetScreens(laufey_screen_t* out, size_t capacity) {
+  return laufey_common::CopyScreens(laufey_common::MacGetScreens(), out,
+                                    capacity);
+}
+
+int64_t WKWebViewBackend::GetWindowScreen(uint32_t window_id) {
+  __block int64_t result = 0;
+  RunOnMainSync(^{
+    NSWindow* window = nil;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      if (auto* state = GetWindow(window_id))
+        window = state->window;
+    }
+    if (window)
+      result = laufey_common::MacScreenForWindow((__bridge void*)window);
+  });
+  return result;
+}
+
+void WKWebViewBackend::SetDisplayChangedHandler(
+    laufey_display_changed_fn handler, void* user_data) {
+  laufey_common::SetDisplayChangedHandler(handler, user_data);
+  if (handler)
+    laufey_common::MacInstallDisplayWatcher();
+}
+
+bool WKWebViewBackend::SetWindowTitlebarStyle(uint32_t window_id, int style) {
+  __block bool result = false;
+  RunOnMainSync(^{
+    NSWindow* window = nil;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      if (auto* state = GetWindow(window_id))
+        window = state->window;
+    }
+    if (window)
+      result =
+          laufey_common::MacSetTitlebarStyle((__bridge void*)window, style);
+  });
+  return result;
+}
+
+bool WKWebViewBackend::SetWindowTrafficLightPosition(uint32_t window_id, int x,
+                                                     int y) {
+  __block bool result = false;
+  RunOnMainSync(^{
+    NSWindow* window = nil;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      if (auto* state = GetWindow(window_id))
+        window = state->window;
+    }
+    if (window)
+      result = laufey_common::MacSetTrafficLightPosition((__bridge void*)window,
+                                                         x, y);
+  });
+  return result;
+}
+
+bool WKWebViewBackend::SetWindowBackdrop(uint32_t window_id, int backdrop,
+                                         int material) {
+  __block bool result = false;
+  RunOnMainSync(^{
+    NSWindow* window = nil;
+    WKWebView* webview = nil;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      if (auto* state = GetWindow(window_id)) {
+        window = state->window;
+        webview = state->webview;
+      }
+    }
+    if (window && webview)
+      result = laufey_common::MacSetVibrancy(
+          (__bridge void*)window, (__bridge void*)webview, backdrop, material);
+  });
+  return result;
+}
+
+bool WKWebViewBackend::GetWindowNormalBounds(uint32_t window_id, int* x, int* y,
+                                             int* width, int* height) {
+  __block bool found = false;
+  __block laufey_common::Bounds bounds;
+  RunOnMainSync(^{
+    NSWindow* window = nil;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      if (auto* state = GetWindow(window_id))
+        window = state->window;
+    }
+    if (!window)
+      return;
+    found = true;
+    if (laufey_common::MacGetWindowState((__bridge void*)window) == 0) {
+      bounds = laufey_common::MacWindowBounds((__bridge void*)window);
+    } else if (!laufey_common::GetCommittedNormalBounds(window_id, &bounds)) {
+      bounds = laufey_common::MacWindowBounds((__bridge void*)window);
+    }
+  });
+  if (!found)
+    return false;
+  if (x)
+    *x = bounds.x;
+  if (y)
+    *y = bounds.y;
+  if (width)
+    *width = bounds.width;
+  if (height)
+    *height = bounds.height;
+  return true;
+}
+
+void WKWebViewBackend::SetQuitOnLastWindowClosed(bool quit) {
+  laufey_common::SetQuitOnLastWindowClosed(quit);
+}
 
 uint32_t WKWebViewBackend::CreateTrayIcon() {
   return laufey_common::CreateTrayIconMac();
@@ -2137,35 +3244,25 @@ uint32_t WKWebViewBackend::ShowNotification(
     laufey_notification_event_fn on_event, void* user_data) {
   laufey_common::NotificationOptions opts =
       laufey_common::ParseNotificationOptions(options, api);
-  return laufey_common::ShowNotificationMac(opts, on_event, user_data);
+  return laufey_common::ShowNotification(opts, on_event, user_data);
 }
 
 void WKWebViewBackend::CloseNotification(uint32_t notification_id) {
-  laufey_common::CloseNotificationMac(notification_id);
+  laufey_common::CloseNotification(notification_id);
 }
 
-// --- Permissions (UNUserNotificationCenter) ---
-//
-// Mirrors cef/src/runtime_loader_mac.mm — the process posts notifications
-// via NSUserNotification today, but authorization is owned by
-// UNUserNotificationCenter (the modern API). Asking via UN here is
-// correct regardless of what posts the banner: macOS routes both APIs
-// through the same per-bundle authorization record. The webview backend
-// targets the *process*, not the WKWebView — runtime-initiated
-// notifications are app-scoped, not page-scoped.
-
-// Permissions: thin trampolines over backend-common/src/permissions_mac.mm.
-
+// Notification permissions: UNUserNotificationCenter, app-scoped (the
+// process, not the page).
 void WKWebViewBackend::QueryPermission(int kind,
                                        laufey_permission_callback_fn cb,
                                        void* user_data) {
-  laufey_common::QueryPermissionMac(kind, cb, user_data);
+  laufey_common::QueryNotificationPermission(kind, cb, user_data);
 }
 
 void WKWebViewBackend::RequestPermission(int kind,
                                          laufey_permission_callback_fn cb,
                                          void* user_data) {
-  laufey_common::RequestPermissionMac(kind, cb, user_data);
+  laufey_common::RequestNotificationPermission(kind, cb, user_data);
 }
 
 LaufeyBackend* CreateLaufeyBackend() {

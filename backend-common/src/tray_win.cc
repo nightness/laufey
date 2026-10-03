@@ -1,8 +1,13 @@
 // Copyright 2025 Divy Srivastava. All rights reserved. MIT license.
 //
-// Shell_NotifyIcon-backed tray / status-bar icon. Hidden message-only
-// window receives WM_LAUFEY_TRAYICON callbacks and dispatches click /
-// double-click / right-click-menu events. WIC handles PNG → HICON
+// Shell_NotifyIcon-backed tray / status-bar icon. A hidden top-level window
+// receives WM_LAUFEY_TRAYICON callbacks and dispatches click /
+// double-click / right-click-menu events. It is top-level rather than
+// message-only because it owns the tray menu: the menu's owner must be the
+// foreground window while the menu is open, or the menu doesn't close when
+// the user clicks elsewhere (KB135788), and a message-only window can't be
+// the foreground window (it also gets no broadcasts such as
+// WM_SETTINGCHANGE). WIC handles PNG → HICON
 // decode. Light vs dark icons are resolved against the
 // AppsUseLightTheme registry value and re-applied on
 // WM_SETTINGCHANGE (ImmersiveColorSet).
@@ -11,6 +16,7 @@
 // a UI thread (CEF's TID_UI) should marshal before calling.
 
 #include "laufey_backend_common.h"
+#include "laufey_menu.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -148,10 +154,19 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (!menu) return 0;
     POINT pt;
     GetCursorPos(&pt);
+    // KB135788: the owner is the foreground window while the menu is open
+    // (so a click elsewhere closes it), and a message posted to it once the
+    // menu has closed makes the next menu open (and close) properly.
     SetForegroundWindow(hwnd);
-    UINT cmd = TrackPopupMenu(menu,
-                              TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                              pt.x, pt.y, 0, hwnd, nullptr);
+    UINT cmd = 0;
+    {
+      // TrackPopupMenu runs its own modal loop on this (the UI) thread
+      // until the menu closes; let the backend's tasks run inside it.
+      ScopedNativeModalLoop modal_loop;
+      cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                           pt.x, pt.y, 0, hwnd, nullptr);
+    }
+    PostMessageW(hwnd, WM_NULL, 0, 0);
     if (!cmd) return 0;
     laufey_menu_click_fn fn = nullptr;
     void* data = nullptr;
@@ -179,9 +194,11 @@ HWND EnsureTrayMessageWindow() {
   wc.hInstance = GetModuleHandleW(nullptr);
   wc.lpszClassName = L"LaufeyCommonTrayWindow";
   RegisterClassExW(&wc);
+  // Never shown: WS_POPUP with no size; WS_EX_TOOLWINDOW keeps it off the
+  // taskbar and out of Alt+Tab.
   g_tray_msg_hwnd =
-      CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
-                      nullptr, wc.hInstance, nullptr);
+      CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"", WS_POPUP, 0, 0,
+                      0, 0, nullptr, nullptr, wc.hInstance, nullptr);
   return g_tray_msg_hwnd;
 }
 
@@ -252,17 +269,30 @@ HICON DecodePngToHicon(const void* bytes, size_t len, int desired) {
   return hicon;
 }
 
+// value_list_get / value_dict_get hand out values the caller owns (laufey.h).
+struct OwnedValue {
+  const laufey_backend_api_t* api;
+  laufey_value_t* v;
+  ~OwnedValue() {
+    if (v) api->value_free(v);
+  }
+  OwnedValue(const OwnedValue&) = delete;
+  OwnedValue& operator=(const OwnedValue&) = delete;
+};
+
 HMENU BuildWinMenuFromValue(laufey_value_t* val, const laufey_backend_api_t* api,
                              std::map<UINT, std::string>& cmd_to_id) {
   if (!val || !api->value_is_list(val)) return nullptr;
   HMENU menu = CreatePopupMenu();
   size_t count = api->value_list_size(val);
   for (size_t i = 0; i < count; ++i) {
-    laufey_value_t* itemVal = api->value_list_get(val, i);
+    OwnedValue item{api, api->value_list_get(val, i)};
+    laufey_value_t* itemVal = item.v;
     if (!itemVal || !api->value_is_dict(itemVal)) continue;
 
     // Separator
-    laufey_value_t* typeVal = api->value_dict_get(itemVal, "type");
+    OwnedValue type{api, api->value_dict_get(itemVal, "type")};
+    laufey_value_t* typeVal = type.v;
     if (typeVal && api->value_is_string(typeVal)) {
       size_t len = 0;
       char* typeStr = api->value_get_string(typeVal, &len);
@@ -274,7 +304,8 @@ HMENU BuildWinMenuFromValue(laufey_value_t* val, const laufey_backend_api_t* api
       if (typeStr) api->value_free_string(typeStr);
     }
 
-    laufey_value_t* labelVal = api->value_dict_get(itemVal, "label");
+    OwnedValue label{api, api->value_dict_get(itemVal, "label")};
+    laufey_value_t* labelVal = label.v;
     std::wstring wlabel;
     if (labelVal && api->value_is_string(labelVal)) {
       size_t len = 0;
@@ -287,14 +318,16 @@ HMENU BuildWinMenuFromValue(laufey_value_t* val, const laufey_backend_api_t* api
       }
     }
 
-    laufey_value_t* submenuVal = api->value_dict_get(itemVal, "submenu");
+    OwnedValue submenu{api, api->value_dict_get(itemVal, "submenu")};
+    laufey_value_t* submenuVal = submenu.v;
     if (submenuVal && api->value_is_list(submenuVal)) {
       HMENU sub = BuildWinMenuFromValue(submenuVal, api, cmd_to_id);
       AppendMenuW(menu, MF_POPUP | MF_STRING, (UINT_PTR)sub, wlabel.c_str());
       continue;
     }
 
-    laufey_value_t* idVal = api->value_dict_get(itemVal, "id");
+    OwnedValue id{api, api->value_dict_get(itemVal, "id")};
+    laufey_value_t* idVal = id.v;
     std::string item_id;
     if (idVal && api->value_is_string(idVal)) {
       size_t len = 0;
@@ -307,7 +340,8 @@ HMENU BuildWinMenuFromValue(laufey_value_t* val, const laufey_backend_api_t* api
 
     UINT cmd = g_next_cmd_id.fetch_add(1, std::memory_order_relaxed);
     UINT flags = MF_STRING;
-    laufey_value_t* enabledVal = api->value_dict_get(itemVal, "enabled");
+    OwnedValue enabled{api, api->value_dict_get(itemVal, "enabled")};
+    laufey_value_t* enabledVal = enabled.v;
     if (enabledVal && api->value_is_bool(enabledVal) &&
         !api->value_get_bool(enabledVal)) {
       flags |= MF_GRAYED;

@@ -46,3 +46,28 @@ See [c-abi.md](c-abi.md), "Close-requested handler defers the close", for the
 full contract, including why app-level quit paths are deliberately out of scope,
 and `examples/confirm_before_quit` for a complete runnable version of the
 confirm-dialog pattern above.
+
+## Window state (API ≥ 38)
+
+`on_state_change` reports maximize, unmaximize, minimize, restore and entering
+or leaving fullscreen, with the state before and after the change:
+
+```rust
+let win = Window::new(800, 600)
+  .on_state_change(|ev| {
+    if ev.state.maximized && !ev.previous.maximized {
+      println!("maximized");
+    }
+    if !ev.state.minimized && ev.previous.minimized {
+      println!("restored");
+    }
+  })
+  .load("index.html");
+```
+
+It fires on the backend UI thread after the OS has applied the change, once per
+real change. See
+[window-management.md](window-management.md#maximize-minimize-and-fullscreen-api--38).
+
+`on_display_changed` (app-wide) reports display changes; see
+[window-management.md](window-management.md#screens-api--38).
