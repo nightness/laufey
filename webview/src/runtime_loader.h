@@ -6,6 +6,8 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <queue>
 #include <map>
@@ -291,6 +293,13 @@ class RuntimeLoader {
 
   std::thread runtime_thread_;
   std::atomic<bool> running_{false};
+  // Set as RuntimeThread returns, so Shutdown can wait for the thread with a
+  // bound (std::thread has no timed join).
+  std::mutex runtime_exit_mutex_;
+  std::condition_variable runtime_exit_cv_;
+  bool runtime_exited_ = false;
+  // How long Shutdown waits for the runtime thread before exiting without it.
+  static constexpr std::chrono::milliseconds kRuntimeShutdownTimeout{10000};
 
   LaufeyBackend* backend_ = nullptr;
   laufey_backend_api_t backend_api_;

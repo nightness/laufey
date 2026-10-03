@@ -980,6 +980,9 @@ void RuntimeLoader::RuntimeThread() {
     std::cerr << "Runtime start returned error: " << result << std::endl;
   }
   running_ = false;
+  std::lock_guard<std::mutex> lock(runtime_exit_mutex_);
+  runtime_exited_ = true;
+  runtime_exit_cv_.notify_all();
 }
 
 void RuntimeLoader::Shutdown() {
@@ -988,7 +991,24 @@ void RuntimeLoader::Shutdown() {
   }
 
   if (runtime_thread_.joinable()) {
-    runtime_thread_.join();
+    // The loop has ended, so the UI thread no longer runs tasks: a runtime
+    // thread blocked in a synchronous call to it (a getter that waits on the
+    // main queue, for example) would never return, and an unbounded join
+    // would hang the exit with it. Wait a bounded time, then exit without it.
+    bool exited;
+    {
+      std::unique_lock<std::mutex> lock(runtime_exit_mutex_);
+      exited = runtime_exit_cv_.wait_for(lock, kRuntimeShutdownTimeout,
+                                         [this] { return runtime_exited_; });
+    }
+    if (exited) {
+      runtime_thread_.join();
+    } else {
+      std::cerr << "laufey: the runtime thread did not finish within "
+                << kRuntimeShutdownTimeout.count()
+                << " ms of shutdown; exiting without it" << std::endl;
+      runtime_thread_.detach();
+    }
   }
 }
 
