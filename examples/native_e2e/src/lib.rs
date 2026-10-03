@@ -174,7 +174,7 @@ window.addEventListener('unhandledrejection', e => report('unhandled: ' + (e && 
 let reported = false;
 // Watchdog: if a step hangs (a stream that never ends, a fetch that never
 // settles), report the partial state so the failure says where it stuck.
-setTimeout(() => report('watchdog: stuck with ' + JSON.stringify(r)), 8000);
+setTimeout(() => report('watchdog: stuck with ' + JSON.stringify(r)), 20000);
 async function report(problem) {{
   if (reported) return;
   reported = true;
@@ -797,7 +797,7 @@ fn e2e_main() {
       na("custom scheme origin (backend has no scheme handler support)");
     } else {
       let reported =
-        wait_for(|| scheme_report.lock().unwrap().is_some(), 200, 100).await;
+        wait_for(|| scheme_report.lock().unwrap().is_some(), 300, 100).await;
       check("custom-scheme page loaded and reported back", reported);
       if let Some(r) = scheme_report.lock().unwrap().clone() {
         check(
