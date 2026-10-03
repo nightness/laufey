@@ -548,10 +548,18 @@ fn e2e_main() {
     if cfg!(target_os = "macos") && backend == "webview" {
       arm_exit_guard();
       laufey::quit();
-      check(
-        "quit() with a window open shuts the runtime down",
-        wait_for(laufey::should_shutdown, 300, 50).await,
-      );
+      let shut = wait_for(laufey::should_shutdown, 300, 50).await;
+      check("quit() with a window open shuts the runtime down", shut);
+      if shut {
+        // The loop has ended and the backend is waiting for this thread. A
+        // runtime that still asks the UI thread something now (a sync getter
+        // is a dispatch_sync to the main queue) gets no answer: the backend
+        // must stop waiting after its bound and exit instead of hanging. The
+        // exit guard reports this check and ends the run with its code; a
+        // watchdog fails the run if the process is still alive at 30 s.
+        expect_exit_while_blocked();
+        let _ = win.get_resizable();
+      }
     } else {
       na("quit() shuts the runtime down (checked on macOS WKWebView)");
     }
@@ -576,6 +584,27 @@ extern "C" {
   fn libc_exit(code: i32) -> !;
 }
 
+/// Set once the runtime thread is about to block in a UI-thread call after
+/// shutdown began: from then on, the process exiting is the expected outcome.
+static EXIT_EXPECTED: AtomicBool = AtomicBool::new(false);
+
+/// Arms the "exit while blocked" check: the exit guard then reports it as
+/// passed and ends the run with its result, and a watchdog fails the run if
+/// the backend hangs in its shutdown instead.
+fn expect_exit_while_blocked() {
+  EXIT_EXPECTED.store(true, Ordering::SeqCst);
+  std::thread::spawn(|| {
+    std::thread::sleep(std::time::Duration::from_secs(30));
+    eprintln!(
+      "[e2e] FAIL the backend did not exit within 30 s while the runtime \
+       thread was blocked in a UI-thread call"
+    );
+    eprintln!("[e2e] OVERALL FAIL");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    unsafe { libc_exit(1) };
+  });
+}
+
 /// Fails the run if the process exits normally (the backend returned from
 /// main) before this runtime reported: the e2e itself always ends with
 /// `_exit`, which skips atexit handlers. Unix only; on Windows a DLL's atexit
@@ -583,6 +612,17 @@ extern "C" {
 #[cfg(unix)]
 fn arm_exit_guard() {
   extern "C" fn on_exit() {
+    if EXIT_EXPECTED.load(Ordering::SeqCst) {
+      check(
+        "the backend exits while the runtime thread is blocked in a \
+         UI-thread call",
+        true,
+      );
+      let failed = FAILED.load(Ordering::SeqCst);
+      eprintln!("[e2e] OVERALL {}", if failed { "FAIL" } else { "PASS" });
+      let _ = std::io::Write::flush(&mut std::io::stderr());
+      unsafe { libc_exit(if failed { 1 } else { 0 }) };
+    }
     eprintln!(
       "[e2e] FAIL the process exited before the runtime was told to shut down"
     );
