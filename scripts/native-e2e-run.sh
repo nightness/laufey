@@ -3,7 +3,7 @@
 # Run the backend-agnostic native_e2e_runtime under a given backend and
 # propagate its PASS/FAIL exit code. See docs/e2e-testing.md.
 #
-#   scripts/native-e2e-run.sh <winit|webview|cef> [--layer1|--scheme-body|--lifetime|--lna|--window-api|--hidpi|--io|--system|--devtools-off|--menus-notifications|--auth-thread]
+#   scripts/native-e2e-run.sh <winit|webview|cef> [--layer1|--scheme-body|--lifetime|--lna|--window-api|--hidpi|--io|--system|--devtools-off|--menus-notifications|--auth-thread|--launch-visibility]
 #
 # --layer1 (Linux only) wraps the run in the D-Bus StatusNotifier/dbusmenu
 # observer (native_e2e_driver) under a private session bus: it checks the
@@ -47,9 +47,14 @@
 # OS's own notion of the UI thread, refused after quit()) and auth sessions
 # (a real ASWebAuthenticationSession round trip on macOS, not_supported
 # elsewhere). Ends with quit().
+# --launch-visibility runs only the launch checks (launch_checks.rs): the
+# first window of a fresh launch is on screen, its page visible and drawing
+# frames, a non-activating window's page too, and a hidden window stays
+# hidden. On macOS a window from another process covers the screen first
+# (scripts/launch-occluder.swift), as an editor or terminal would.
 set -euo pipefail
 
-backend="${1:?usage: native-e2e-run.sh <winit|webview|cef> [--layer1|--scheme-body|--lifetime|--lna|--window-api|--hidpi|--io|--system|--devtools-off|--menus-notifications|--auth-thread]}"
+backend="${1:?usage: native-e2e-run.sh <winit|webview|cef> [--layer1|--scheme-body|--lifetime|--lna|--window-api|--hidpi|--io|--system|--devtools-off|--menus-notifications|--auth-thread|--launch-visibility]}"
 mode="${2:-}"
 
 # Locate the runtime cdylib (.so / .dylib / .dll).
@@ -104,6 +109,23 @@ if [ "$mode" = "--devtools-off" ]; then
 fi
 if [ "$mode" = "--auth-thread" ]; then
   export LAUFEY_E2E_ONLY=auth-thread
+fi
+occluder_pid=""
+if [ "$mode" = "--launch-visibility" ]; then
+  export LAUFEY_E2E_ONLY=launch-visibility
+  if [ "$(uname -s)" = "Darwin" ]; then
+    occluder="$(mktemp -d "${TMPDIR:-/tmp}/laufey-occluder.XXXXXX")"
+    swiftc -O scripts/launch-occluder.swift -o "$occluder/launch-occluder"
+    "$occluder/launch-occluder" >"$occluder/out" 2>&1 &
+    occluder_pid=$!
+    trap 'kill "$occluder_pid" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 300); do
+      grep -q '^occluder ready' "$occluder/out" 2>/dev/null && break
+      sleep 0.1
+    done
+    grep '^occluder ready' "$occluder/out" ||
+      { cat "$occluder/out"; echo "the occluder did not come up" >&2; exit 1; }
+  fi
 fi
 mock=""
 if [ "$mode" = "--menus-notifications" ]; then

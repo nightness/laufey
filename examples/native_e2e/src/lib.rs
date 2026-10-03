@@ -31,6 +31,7 @@ mod auth_thread_checks;
 mod body_echo;
 mod close_checks;
 mod io_checks;
+mod launch_checks;
 mod lna_checks;
 mod menu_notification_checks;
 mod os_view;
@@ -760,6 +761,12 @@ fn e2e_main() {
       }
       // UI-thread tasks and auth sessions (API 42). Ends with quit().
       Ok("auth-thread") => auth_thread_checks::run().await,
+      // The first window of a fresh launch is on screen and renders frames
+      // (launch_checks.rs). Its windows must be the process's first.
+      Ok("launch-visibility") => {
+        launch_checks::run().await;
+        finish();
+      }
       Ok("shortcut-holder") => {
         // Not a battery: no OVERALL line, so its output can't be mistaken
         // for the main run's result.

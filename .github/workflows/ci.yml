@@ -559,6 +559,18 @@ jobs:
         shell: bash
         run: scripts/native-e2e-run.sh ${{ matrix.backend }} --auth-thread
 
+      # The first window of a fresh launch (launch_checks.rs): on screen, its
+      # page visible and drawing a frame within 2 s, and outerWidth /
+      # outerHeight read as the window's; a non-activating window's page
+      # visible and drawing frames too; a hidden window left hidden. On macOS
+      # another process's window covers the screen first, as an editor or a
+      # terminal would when the app is started from it. Every leg; Winit has
+      # no page and reports N/A for those checks.
+      - name: Launch visibility — first window on screen, frames drawn
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --launch-visibility
+
       # The cold-start toast click (Windows): COM starts the app from the
       # activator registration the step above wrote, and the click reaches
       # the response handler as the launch.
