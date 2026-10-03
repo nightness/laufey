@@ -94,8 +94,67 @@ fn answer(mut stream: TcpStream) {
   );
 }
 
-/// Runs `script` in the page and returns its string result, if any.
-async fn eval_string(win: &Window, script: &str) -> Option<String> {
+/// How an `execute_js` call ended.
+enum Eval {
+  /// The script's string result.
+  String(String),
+  /// The script threw (or its promise rejected): the error the engine gave.
+  Exception(Value),
+  /// It ran, but its result isn't a string.
+  NotString(Value),
+  /// No answer within the wait.
+  Timeout(Duration),
+}
+
+impl std::fmt::Display for Eval {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Eval::String(s) => write!(f, "string {s:?}"),
+      Eval::Exception(e) => write!(f, "exception {}", describe(e)),
+      Eval::NotString(v) => write!(f, "non-string result {}", describe(v)),
+      Eval::Timeout(d) => write!(f, "no answer within {d:?}"),
+    }
+  }
+}
+
+/// A short description of a value for the log.
+fn describe(v: &Value) -> String {
+  match v {
+    Value::Null => "null".into(),
+    Value::Bool(b) => format!("bool {b}"),
+    Value::Int(i) => format!("int {i}"),
+    Value::Double(d) => format!("double {d}"),
+    Value::String(s) => format!("{s:?}"),
+    Value::List(l) => {
+      format!(
+        "[{}]",
+        l.iter().map(describe).collect::<Vec<_>>().join(", ")
+      )
+    }
+    Value::Dict(m) => {
+      let mut keys: Vec<_> = m.iter().collect();
+      keys.sort_by(|a, b| a.0.cmp(b.0));
+      let parts: Vec<String> = keys
+        .into_iter()
+        .map(|(k, v)| format!("{k}: {}", describe(v)))
+        .collect();
+      format!("{{{}}}", parts.join(", "))
+    }
+    Value::Binary(b) => format!("{} bytes", b.len()),
+  }
+}
+
+impl Eval {
+  fn ok(self) -> Option<String> {
+    match self {
+      Eval::String(s) => Some(s),
+      _ => None,
+    }
+  }
+}
+
+/// Runs `script` in the page and waits up to `wait` for its result.
+async fn eval(win: &Window, script: &str, wait: Duration) -> Eval {
   let (tx, rx) = oneshot::channel::<Result<Value, Value>>();
   win.execute_js(
     script,
@@ -103,10 +162,18 @@ async fn eval_string(win: &Window, script: &str) -> Option<String> {
       let _ = tx.send(r);
     }),
   );
-  match tokio::time::timeout(Duration::from_secs(5), rx).await {
-    Ok(Ok(Ok(Value::String(s)))) => Some(s),
-    _ => None,
+  match tokio::time::timeout(wait, rx).await {
+    Ok(Ok(Ok(Value::String(s)))) => Eval::String(s),
+    Ok(Ok(Ok(other))) => Eval::NotString(other),
+    Ok(Ok(Err(e))) => Eval::Exception(e),
+    // The callback was dropped without an answer: as good as no answer.
+    Ok(Err(_)) | Err(_) => Eval::Timeout(wait),
   }
+}
+
+/// Runs `script` in the page and returns its string result, if any.
+async fn eval_string(win: &Window, script: &str) -> Option<String> {
+  eval(win, script, Duration::from_secs(5)).await.ok()
 }
 
 /// `"<localStorage value>|<cookie value>"`, each "" when absent.
@@ -174,7 +241,9 @@ fn e2e_main() {
   return {READ_JS};
 }})()"#
           );
-          let got = eval_string(&win, &script).await.unwrap_or_default();
+          let result = eval(&win, &script, Duration::from_secs(5)).await;
+          eprintln!("[e2e] write script: {result}");
+          let got = result.ok().unwrap_or_default();
           let (ls, cookie) = split(&got);
           eprintln!("[e2e] wrote localStorage={ls:?} cookie={cookie:?}");
           check("localStorage write reads back", !value.is_empty() && ls == value);
@@ -183,7 +252,9 @@ fn e2e_main() {
           tokio::time::sleep(Duration::from_millis(1500)).await;
         }
         "read" => {
-          let got = eval_string(&win, READ_JS).await;
+          let result = eval(&win, READ_JS, Duration::from_secs(5)).await;
+          eprintln!("[e2e] read script: {result}");
+          let got = result.ok();
           check("read storage", got.is_some());
           let (ls, cookie) = split(&got.unwrap_or_default());
           eprintln!("[e2e] read localStorage={ls:?} cookie={cookie:?}");
