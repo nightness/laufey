@@ -174,10 +174,15 @@ expected bytes. Same shape as the existing binding round-trip.
 
 Request bodies travel the other way: a page at `app://e2e-body/` sends POST, PUT
 and PATCH requests (UTF-8 text, binary bytes including NUL and 0x80–0xFF, a body
-over 1 MB, and an empty body) to the scheme handler, which reads each one with
-`read_body` and echoes it. The battery checks that the handler received exactly
-the bytes sent and that the page got an identical echo
-(`examples/native_e2e/src/body_echo.rs`). `LAUFEY_E2E_ONLY=scheme-body`
+over 1 MB, an empty body, bodies one byte either side of and exactly at the 256
+KiB chunk WebKitGTK reads them in, and eight bodies sent at once) to the scheme
+handler, which reads each one with `read_body` and echoes it. The battery checks
+that the handler received exactly the bytes sent and that the page got an
+identical echo (`examples/native_e2e/src/body_echo.rs`). The same page then
+checks that a response's Content-Type reaches the engine as its MIME type and
+charset: a Latin-1 body decodes as Latin-1 in XHR, a quoted charset is honoured,
+a JSON response keeps its type, and documents loaded in a frame are UTF-8 or
+windows-1252 HTML, or plain text, as declared. `LAUFEY_E2E_ONLY=scheme-body`
 (`native-e2e-run.sh <backend> --scheme-body`) runs only this check. CEF reports
 it N/A for now: it registers `app://` as fetch-enabled only in the browser
 process, so a `fetch()` from an `app://` page fails in the renderer before it

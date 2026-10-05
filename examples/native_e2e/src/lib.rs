@@ -140,9 +140,13 @@ async fn body_round_trip(received: &body_echo::Received) -> Option<Window> {
   let done = wait_for(
     || {
       let r = reports.lock().unwrap();
-      r.contains_key("script") || cases.iter().all(|c| r.contains_key(c.label))
+      r.contains_key("script")
+        || (cases.iter().all(|c| r.contains_key(c.label))
+          && body_echo::MIME_CHECKS
+            .iter()
+            .all(|(label, _)| r.contains_key(*label)))
     },
-    300,
+    600,
     100,
   )
   .await;
@@ -180,6 +184,14 @@ async fn body_round_trip(received: &body_echo::Received) -> Option<Window> {
       ),
       same && len == c.body.len() as i64,
     );
+  }
+  for (label, what) in body_echo::MIME_CHECKS {
+    let (ok, _, detail) = reports.get(*label).cloned().unwrap_or((
+      false,
+      -1,
+      "no report".to_string(),
+    ));
+    check(&format!("custom scheme: {what} ({detail})"), ok);
   }
   Some(win)
 }
