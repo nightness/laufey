@@ -429,8 +429,8 @@ class MacSchemeExchange : public SchemeExchangeBase {
                forNavigationAction:(WKNavigationAction*)navigationAction
                     windowFeatures:(WKWindowFeatures*)windowFeatures {
   NSURL* url = navigationAction.request.URL;
-  const char* spec = url ? url.absoluteString.UTF8String : nullptr;
-  if (spec && IsAllowedExternalLinkUrl(spec)) {
+  if (url && ([url.scheme isEqualToString:@"http"] ||
+              [url.scheme isEqualToString:@"https"])) {
     [[NSWorkspace sharedWorkspace] openURL:url];
   }
   return nil;

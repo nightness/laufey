@@ -307,7 +307,8 @@ static WebKitWebView* on_create(WebKitWebView* /*webview*/,
   WebKitURIRequest* req =
       webkit_navigation_action_get_request(navigation_action);
   const char* uri = req ? webkit_uri_request_get_uri(req) : nullptr;
-  if (uri && IsAllowedExternalLinkUrl(uri)) {
+  if (uri &&
+      (g_str_has_prefix(uri, "http://") || g_str_has_prefix(uri, "https://"))) {
     g_app_info_launch_default_for_uri(uri, nullptr, nullptr);
   }
   return nullptr;

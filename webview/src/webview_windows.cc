@@ -892,7 +892,8 @@ void WebView2Backend::OnEnvironmentReady(uint32_t window_id, HWND hwnd,
                       LPWSTR uriRaw = nullptr;
                       args->get_Uri(&uriRaw);
                       if (uriRaw) {
-                        if (IsAllowedExternalLinkUrl(WideToUtf8(uriRaw))) {
+                        if (wcsncmp(uriRaw, L"http://", 7) == 0 ||
+                            wcsncmp(uriRaw, L"https://", 8) == 0) {
                           ShellExecuteW(nullptr, L"open", uriRaw, nullptr,
                                         nullptr, SW_SHOWNORMAL);
                         }
