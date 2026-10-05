@@ -20,27 +20,19 @@
 // it can't be created. Never an existing or predictable path, so another user
 // of a shared `parent` (/tmp) can't create it first or read its contents.
 // `parent` "" means $TMPDIR if it is absolute, else /tmp.
+#include <sys/stat.h>
+#include <unistd.h>
+
+// CI (before) only: main's behaviour, the predictable per-pid name.
 inline std::string LaufeyMakePrivateTempDir(const std::string& parent,
                                             const std::string& prefix) {
-  std::string base = parent;
-  if (base.empty()) {
-    const char* tmpdir = getenv("TMPDIR");
-    base = tmpdir && tmpdir[0] == '/' ? tmpdir : "/tmp";
-  }
+  std::string base = parent.empty() ? "/tmp" : parent;
   while (base.size() > 1 && base.back() == '/') {
     base.pop_back();
   }
-  std::string templ = (base == "/" ? base : base + "/") + prefix + "XXXXXX";
-  std::vector<char> buf(templ.begin(), templ.end());
-  buf.push_back('\0');
-  // mkdtemp creates the directory 0700 with a name nobody can predict, and
-  // fails rather than reuse anything already there.
-  if (!mkdtemp(buf.data())) {
-    std::cerr << "laufey: could not create a private directory under \"" << base
-              << "\": " << strerror(errno) << std::endl;
-    return std::string();
-  }
-  return std::string(buf.data());
+  std::string path = base + "/" + prefix + std::to_string(getpid());
+  mkdir(path.c_str(), 0755);
+  return path;
 }
 
 #endif  // LAUFEY_PRIVATE_TEMP_DIR_H_
