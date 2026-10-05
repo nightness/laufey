@@ -177,12 +177,58 @@ static void TestPrecedence() {
   EXPECT(LaunchSettingFrom("", false, "file") == "");
   EXPECT(LaunchSettingFrom("env", false, "") == "env");
   EXPECT(LaunchSettingFrom("", false, "") == "");
-  // App id and data dir: the shipped file wins over an inherited environment
-  // (another app that launched this one must not move it into its profile).
+  // App id: the shipped file wins over an inherited environment (another app
+  // that launched this one must not move it into its profile).
   EXPECT(LaunchPinnedSettingFrom("env", true, "file") == "file");
   EXPECT(LaunchPinnedSettingFrom("", true, "file") == "file");
   EXPECT(LaunchPinnedSettingFrom("env", false, "") == "env");
   EXPECT(LaunchPinnedSettingFrom("", false, "") == "");
+}
+
+// A launch file that pins "appId" pins the app's data dir and custom schemes
+// with it: the environment can't change them (it is reported instead).
+// Without a pinned app id, the file's dataDir still wins and the environment
+// still wins for the custom schemes.
+static void TestPinnedAppId() {
+  std::string warning;
+  // dataDir: the file's, else (with an app id pinned) none, so the app id's
+  // default directory applies; LAUFEY_DATA_DIR is reported.
+  EXPECT(LaunchDataDirFrom("/env", true, true, "/file", &warning) == "/file");
+  EXPECT(warning.find("LAUFEY_DATA_DIR") != std::string::npos);
+  warning.clear();
+  EXPECT(LaunchDataDirFrom("/env", true, false, "", &warning).empty());
+  EXPECT(warning.find("LAUFEY_DATA_DIR") != std::string::npos &&
+         warning.find("app id") != std::string::npos);
+  warning.clear();
+  EXPECT(LaunchDataDirFrom("", true, false, "", &warning).empty());
+  EXPECT(LaunchDataDirFrom("", true, true, "/file", &warning) == "/file");
+  EXPECT(warning.empty());
+  // Not pinned: the file's dataDir still wins, else the environment.
+  EXPECT(LaunchDataDirFrom("/env", false, true, "/file", &warning) == "/file");
+  EXPECT(warning.find("LAUFEY_DATA_DIR") != std::string::npos);
+  warning.clear();
+  EXPECT(LaunchDataDirFrom("/env", false, false, "", &warning) == "/env");
+  EXPECT(LaunchDataDirFrom("", false, false, "", &warning).empty());
+  EXPECT(warning.empty());
+  // The warning is optional.
+  EXPECT(LaunchDataDirFrom("/env", true, false, "", nullptr).empty());
+
+  // customSchemes: the file's list only (none without one).
+  EXPECT(LaunchCustomSchemesFrom("other", true, true, "a,b", &warning) ==
+         "a,b");
+  EXPECT(warning.find("LAUFEY_CUSTOM_SCHEMES") != std::string::npos);
+  warning.clear();
+  EXPECT(LaunchCustomSchemesFrom("other", true, false, "", &warning).empty());
+  EXPECT(warning.find("LAUFEY_CUSTOM_SCHEMES") != std::string::npos);
+  warning.clear();
+  EXPECT(LaunchCustomSchemesFrom("", true, true, "a", &warning) == "a");
+  EXPECT(LaunchCustomSchemesFrom("", true, false, "", &warning).empty());
+  EXPECT(warning.empty());
+  // Not pinned: the environment wins, else the file.
+  EXPECT(LaunchCustomSchemesFrom("env", false, true, "a", &warning) == "env");
+  EXPECT(LaunchCustomSchemesFrom("", false, true, "a", &warning) == "a");
+  EXPECT(LaunchCustomSchemesFrom("env", false, false, "", &warning) == "env");
+  EXPECT(warning.empty());
 }
 
 static void TestPaths() {
@@ -267,14 +313,16 @@ static void TestProcessLaunchConfig() {
   EXPECT(LaunchDataDir() == "/from/file");
   EXPECT(LaunchCustomSchemes() == "one,two");
 
-  // The environment wins, key by key, except for the app id and data dir
-  // the file pins (an inherited environment can't move the app's profile).
+  // The file pins the app id, and with it the data dir and the custom
+  // schemes: an inherited environment can't move the app's profile or add
+  // schemes (each ignored variable is reported once).
   SetEnv("LAUFEY_APP_ID", "from.env");
   SetEnv("LAUFEY_DATA_DIR", "/from/env");
   SetEnv("LAUFEY_CUSTOM_SCHEMES", "envscheme");
   EXPECT(LaunchAppId() == "dev.laufey.test");
   EXPECT(LaunchDataDir() == "/from/file");
-  EXPECT(LaunchCustomSchemes() == "envscheme");
+  EXPECT(LaunchCustomSchemes() == "one,two");
+  EXPECT(LaunchCustomSchemes() == "one,two");  // reported only the first time
   SetEnv("LAUFEY_APP_ID", nullptr);
   SetEnv("LAUFEY_DATA_DIR", nullptr);
   SetEnv("LAUFEY_CUSTOM_SCHEMES", nullptr);
@@ -293,6 +341,7 @@ int main() {
   TestMalformed();
   TestSchema();
   TestPrecedence();
+  TestPinnedAppId();
   TestPaths();
   TestProcessLaunchConfig();
   if (g_failures) {

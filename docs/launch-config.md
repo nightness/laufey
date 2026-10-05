@@ -58,6 +58,20 @@ them the shipped file wins: when the file has the key, `LAUFEY_APP_ID` /
 started by another laufey app would otherwise open that app's profile. A
 launcher can still set them for an app whose file leaves them out.
 
+A file with `appId` pins the rest of the app's identity with it:
+
+- The data directory is the file's `dataDir`, or else the app id's default
+  directory. `LAUFEY_DATA_DIR` is ignored even when the file has no `dataDir`.
+- The custom schemes are the file's `customSchemes` only, none without the key.
+  `LAUFEY_CUSTOM_SCHEMES` is ignored.
+
+Otherwise a variable inherited from another program could still move the app's
+profile or register a scheme of its choosing in the app. Without `appId` in the
+file, the keys are resolved one at a time as described above.
+
+`LAUFEY_DATA_DIR` or `LAUFEY_CUSTOM_SCHEMES` set but ignored because of the file
+is reported on stderr, once per process.
+
 ## Validation
 
 A problem with the file never stops the app. It is reported on stderr as

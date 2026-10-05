@@ -25,7 +25,10 @@
 // key, so a launcher can still force a value. The exceptions are "appId" and
 // "dataDir", which identify the installed app: there the shipped file wins,
 // because an environment inherited from another app (e.g. one that launched
-// this one) must not move this app into that app's profile. The file is
+// this one) must not move this app into that app's profile. A file that pins
+// "appId" pins the rest of the app's identity with it: dataDir comes from the
+// file or the app id, and customSchemes from the file alone; LAUFEY_DATA_DIR
+// and LAUFEY_CUSTOM_SCHEMES are then reported and ignored. The file is
 // located from the executable's real path, never from the working directory,
 // and is trusted like the executable itself (it belongs to the installed,
 // possibly signed, app). A missing file is not an error; a malformed file, an
@@ -87,16 +90,33 @@ const LaunchConfig& ProcessLaunchConfig();
 std::string LaunchSettingFrom(const std::string& env_value, bool file_has,
                               const std::string& file_value);
 
-// Precedence step behind LaunchAppId and LaunchDataDir, exposed for tests:
-// `file_value` if `file_has`, else `env_value` (possibly "").
+// Precedence step behind LaunchAppId, exposed for tests: `file_value` if
+// `file_has`, else `env_value` (possibly "").
 std::string LaunchPinnedSettingFrom(const std::string& env_value, bool file_has,
                                     const std::string& file_value);
 
-// The effective settings. App id and data dir: the launch file's value if it
-// has one, else the environment variable, else "" (LaunchPinnedSettingFrom).
-// Custom schemes: the environment variable if set (non-empty), else the
-// launch file's value, else "". Each has the environment variable's format,
-// so callers treat both sources alike.
+// Precedence step behind LaunchDataDir, exposed for tests: `file_value` if
+// `file_has`; else "" when `app_id_pinned` (the app id's default directory
+// applies); else `env_value` (possibly ""). An `env_value` that is set but
+// not used is reported in `warning`.
+std::string LaunchDataDirFrom(const std::string& env_value, bool app_id_pinned,
+                              bool file_has, const std::string& file_value,
+                              std::string* warning);
+
+// Precedence step behind LaunchCustomSchemes, exposed for tests: when
+// `app_id_pinned`, `file_value` if `file_has`, else "" (a set `env_value` is
+// reported in `warning`); otherwise LaunchSettingFrom.
+std::string LaunchCustomSchemesFrom(const std::string& env_value,
+                                    bool app_id_pinned, bool file_has,
+                                    const std::string& file_value,
+                                    std::string* warning);
+
+// The effective settings. App id: the launch file's value if it has one,
+// else the environment variable, else "" (LaunchPinnedSettingFrom). Data
+// dir: see LaunchDataDirFrom. Custom schemes: see LaunchCustomSchemesFrom.
+// Each has the environment variable's format, so callers treat both sources
+// alike. An environment variable that is ignored is reported on stderr once
+// per process.
 std::string LaunchAppId();          // LAUFEY_APP_ID  / "appId"
 std::string LaunchDataDir();        // LAUFEY_DATA_DIR / "dataDir"
 std::string LaunchCustomSchemes();  // LAUFEY_CUSTOM_SCHEMES / "customSchemes"
