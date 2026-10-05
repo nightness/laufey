@@ -17,7 +17,6 @@
 #include "init_script.h"
 #include "laufey_json.h"
 #include "runtime_loader.h"
-#include "script_message_frame.h"
 
 @class LaufeyIOSMessageHandler;
 
@@ -215,8 +214,6 @@ class WKWebViewIOSBackend : public LaufeyBackend {
 - (void)userContentController:(WKUserContentController*)ucc
       didReceiveScriptMessage:(WKScriptMessage*)message {
   if (![message.name isEqualToString:@"laufey"])
-    return;
-  if (!LaufeyIsMainFrameMessage(message))
     return;
   if (![message.body isKindOfClass:[NSDictionary class]])
     return;

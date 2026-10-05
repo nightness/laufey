@@ -8,7 +8,6 @@
 #include "laufey_backend_common.h"
 #include "laufey_json.h"
 #include "init_script.h"
-#include "script_message_frame.h"
 
 #include <atomic>
 #include <map>
@@ -245,9 +244,6 @@ static void UnregisterNSWindow(NSWindow* win) {
 - (void)userContentController:(WKUserContentController*)userContentController
       didReceiveScriptMessage:(WKScriptMessage*)message {
   if (![message.name isEqualToString:@"laufey"])
-    return;
-
-  if (!LaufeyIsMainFrameMessage(message))
     return;
 
   if (![message.body isKindOfClass:[NSDictionary class]])
