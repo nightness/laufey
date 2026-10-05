@@ -270,18 +270,13 @@ impl Value {
           .value_double
           .map(|f| f(bd, *v))
           .unwrap_or(std::ptr::null_mut()),
-        // A string with a NUL byte cannot cross the C ABI (C strings end at
-        // the first NUL): it becomes null rather than a truncated string.
-        Value::String(s) => match CString::new(s.as_str()) {
-          Ok(c_str) => api
+        Value::String(s) => {
+          let c_str = CString::new(s.as_str()).unwrap();
+          api
             .value_string
             .map(|f| f(bd, c_str.as_ptr()))
-            .unwrap_or(std::ptr::null_mut()),
-          Err(_) => api
-            .value_null
-            .map(|f| f(bd))
-            .unwrap_or(std::ptr::null_mut()),
-        },
+            .unwrap_or(std::ptr::null_mut())
+        }
         Value::List(items) => {
           let list = api
             .value_list
@@ -305,11 +300,7 @@ impl Value {
           if !dict.is_null() {
             if let Some(set) = api.value_dict_set {
               for (k, v) in map {
-                // A key with a NUL byte cannot cross the C ABI: the entry
-                // is left out.
-                let Ok(c_key) = CString::new(k.as_str()) else {
-                  continue;
-                };
+                let c_key = CString::new(k.as_str()).unwrap();
                 let raw = v.to_raw();
                 set(dict, c_key.as_ptr(), raw);
               }
@@ -322,19 +313,6 @@ impl Value {
           .map(|f| f(bd, data.as_ptr() as *const c_void, data.len()))
           .unwrap_or(std::ptr::null_mut()),
       }
-    }
-  }
-
-  /// Whether a string or dict key anywhere in this value contains a NUL
-  /// byte (which the C ABI's strings cannot carry).
-  fn has_interior_nul(&self) -> bool {
-    match self {
-      Value::String(s) => s.contains('\0'),
-      Value::List(items) => items.iter().any(Value::has_interior_nul),
-      Value::Dict(map) => map
-        .iter()
-        .any(|(k, v)| k.contains('\0') || v.has_interior_nul()),
-      _ => false,
     }
   }
 
@@ -374,9 +352,6 @@ impl Value {
   }
 }
 
-const NUL_IN_RESULT: &str =
-  "the result contains a NUL byte, which cannot cross the laufey C ABI";
-
 pub struct JsCall {
   pub window_id: u32,
   pub call_id: u64,
@@ -385,13 +360,7 @@ pub struct JsCall {
 }
 
 impl JsCall {
-  /// Answers the call with `value`. A string in `value` (or a dict key)
-  /// containing a NUL byte cannot cross the C ABI, whose strings end at the
-  /// first NUL: the call is then rejected with an error saying so instead.
   pub fn resolve(self, value: Value) {
-    if value.has_interior_nul() {
-      return self.reject(Value::String(NUL_IN_RESULT.into()));
-    }
     let api = api();
     if let Some(respond) = api.js_call_respond {
       let raw = value.to_raw();
@@ -401,13 +370,7 @@ impl JsCall {
     }
   }
 
-  /// Rejects the call with `error` (NUL bytes as for [`JsCall::resolve`]).
   pub fn reject(self, error: Value) {
-    let error = if error.has_interior_nul() {
-      Value::String(NUL_IN_RESULT.into())
-    } else {
-      error
-    };
     let api = api();
     if let Some(respond) = api.js_call_respond {
       let raw = error.to_raw();
@@ -679,13 +642,10 @@ pub fn register_scheme_handler<F>(scheme: &str, handler: F)
 where
   F: Fn(SchemeRequest) + Send + Sync + 'static,
 {
-  // A scheme with a NUL byte is no scheme: nothing is registered.
-  let Ok(c_scheme) = CString::new(scheme) else {
-    return;
-  };
   *scheme_handler_store().lock().unwrap() = Some(Box::new(handler));
   let api = api();
   if let Some(register) = api.register_scheme_handler {
+    let c_scheme = CString::new(scheme).expect("scheme contains NUL");
     unsafe {
       register(
         api.backend_data,
@@ -827,11 +787,10 @@ impl Window {
     self
   }
 
-  /// A `title` containing a NUL byte cannot cross the C ABI; the call is
-  /// then a no-op.
   pub fn set_title(&self, title: &str) {
     let api = api();
-    if let (Some(f), Ok(c_title)) = (api.set_title, CString::new(title)) {
+    if let Some(f) = api.set_title {
+      let c_title = CString::new(title).expect("Invalid title");
       unsafe { f(api.backend_data, self.id, c_title.as_ptr()) };
     }
   }
@@ -841,10 +800,10 @@ impl Window {
     self
   }
 
-  /// A `url` containing a NUL byte is not a URL; the call is then a no-op.
   pub fn navigate(&self, url: &str) {
     let api = api();
-    if let (Some(f), Ok(c_url)) = (api.navigate, CString::new(url)) {
+    if let Some(f) = api.navigate {
+      let c_url = CString::new(url).expect("Invalid URL");
       unsafe { f(api.backend_data, self.id, c_url.as_ptr()) };
     }
   }
@@ -1072,20 +1031,13 @@ impl Window {
     }
   }
 
-  /// A `script` containing a NUL byte cannot cross the C ABI: it is not
-  /// run, and `callback` receives an `Err` saying so.
   pub fn execute_js<F>(&self, script: &str, callback: Option<F>)
   where
     F: FnOnce(Result<Value, Value>) + Send + 'static,
   {
     let api = api();
     if let Some(f) = api.execute_js {
-      let Ok(c_script) = CString::new(script) else {
-        if let Some(cb) = callback {
-          cb(Err(Value::String("script contains a NUL byte".into())));
-        }
-        return;
-      };
+      let c_script = CString::new(script).expect("Invalid script");
 
       match callback {
         Some(cb_fn) => {
@@ -1577,14 +1529,9 @@ fn show_dialog_blocking(
   let Some(f) = api.show_dialog else {
     return (false, None);
   };
-  // Text with a NUL byte cannot cross the C ABI: no dialog, as if cancelled.
-  let (Ok(c_title), Ok(c_message), Ok(c_default)) = (
-    CString::new(title),
-    CString::new(message),
-    CString::new(default_value),
-  ) else {
-    return (false, None);
-  };
+  let c_title = CString::new(title).expect("Invalid title");
+  let c_message = CString::new(message).expect("Invalid message");
+  let c_default = CString::new(default_value).expect("Invalid default value");
   let mut out_input: *mut c_char = std::ptr::null_mut();
   let want_input = dialog_type == LAUFEY_DIALOG_PROMPT;
   // SAFETY: All pointers are valid for the duration of the call. The
@@ -1650,12 +1597,12 @@ pub fn read_clipboard_text() -> Option<String> {
 ///
 /// Passing an empty string clears the clipboard. Mirrors the web
 /// `navigator.clipboard.writeText()` API. No-op if the backend does not
-/// support clipboard access, or if `text` contains a NUL byte (which cannot
-/// cross the C ABI). Must be called on the UI thread.
+/// support clipboard access. Must be called on the UI thread.
 pub fn write_clipboard_text(text: &str) {
   let api = api();
-  if let (Some(f), Ok(c_text)) = (api.write_clipboard_text, CString::new(text))
-  {
+  if let Some(f) = api.write_clipboard_text {
+    let c_text =
+      CString::new(text).expect("clipboard text contained a NUL byte");
     // SAFETY: `c_text` outlives the call; the backend copies the bytes.
     unsafe { f(api.backend_data, c_text.as_ptr()) };
   }
@@ -1879,16 +1826,14 @@ unsafe extern "C" fn dock_reopen_callback(
 
 /// Set a short text badge on the app's dock icon (macOS) or taskbar icon
 /// (Windows), or prefix the focused window's title with `"(text) "` (Linux).
-/// Pass `None` or an empty string to clear the badge. Text containing a NUL
-/// byte cannot cross the C ABI; the call is then a no-op.
+/// Pass `None` or an empty string to clear the badge.
 pub fn set_dock_badge(text: Option<&str>) {
   let api = api();
   if let Some(f) = api.set_dock_badge {
     match text {
       Some(t) if !t.is_empty() => {
-        if let Ok(c_text) = CString::new(t) {
-          unsafe { f(api.backend_data, c_text.as_ptr()) };
-        }
+        let c_text = CString::new(t).expect("Invalid badge text");
+        unsafe { f(api.backend_data, c_text.as_ptr()) };
       }
       _ => unsafe { f(api.backend_data, std::ptr::null()) },
     }
@@ -2241,11 +2186,9 @@ impl TrayIcon {
     let api = api();
     if let Some(f) = api.set_tray_tooltip {
       match text {
-        // Text with a NUL byte cannot cross the C ABI: a no-op.
         Some(t) if !t.is_empty() => {
-          if let Ok(c_text) = CString::new(t) {
-            unsafe { f(api.backend_data, self.id, c_text.as_ptr()) };
-          }
+          let c_text = CString::new(t).expect("Invalid tooltip");
+          unsafe { f(api.backend_data, self.id, c_text.as_ptr()) };
         }
         _ => unsafe { f(api.backend_data, self.id, std::ptr::null()) },
       }
@@ -2336,12 +2279,10 @@ impl Drop for TrayIcon {
 /// laufey::set_js_namespace("MyApp");
 /// // JS code can now use: window.MyApp.greet("world")
 /// ```
-///
-/// A `name` containing a NUL byte is no JS identifier; the call is then a
-/// no-op.
 pub fn set_js_namespace(name: &str) {
   let api = api();
-  if let (Some(f), Ok(c_name)) = (api.set_js_namespace, CString::new(name)) {
+  if let Some(f) = api.set_js_namespace {
+    let c_name = CString::new(name).unwrap();
     unsafe { f(api.backend_data, c_name.as_ptr()) };
   }
 }
