@@ -1706,6 +1706,19 @@ void DispatchPendingSchemeRequest(PendingSchemeRequest* pending) {
 // Bytes requested per asynchronous read of a request body.
 constexpr gsize kSchemeBodyChunk = 256 * 1024;
 
+// The most request body bytes buffered for one custom-scheme request. The
+// body is read whole before the handler runs, so without a cap a page could
+// make the host hold any amount of memory; past it the request fails without
+// reaching the runtime.
+constexpr size_t kMaxSchemeRequestBodyBytes = 512u * 1024 * 1024;
+
+// Whether a body already holding `held` bytes may take `more` without passing
+// kMaxSchemeRequestBodyBytes (and without overflowing).
+bool SchemeRequestBodyFits(size_t held, size_t more) {
+  return held <= kMaxSchemeRequestBodyBytes &&
+         more <= kMaxSchemeRequestBodyBytes - held;
+}
+
 void ReadSchemeRequestBodyChunk(GInputStream* body,
                                 PendingSchemeRequest* pending);
 
@@ -1744,6 +1757,24 @@ void OnSchemeRequestBodyChunk(GObject* source, GAsyncResult* result,
     g_bytes_unref(chunk);
     g_object_unref(body);
     DispatchPendingSchemeRequest(pending);
+    return;
+  }
+  if (!SchemeRequestBodyFits(pending->body.size(), size)) {
+    // Past the cap the request fails (the page's fetch rejects) without
+    // reaching the runtime, rather than the whole body being held.
+    std::cerr << "laufey: the request body of " << pending->method << " "
+              << pending->uri << " is larger than "
+              << (kMaxSchemeRequestBodyBytes >> 20)
+              << " MiB; failing the request" << std::endl;
+    GError* too_large =
+        g_error_new_literal(G_IO_ERROR, G_IO_ERROR_MESSAGE_TOO_LARGE,
+                            "the request body is too large");
+    webkit_uri_scheme_request_finish_error(pending->request, too_large);
+    g_error_free(too_large);
+    g_bytes_unref(chunk);
+    g_object_unref(pending->request);
+    delete pending;
+    g_object_unref(body);
     return;
   }
   pending->body.insert(pending->body.end(), bytes, bytes + size);
