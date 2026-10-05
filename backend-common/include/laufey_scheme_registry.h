@@ -12,7 +12,9 @@
 // CefSchemeRegistrar), but the bookkeeping is shared here:
 //
 //   * name validation — RFC 3986 `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-"
-//     / "." )`, compared case-insensitively and stored lowercase;
+//     / "." )`, compared case-insensitively and stored lowercase, and never
+//     one of the schemes the engines give a meaning of their own (http, file,
+//     javascript, ...; IsReservedSchemeName);
 //   * the thread-safe set of registered names (the runtime registers from its
 //     own thread while the UI thread creates windows and reads the set).
 //
@@ -50,7 +52,7 @@ inline std::string NormalizeSchemeName(const std::string& scheme) {
 // RFC 3986 scheme grammar: a letter followed by letters, digits, "+", "-" or
 // ".". Case-insensitive. Rejects the empty string, anything with "://", and
 // characters outside the grammar.
-inline bool IsValidSchemeName(const std::string& scheme) {
+inline bool IsSchemeNameGrammar(const std::string& scheme) {
   if (scheme.empty()) {
     return false;
   }
@@ -67,6 +69,35 @@ inline bool IsValidSchemeName(const std::string& scheme) {
     }
   }
   return true;
+}
+
+// Schemes an embedder may not register (any case): the ones the engines (or
+// the URL standard) already give a meaning of their own. Taking one over
+// would hand the embedder's handler the page's ordinary web traffic
+// (http, https, ws, wss, ftp), local files (file, filesystem), in-memory
+// documents (data, blob), script URLs (javascript) or the engines' own pages
+// (about, chrome, chrome-extension, chrome-untrusted, devtools,
+// view-source). Schemes only the OS handles (mailto, tel, ...) stay allowed.
+inline bool IsReservedSchemeName(const std::string& scheme) {
+  static const char* const kReserved[] = {
+      "about", "blob",     "chrome",     "chrome-extension", "chrome-untrusted",
+      "data",  "devtools", "file",       "filesystem",       "ftp",
+      "http",  "https",    "javascript", "view-source",      "ws",
+      "wss",
+  };
+  const std::string normalized = NormalizeSchemeName(scheme);
+  for (const char* reserved : kReserved) {
+    if (normalized == reserved) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A scheme name an embedder may register: the RFC 3986 grammar
+// (IsSchemeNameGrammar) and not reserved (IsReservedSchemeName).
+inline bool IsValidSchemeName(const std::string& scheme) {
+  return IsSchemeNameGrammar(scheme) && !IsReservedSchemeName(scheme);
 }
 
 // Split a comma-separated list ("myapp, other") into normalized, valid,

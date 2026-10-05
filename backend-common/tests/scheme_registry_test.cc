@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+using laufey_common::IsReservedSchemeName;
+using laufey_common::IsSchemeNameGrammar;
 using laufey_common::IsValidSchemeName;
 using laufey_common::JoinForwardedSchemes;
 using laufey_common::MergeForwardedSchemes;
@@ -44,6 +46,42 @@ static void TestSchemeNameGrammar() {
   EXPECT(!IsValidSchemeName("my_app"));  // "_" is not in the RFC grammar
   EXPECT(!IsValidSchemeName("app/x"));
   EXPECT(!IsValidSchemeName(std::string("app\0x", 5)));
+
+  // Schemes the engines already give a meaning to can't be taken over, in
+  // any case; they still follow the grammar.
+  for (const char* reserved : {"http",
+                               "https",
+                               "file",
+                               "ws",
+                               "wss",
+                               "data",
+                               "blob",
+                               "javascript",
+                               "about",
+                               "ftp",
+                               "filesystem",
+                               "chrome",
+                               "chrome-extension",
+                               "chrome-untrusted",
+                               "devtools",
+                               "view-source",
+                               "HTTPS",
+                               "JavaScript",
+                               "File",
+                               "Data",
+                               "BLOB",
+                               "View-Source"}) {
+    EXPECT(IsSchemeNameGrammar(reserved));
+    EXPECT(IsReservedSchemeName(reserved));
+    EXPECT(!IsValidSchemeName(reserved));
+  }
+  // Near misses and OS-only schemes stay allowed.
+  for (const char* allowed :
+       {"https2", "httpx", "xhttp", "files", "app", "mailto", "tel",
+        "javascript-app", "about-app", "wss.app"}) {
+    EXPECT(!IsReservedSchemeName(allowed));
+    EXPECT(IsValidSchemeName(allowed));
+  }
 
   EXPECT(NormalizeSchemeName("MyApp") == "myapp");
   EXPECT(NormalizeSchemeName("app") == "app");
@@ -162,6 +200,13 @@ static void TestParseSchemeList() {
   EXPECT(rejected[0] == "1bad");
   EXPECT(rejected[1] == "also good");
   EXPECT(rejected[2] == "app://");
+
+  // Reserved schemes (the switch, LAUFEY_CUSTOM_SCHEMES) are rejected too.
+  rejected.clear();
+  std::vector<std::string> reserved =
+      ParseSchemeList("https,myapp,JavaScript", &rejected);
+  EXPECT(reserved.size() == 1 && reserved[0] == "myapp");
+  EXPECT(rejected.size() == 2);
 
   // A null `rejected` is allowed.
   std::vector<std::string> quiet = ParseSchemeList("ok,not ok");

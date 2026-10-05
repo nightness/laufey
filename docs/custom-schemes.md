@@ -47,7 +47,14 @@ of it, so there the body arrives whole once the handler calls `finish`, and a
 response that never finishes (server-sent events, for example) never arrives.
 Scheme names follow RFC 3986 (a letter, then letters, digits, `+`, `-`, or `.`),
 are case-insensitive, and are stored in lowercase; an invalid name is logged and
-ignored. Engine-less backends such as Winit have no scheme support;
+ignored. So is a scheme the engines already give a meaning of their own, in any
+case: `http`, `https`, `ws`, `wss`, `ftp`, `file`, `filesystem`, `data`, `blob`,
+`javascript`, `about`, `chrome`, `chrome-extension`, `chrome-untrusted`,
+`devtools` and `view-source`. Taking one of them over would hand the handler the
+page's ordinary web traffic, local files or script URLs. This applies to
+`register_scheme_handler`, the `--laufey-custom-schemes` switch and
+`LAUFEY_CUSTOM_SCHEMES` alike. Schemes only the OS handles (`mailto`, `tel`) are
+not reserved. Engine-less backends such as Winit have no scheme support;
 `laufey::scheme_handlers_supported()` returns `false` there, and the application
 should fall back to a loopback server.
 

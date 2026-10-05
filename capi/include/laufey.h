@@ -708,7 +708,8 @@ struct laufey_backend_api {
   // Register `handler` to service every request for `scheme` (the scheme name
   // only, e.g. "app", without "://"; RFC 3986 grammar — a letter followed by
   // letters, digits, "+", "-" or "."; case-insensitive, stored lowercase; an
-  // invalid name is logged and ignored). Call it once per scheme: the built-in
+  // invalid name, or one the engines already define such as "http", "file" or
+  // "javascript", is logged and ignored). Call it once per scheme: the built-in
   // "app" plus any of the embedder's own. One handler serves all registered
   // schemes — a later call replaces the handler for every scheme and adds the
   // new scheme — so dispatch on the request URL. A NULL handler unregisters.

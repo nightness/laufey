@@ -165,7 +165,9 @@ runtime calls `scheme_response_finish`. On the WebView backends storage persists
 across launches; the CEF host keeps its profile in a per-process temporary
 directory, so there it lasts for one run, as for any other origin. Scheme names
 follow the RFC 3986 grammar (a letter, then letters, digits, `+`, `-`, `.`), are
-case-insensitive and stored lowercase; an invalid name is logged and ignored.
+case-insensitive and stored lowercase; an invalid name is logged and ignored, as
+is a scheme the engines already define (`http`, `https`, `file`, `data`,
+`javascript`, ...; the full list is in [Custom URL schemes](custom-schemes.md)).
 
 **Register every scheme before creating the first window.** The engines read
 their scheme tables when a web view is created — the `WKWebViewConfiguration` on
