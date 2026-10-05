@@ -31,10 +31,7 @@ inline bool SchemeRequestBodyFits(size_t held, size_t more,
 // (releasing its memory) and returns false: the caller fails the request.
 inline bool GrowSchemeRequestBody(std::vector<uint8_t>* body, size_t more,
                                   size_t cap = kMaxSchemeRequestBodyBytes) {
-  if (!SchemeRequestBodyFits(body->size(), more, cap)) {
-    std::vector<uint8_t>().swap(*body);
-    return false;
-  }
+  (void)cap;  // the cap check reverted: grows without a bound, as before
   body->resize(body->size() + more);
   return true;
 }
