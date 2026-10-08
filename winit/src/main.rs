@@ -10,10 +10,9 @@ use laufey_backend_winit_common::{
   CommonEvent, CommonState, LaufeyBackendApi, LaufeyJsResultFn,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::WindowEvent;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{Modifiers, WindowEvent};
 use winit::event_loop::{EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
 use winit::window::Window;
 
 // --- Backend state ---
@@ -93,7 +92,7 @@ enum UserEvent {
 
 struct WindowInfo {
   window: Window,
-  modifiers: ModifiersState,
+  modifiers: Modifiers,
 }
 
 struct App {
@@ -146,18 +145,26 @@ impl App {
     });
     laufey_backend_winit_common::store_window_handles(window_id, &window);
 
+    // Screens and the initial state (API 38).
+    laufey_backend_winit_common::window_api::refresh_window_screen(
+      window_id, &window,
+    );
+    laufey_backend_winit_common::window_api::report(window_id, &window);
+
     let winit_id = window.id();
     self.winit_to_laufey.insert(winit_id, window_id);
     self.windows.insert(
       window_id,
       WindowInfo {
         window,
-        modifiers: ModifiersState::default(),
+        modifiers: Modifiers::default(),
       },
     );
   }
 
   fn close_window(&mut self, window_id: u32) {
+    laufey_backend_winit_common::window_api::forget(window_id);
+    laufey_backend_winit_common::file_drop::forget(window_id);
     if let Some(info) = self.windows.remove(&window_id) {
       self.winit_to_laufey.remove(&info.window.id());
       laufey_backend_winit_common::remove_window_handles(window_id);
@@ -173,8 +180,13 @@ impl App {
 }
 
 impl ApplicationHandler<UserEvent> for App {
-  fn resumed(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-    // Windows are created on-demand via CreateWindow events
+  fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+    // Windows are created on-demand via CreateWindow events. The screens are
+    // known before any window exists (a tray app has none).
+    laufey_backend_winit_common::window_api::refresh_screens(
+      event_loop.available_monitors(),
+      event_loop.primary_monitor(),
+    );
   }
 
   fn user_event(
@@ -192,7 +204,11 @@ impl ApplicationHandler<UserEvent> for App {
         }
         CommonEvent::CloseWindow { window_id } => {
           self.close_window(*window_id);
-          if self.windows.is_empty() {
+          // A tray app keeps running with no window
+          // (set_quit_on_last_window_closed(false)); quit() ends it anyway.
+          if self.windows.is_empty()
+            && laufey_backend_winit_common::window_api::should_end_loop_after_last_window()
+          {
             event_loop.exit();
           }
         }
@@ -219,7 +235,9 @@ impl ApplicationHandler<UserEvent> for App {
             | CommonEvent::Hide { window_id }
             | CommonEvent::Focus { window_id }
             | CommonEvent::SetApplicationMenu { window_id }
-            | CommonEvent::ShowContextMenu { window_id } => *window_id,
+            | CommonEvent::ShowContextMenu { window_id }
+            | CommonEvent::SetWindowState { window_id }
+            | CommonEvent::SetSizeConstraints { window_id } => *window_id,
             _ => return,
           };
           if let Some(info) = self.windows.get(&wid) {
@@ -235,7 +253,21 @@ impl ApplicationHandler<UserEvent> for App {
   }
 
   fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+    // The queue is drained, so any `Resized` burst from creating a window has
+    // been seen. Re-sync each window's cached geometry from the real window
+    // and start reporting resizes.
+    if let Some(state) = BackendState::get() {
+      for (laufey_id, info) in &self.windows {
+        state.common.with_window(*laufey_id, |ws| {
+          laufey_backend_winit_common::settle_creation_geometry(
+            ws,
+            &info.window,
+          );
+        });
+      }
+    }
     laufey_backend_winit_common::poll_menu_events();
+    laufey_backend_winit_common::file_drop::flush();
     // The tray lives on the primary monitor (menu bar / taskbar); its scale
     // factor converts tray-icon's physical rect into the logical window space.
     let scale_factor = event_loop
@@ -261,12 +293,88 @@ impl ApplicationHandler<UserEvent> for App {
       None => return,
     };
 
-    let modifiers = match self.windows.get_mut(&laufey_id) {
-      Some(info) => &mut info.modifiers,
+    // Scale before any mut borrow of `windows` (modifiers live next to Window).
+    let scale_factor = match self.windows.get(&laufey_id) {
+      Some(info) => info.window.scale_factor(),
+      None => return,
+    };
+    let modifiers = match self.windows.get(&laufey_id) {
+      Some(info) => info.modifiers.state(),
       None => return,
     };
 
+    // Any of these can reveal a maximize / minimize / fullscreen change or a
+    // move to another monitor (API 38); read the state back after handling.
+    let recheck_state = matches!(
+      event,
+      WindowEvent::Resized(_)
+        | WindowEvent::Moved(_)
+        | WindowEvent::Focused(_)
+        | WindowEvent::Occluded(_)
+        | WindowEvent::ScaleFactorChanged { .. }
+    );
+    let refresh_screens = matches!(
+      event,
+      WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+    );
+
+    self.handle_window_event(
+      event_loop,
+      laufey_id,
+      state,
+      scale_factor,
+      modifiers,
+      event,
+    );
+
+    if recheck_state {
+      if let Some(info) = self.windows.get(&laufey_id) {
+        if refresh_screens {
+          laufey_backend_winit_common::window_api::refresh_window_screen(
+            laufey_id,
+            &info.window,
+          );
+        }
+        laufey_backend_winit_common::window_api::report(
+          laufey_id,
+          &info.window,
+        );
+      }
+    }
+  }
+}
+
+impl App {
+  #[allow(clippy::too_many_arguments)]
+  fn handle_window_event(
+    &mut self,
+    event_loop: &winit::event_loop::ActiveEventLoop,
+    laufey_id: u32,
+    state: &'static BackendState,
+    scale_factor: f64,
+    modifiers: winit::keyboard::ModifiersState,
+    event: WindowEvent,
+  ) {
     match event {
+      // File drops (API 39): gathered per window and reported once the queue
+      // is drained (about_to_wait -> file_drop::flush).
+      WindowEvent::HoveredFile(path) => {
+        let (x, y) = state
+          .common
+          .with_window(laufey_id, |ws| *ws.cursor_position.lock().unwrap())
+          .unwrap_or((0.0, 0.0));
+        laufey_backend_winit_common::file_drop::hovered(laufey_id, &path, x, y);
+      }
+      WindowEvent::DroppedFile(path) => {
+        let (x, y) = state
+          .common
+          .with_window(laufey_id, |ws| *ws.cursor_position.lock().unwrap())
+          .unwrap_or((0.0, 0.0));
+        laufey_backend_winit_common::file_drop::dropped(laufey_id, &path, x, y);
+      }
+      WindowEvent::HoveredFileCancelled => {
+        laufey_backend_winit_common::file_drop::cancelled(laufey_id);
+      }
       WindowEvent::CloseRequested => {
         let proceed =
           laufey_backend_winit_common::dispatch_close_requested_event(
@@ -275,26 +383,88 @@ impl ApplicationHandler<UserEvent> for App {
           );
         if proceed {
           self.close_window(laufey_id);
-          if self.windows.is_empty() {
+          if self.windows.is_empty()
+            && laufey_backend_winit_common::window_api::should_end_loop_after_last_window()
+          {
             event_loop.exit();
           }
         }
       }
       WindowEvent::Resized(PhysicalSize { width, height }) => {
-        state.common.with_window(laufey_id, |ws| {
-          *ws.current_size.lock().unwrap() =
-            Some((width as i32, height as i32));
+        let (width, height) =
+          laufey_backend_winit_common::physical_size_to_logical_i32(
+            width,
+            height,
+            scale_factor,
+          );
+        let inner = self.windows.get(&laufey_id).and_then(|info| {
+          info.window.inner_position().ok().map(|p| {
+            laufey_backend_winit_common::physical_pos_to_logical_i32(
+              p.x,
+              p.y,
+              scale_factor,
+            )
+          })
         });
-        laufey_backend_winit_common::dispatch_resize_event(
-          &state.common.handlers,
-          laufey_id,
-          width as i32,
-          height as i32,
-        );
+        let outer = self.windows.get(&laufey_id).map(|info| {
+          let s = info.window.outer_size();
+          laufey_backend_winit_common::physical_size_to_logical_i32(
+            s.width,
+            s.height,
+            scale_factor,
+          )
+        });
+        let changed = state
+          .common
+          .with_window(laufey_id, |ws| {
+            let prev = *ws.current_size.lock().unwrap();
+            *ws.current_size.lock().unwrap() = Some((width, height));
+            *ws.current_scale.lock().unwrap() = scale_factor;
+            if let Some(inner) = inner {
+              *ws.current_inner_position.lock().unwrap() = Some(inner);
+            }
+            if let Some(outer) = outer {
+              *ws.current_outer_size.lock().unwrap() = Some(outer);
+            }
+            // Creating a window emits several `Resized` events for sizes the
+            // app never asked for. Keep the cache current, but stay silent
+            // until `about_to_wait` has drained that burst.
+            *ws.resize_reporting_armed.lock().unwrap()
+              && prev != Some((width, height))
+          })
+          .unwrap_or(false);
+        if changed {
+          laufey_backend_winit_common::dispatch_resize_event(
+            &state.common.handlers,
+            laufey_id,
+            width,
+            height,
+          );
+        }
       }
       WindowEvent::Moved(PhysicalPosition { x, y }) => {
+        let (x, y) = laufey_backend_winit_common::physical_pos_to_logical_i32(
+          x,
+          y,
+          scale_factor,
+        );
+        let inner = self.windows.get(&laufey_id).and_then(|info| {
+          info.window.inner_position().ok().map(|p| {
+            laufey_backend_winit_common::physical_pos_to_logical_i32(
+              p.x,
+              p.y,
+              scale_factor,
+            )
+          })
+        });
         state.common.with_window(laufey_id, |ws| {
-          *ws.pending_position.lock().unwrap() = Some((x, y));
+          // The authoritative origin, not `pending_position` — that is a
+          // request waiting to be applied, and re-arming it here would make a
+          // later apply move the window back to wherever it was dragged from.
+          *ws.current_position.lock().unwrap() = Some((x, y));
+          if let Some(inner) = inner {
+            *ws.current_inner_position.lock().unwrap() = Some(inner);
+          }
         });
         laufey_backend_winit_common::dispatch_move_event(
           &state.common.handlers,
@@ -304,29 +474,73 @@ impl ApplicationHandler<UserEvent> for App {
         );
       }
       WindowEvent::ModifiersChanged(new_modifiers) => {
-        *modifiers = new_modifiers.state();
+        let prev = self
+          .windows
+          .get(&laufey_id)
+          .map(|info| info.modifiers)
+          .unwrap_or_default();
+        if let Some(info) = self.windows.get_mut(&laufey_id) {
+          info.modifiers = new_modifiers;
+        }
+        // macOS often has no KeyboardInput for modifiers. Emit the same
+        // keydown/keyup CEF / WebView send. Skip KeyboardInput for those
+        // named keys so Windows / Linux do not double-fire.
+        for (pressed, key, code) in
+          laufey_backend_winit_common::modifier_key_edges(&prev, &new_modifiers)
+        {
+          laufey_backend_winit_common::dispatch_raw_keyboard_event(
+            &state.common.handlers,
+            laufey_id,
+            pressed,
+            key,
+            code,
+            new_modifiers.state(),
+            false,
+          );
+        }
       }
       WindowEvent::KeyboardInput {
         event: ref key_event,
         ..
       } => {
-        laufey_backend_winit_common::dispatch_keyboard_event(
-          &state.common.handlers,
-          laufey_id,
-          key_event,
-          *modifiers,
-        );
+        if !laufey_backend_winit_common::is_modifier_named_key(
+          &key_event.logical_key,
+        ) {
+          laufey_backend_winit_common::dispatch_keyboard_event(
+            &state.common.handlers,
+            laufey_id,
+            key_event,
+            modifiers,
+          );
+        }
       }
       WindowEvent::CursorMoved { position, .. } => {
-        state.common.with_window(laufey_id, |ws| {
-          *ws.cursor_position.lock().unwrap() = (position.x, position.y);
-        });
+        let (x, y) = laufey_backend_winit_common::physical_pos_to_logical_f64(
+          position.x,
+          position.y,
+          scale_factor,
+        );
+        let flush_enter = state
+          .common
+          .with_window(laufey_id, |ws| ws.note_cursor_move(x, y))
+          .unwrap_or(false);
+        if flush_enter {
+          state.common.with_window(laufey_id, |ws| {
+            laufey_backend_winit_common::dispatch_cursor_enter_leave_event(
+              &state.common.handlers,
+              ws,
+              laufey_id,
+              true,
+              modifiers,
+            );
+          });
+        }
         laufey_backend_winit_common::dispatch_mouse_move_event(
           &state.common.handlers,
           laufey_id,
-          position.x,
-          position.y,
-          *modifiers,
+          x,
+          y,
+          modifiers,
         );
       }
       WindowEvent::MouseInput {
@@ -334,14 +548,24 @@ impl ApplicationHandler<UserEvent> for App {
         button,
         ..
       } => {
+        let window = self.windows.get(&laufey_id).map(|info| &info.window);
         state.common.with_window(laufey_id, |ws| {
+          // `MouseInput` carries no position, so make sure the cached one is
+          // not behind a move that has yet to be dequeued.
+          if let Some(window) = window {
+            laufey_backend_winit_common::refresh_cursor_position(
+              ws,
+              window,
+              scale_factor,
+            );
+          }
           laufey_backend_winit_common::dispatch_mouse_click_event(
             &state.common.handlers,
             ws,
             laufey_id,
             button_state,
             button,
-            *modifiers,
+            modifiers,
           );
         });
       }
@@ -352,29 +576,33 @@ impl ApplicationHandler<UserEvent> for App {
             ws,
             laufey_id,
             delta,
-            *modifiers,
+            modifiers,
+            scale_factor,
           );
         });
       }
       WindowEvent::CursorEntered { .. } => {
         state.common.with_window(laufey_id, |ws| {
-          laufey_backend_winit_common::dispatch_cursor_enter_leave_event(
-            &state.common.handlers,
-            ws,
-            laufey_id,
-            true,
-            *modifiers,
-          );
+          if ws.note_cursor_entered() {
+            laufey_backend_winit_common::dispatch_cursor_enter_leave_event(
+              &state.common.handlers,
+              ws,
+              laufey_id,
+              true,
+              modifiers,
+            );
+          }
         });
       }
       WindowEvent::CursorLeft { .. } => {
         state.common.with_window(laufey_id, |ws| {
+          ws.note_cursor_left();
           laufey_backend_winit_common::dispatch_cursor_enter_leave_event(
             &state.common.handlers,
             ws,
             laufey_id,
             false,
-            *modifiers,
+            modifiers,
           );
         });
       }
@@ -390,12 +618,48 @@ impl ApplicationHandler<UserEvent> for App {
           focused,
         );
       }
+      WindowEvent::ScaleFactorChanged {
+        scale_factor: new_scale,
+        mut inner_size_writer,
+      } => {
+        // Another monitor (or a DPI change) — keep the DIP size CEF / WebView
+        // keep. Physical pixels follow; a later `Resized` refreshes
+        // `current_size` with the new scale. Do not recompute logical from the
+        // still-old `inner_size()`, or a 2× → 1× move reports half the window.
+        let logical = state
+          .common
+          .with_window(laufey_id, |ws| *ws.current_size.lock().unwrap())
+          .flatten();
+        if let Some((w, h)) = logical {
+          state.common.with_window(laufey_id, |ws| {
+            *ws.current_scale.lock().unwrap() = new_scale;
+          });
+          let physical =
+            LogicalSize::new(w as f64, h as f64).to_physical(new_scale);
+          let _ = inner_size_writer.request_inner_size(physical);
+        } else if let Some(info) = self.windows.get(&laufey_id) {
+          let size = info.window.inner_size();
+          let (width, height) =
+            laufey_backend_winit_common::physical_size_to_logical_i32(
+              size.width,
+              size.height,
+              new_scale,
+            );
+          state.common.with_window(laufey_id, |ws| {
+            *ws.current_size.lock().unwrap() = Some((width, height));
+            *ws.current_scale.lock().unwrap() = new_scale;
+          });
+          laufey_backend_winit_common::dispatch_resize_event(
+            &state.common.handlers,
+            laufey_id,
+            width,
+            height,
+          );
+        }
+      }
 
       WindowEvent::ThemeChanged(_) => {}
       WindowEvent::Destroyed => {}
-      WindowEvent::DroppedFile(_) => {}
-      WindowEvent::HoveredFile(_) => {}
-      WindowEvent::HoveredFileCancelled => {}
       WindowEvent::Ime(_) => {}
 
       WindowEvent::Touch(_)
@@ -408,7 +672,6 @@ impl ApplicationHandler<UserEvent> for App {
       }
       WindowEvent::ActivationTokenDone { .. }
       | WindowEvent::AxisMotion { .. }
-      | WindowEvent::ScaleFactorChanged { .. }
       | WindowEvent::Occluded(_)
       | WindowEvent::RedrawRequested => {
         // wont implement
@@ -418,6 +681,9 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+  // LAUFEY_CWD is only for the Windows CEF host behind CEF's bootstrap
+  // (cef/src/main_windows.cc); never pass it on to what the app starts.
+  std::env::remove_var("LAUFEY_CWD");
   let event_loop = EventLoop::with_user_event()
     .build()
     .expect("Failed to create EventLoop");
@@ -431,5 +697,21 @@ fn main() -> Result<(), Box<dyn Error>> {
   laufey_backend_winit_common::load_and_start_runtime(create_backend_api());
 
   let mut app = App::new();
-  Ok(event_loop.run_app(&mut app)?)
+  let result = event_loop.run_app(&mut app);
+  // The loop ended (last window closed, or quit()): let the runtime shut
+  // down, like the CEF and WebView backends do.
+  laufey_backend_winit_common::shutdown_runtime(
+    std::time::Duration::from_secs(5),
+  );
+  // exit_app (API 46) asked for an exit code.
+  if let Some(code) =
+    laufey_backend_winit_common::window_api::requested_exit_code()
+  {
+    result?;
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code);
+  }
+  Ok(result?)
 }

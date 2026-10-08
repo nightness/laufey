@@ -4,6 +4,14 @@
 
 #include "laufey_backend_common.h"
 #include "laufey_external_links.h"
+#include "laufey_platform_features.h"
+#include "laufey_title_bar.h"
+#if defined(__linux__) || defined(__APPLE__)
+#include "laufey_secret_store.h"
+#endif
+#include "laufey_auth_session.h"
+#include "laufey_ui_tasks.h"
+#include "laufey_window.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -16,7 +24,12 @@
 #endif
 
 #ifdef __APPLE__
+#include <TargetConditionals.h>
 #include <mach-o/dyld.h>
+#endif
+
+#if defined(__linux__)
+#include "laufey_io.h"
 #endif
 
 #include <iostream>
@@ -138,6 +151,15 @@ static void Backend_Quit(void* data) {
   }
 }
 
+// exit_app (API 46): quit() with an exit code. The host returns it once its
+// loop has ended and the web views are released (on Windows through
+// laufey_common::EndProcess), and Shutdown doesn't wait for a runtime thread
+// that may be blocked for good in its exit().
+static void Backend_ExitApp(void* data, int exit_code) {
+  laufey_common::MarkExitRequested(exit_code);
+  Backend_Quit(data);
+}
+
 static void Backend_SetWindowSize(void* data, uint32_t window_id, int width,
                                   int height) {
   RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
@@ -156,6 +178,15 @@ static void Backend_GetWindowSize(void* data, uint32_t window_id, int* width,
   }
 }
 
+static void Backend_GetWindowOuterSize(void* data, uint32_t window_id,
+                                       int* width, int* height) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  LaufeyBackend* backend = loader->GetBackend();
+  if (backend) {
+    backend->GetWindowOuterSize(window_id, width, height);
+  }
+}
+
 static void Backend_SetWindowPosition(void* data, uint32_t window_id, int x,
                                       int y) {
   RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
@@ -171,6 +202,15 @@ static void Backend_GetWindowPosition(void* data, uint32_t window_id, int* x,
   LaufeyBackend* backend = loader->GetBackend();
   if (backend) {
     backend->GetWindowPosition(window_id, x, y);
+  }
+}
+
+static void Backend_GetWindowInnerPosition(void* data, uint32_t window_id,
+                                           int* x, int* y) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  LaufeyBackend* backend = loader->GetBackend();
+  if (backend) {
+    backend->GetWindowInnerPosition(window_id, x, y);
   }
 }
 
@@ -224,6 +264,15 @@ static double Backend_GetWindowOpacity(void* data, uint32_t window_id) {
   LaufeyBackend* backend = loader->GetBackend();
   if (backend) {
     return backend->GetWindowOpacity(window_id);
+  }
+  return 1.0;
+}
+
+static double Backend_GetWindowScaleFactor(void* data, uint32_t window_id) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  LaufeyBackend* backend = loader->GetBackend();
+  if (backend) {
+    return backend->GetWindowScaleFactor(window_id);
   }
   return 1.0;
 }
@@ -312,11 +361,20 @@ static void Backend_SetJsCallHandler(void* data, laufey_js_call_fn handler,
   loader->SetJsCallHandler(handler, user_data);
 }
 
+static void Backend_SetJsCallHandlerEx(void* data, laufey_js_call_ex_fn handler,
+                                       void* user_data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  loader->SetJsCallHandlerEx(handler, user_data);
+}
+
 static void Backend_JsCallRespond(void* data, uint64_t call_id,
                                   laufey_value_t* result,
                                   laufey_value_t* error) {
   RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
-  uint32_t window_id = loader->ConsumeCallWindow(call_id);
+  // An id this backend never issued, or a second answer, reaches nothing.
+  laufey_common::JsCallRoute route;
+  if (!loader->TakeJsCall(call_id, &route))
+    return;
   laufey::ValuePtr resultPtr =
       (result && result->value) ? result->value : laufey::Value::Null();
   // Keep the absent-error case as a genuine null pointer. RespondToJsCall on
@@ -324,7 +382,8 @@ static void Backend_JsCallRespond(void* data, uint64_t call_id,
   // fabricating a Value::Null() here would make every response look like a
   // rejection and resolve the JS promise with null.
   laufey::ValuePtr errorPtr = (error && error->value) ? error->value : nullptr;
-  loader->JsCallRespond(window_id, call_id, resultPtr, errorPtr);
+  loader->JsCallRespond(route.window_id, route.page_call_id, resultPtr,
+                        errorPtr);
 }
 
 // --- Custom URL scheme handling ---
@@ -645,6 +704,467 @@ static void Backend_SetDockReopenHandler(void* data,
   }
 }
 
+// --- Deep links / custom URL schemes (macOS only) ---
+#if defined(__APPLE__)
+
+static void Backend_SetOpenUrlHandler(void* data, laufey_open_url_fn handler,
+                                      void* user_data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend()) {
+    backend->SetOpenUrlHandler(handler, user_data);
+  }
+}
+
+static bool Backend_TestTriggerOpenUrl(void* data, const char* url) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend()) {
+    return backend->TestTriggerOpenUrl(url);
+  }
+  return false;
+}
+
+#endif  // defined(__APPLE__)
+
+// --- Single instance ---
+
+static void Backend_SetSecondInstanceHandler(void* data,
+                                             laufey_second_instance_fn handler,
+                                             void* user_data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend()) {
+    backend->SetSecondInstanceHandler(handler, user_data);
+  }
+}
+
+// --- Passkeys ---
+
+static uint32_t Backend_PasskeyCapabilities(void* data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->PasskeyCapabilities();
+  return 0;
+}
+
+static void Backend_PasskeyRequest(void* data, uint32_t window_id,
+                                   uint32_t kind, const char* options_json,
+                                   laufey_passkey_result_fn callback,
+                                   void* user_data) {
+  if (!callback)
+    return;
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend()) {
+    backend->PasskeyRequest(window_id, kind, options_json, callback, user_data);
+  } else {
+    callback(user_data,
+             "{\"ok\":false,\"error\":{\"code\":\"unknown\","
+             "\"message\":\"backend not initialized\"}}");
+  }
+}
+
+// --- Drag and drop, file dialogs, rich clipboard (API >= 39) ---
+
+static LaufeyBackend* BackendOf(void* data) {
+  return static_cast<RuntimeLoader*>(data)->GetBackend();
+}
+
+static void Backend_SetFileDropHandler(void* data, laufey_file_drop_fn handler,
+                                       void* user_data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    backend->SetFileDropHandler(handler, user_data);
+}
+
+static bool Backend_TestTriggerFileDrop(void* data, uint32_t window_id,
+                                        int phase, double x, double y,
+                                        const char* const* paths,
+                                        size_t count) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->TestTriggerFileDrop(window_id, phase, x, y, paths, count);
+  return false;
+}
+
+static void Backend_StartFileDrag(void* data, uint32_t window_id,
+                                  const char* const* paths, size_t count,
+                                  const uint8_t* icon_png, size_t icon_len,
+                                  laufey_drag_result_fn callback,
+                                  void* user_data) {
+  if (LaufeyBackend* backend = BackendOf(data)) {
+    backend->StartFileDrag(window_id, paths, count, icon_png, icon_len,
+                           callback, user_data);
+  } else if (callback) {
+    callback(user_data, LAUFEY_DRAG_RESULT_FAILED);
+  }
+}
+
+static uint32_t Backend_ShowFileDialog(
+    void* data, uint32_t window_id, const laufey_file_dialog_options_t* options,
+    laufey_file_dialog_result_fn callback, void* user_data) {
+  if (!callback)
+    return 0;
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->ShowFileDialog(window_id, options, callback, user_data);
+  callback(user_data, 0, LAUFEY_FILE_DIALOG_FAILED, nullptr, 0);
+  return 0;
+}
+
+static bool Backend_CancelFileDialog(void* data, uint32_t dialog_id) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->CancelFileDialog(dialog_id);
+  return false;
+}
+
+static bool Backend_TestFileDialogRespond(void* data, int action,
+                                          const char* path) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->TestFileDialogRespond(action, path);
+  return false;
+}
+
+static uint32_t Backend_ClipboardCapabilities(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->ClipboardCapabilities();
+  return 0;
+}
+
+static char* Backend_ReadClipboardHtml(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->ReadClipboardHtml();
+  return nullptr;
+}
+
+static bool Backend_WriteClipboardHtml(void* data, const char* html,
+                                       const char* text_or_null) {
+  if (!html)
+    return false;
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->WriteClipboardHtml(html, text_or_null);
+  return false;
+}
+
+static uint8_t* Backend_ReadClipboardImage(void* data, size_t* len_out) {
+  if (len_out)
+    *len_out = 0;
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->ReadClipboardImage(len_out);
+  return nullptr;
+}
+
+static bool Backend_WriteClipboardImage(void* data, const uint8_t* png,
+                                        size_t len) {
+  if (!png || len == 0)
+    return false;
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->WriteClipboardImage(png, len);
+  return false;
+}
+
+static char* Backend_ReadClipboardFormats(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->ReadClipboardFormats();
+  return nullptr;
+}
+
+static void Backend_SetClipboardChangeHandler(void* data,
+                                              laufey_clipboard_change_fn fn,
+                                              void* user_data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    backend->SetClipboardChangeHandler(fn, user_data);
+}
+
+static void Backend_BufferFree(void* /*data*/, void* buffer) {
+  free(buffer);
+}
+
+// --- Global shortcuts, launch at login, DevTools (API >= 40) ---
+
+static uint32_t Backend_SystemCapabilities(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->SystemCapabilities();
+  return 0;
+}
+
+static void Backend_SetShortcutHandler(void* data, laufey_shortcut_fn handler,
+                                       void* user_data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    backend->SetShortcutHandler(handler, user_data);
+}
+
+static void Backend_RegisterShortcut(void* data, const char* accelerator,
+                                     laufey_shortcut_result_fn callback,
+                                     void* user_data) {
+  if (LaufeyBackend* backend = BackendOf(data)) {
+    backend->RegisterShortcut(accelerator, callback, user_data);
+  } else if (callback) {
+    callback(user_data, LAUFEY_SHORTCUT_NOT_SUPPORTED, nullptr);
+  }
+}
+
+static bool Backend_UnregisterShortcut(void* data, const char* accelerator) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->UnregisterShortcut(accelerator);
+  return false;
+}
+
+static void Backend_UnregisterAllShortcuts(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    backend->UnregisterAllShortcuts();
+}
+
+static char* Backend_ListShortcuts(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->ListShortcuts();
+  return nullptr;
+}
+
+static char* Backend_PlatformFeatures(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->PlatformFeatures();
+  return nullptr;
+}
+
+static char* Backend_TrayUnavailableReason(void* /*data*/) {
+  return laufey_common::TrayUnavailableReasonForAbi();
+}
+
+// On Linux it fires on the GTK main thread (it runs the default GLib main
+// context, where the probe's NameOwnerChanged subscription delivers).
+static void Backend_SetPlatformFeaturesChangedHandler(
+    void* /*data*/, laufey_platform_features_changed_fn handler,
+    void* user_data) {
+  laufey_common::SetPlatformFeaturesChangedHandler(handler, user_data);
+}
+
+// Title bar preferences (API 47). The change handler fires on the
+// watcher's own thread (Linux, Windows) or the main thread (macOS).
+static char* Backend_TitleBarPreferences(void* /*data*/) {
+  return laufey_common::TitleBarPreferencesJsonForAbi();
+}
+
+static void Backend_SetTitleBarPreferencesChangedHandler(
+    void* /*data*/, laufey_title_bar_preferences_changed_fn handler,
+    void* user_data) {
+  laufey_common::SetTitleBarPreferencesChangedHandler(handler, user_data);
+}
+
+static char* Backend_CanonicalizeAccelerator(void* data,
+                                             const char* accelerator) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->CanonicalizeAccelerator(accelerator);
+  return nullptr;
+}
+
+static bool Backend_TestTriggerShortcut(void* data, const char* accelerator) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->TestTriggerShortcut(accelerator);
+  return false;
+}
+
+static int Backend_GetLaunchAtLogin(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->GetLaunchAtLogin();
+  return LAUFEY_LOGIN_ITEM_NOT_SUPPORTED;
+}
+
+static int Backend_SetLaunchAtLogin(void* data, bool enabled,
+                                    char** error_out) {
+  if (error_out)
+    *error_out = nullptr;
+  LaufeyBackend* backend = BackendOf(data);
+  if (!backend)
+    return LAUFEY_LOGIN_ITEM_NOT_SUPPORTED;
+  std::string error;
+  int state = backend->SetLaunchAtLogin(enabled, &error);
+  if (state == LAUFEY_LOGIN_ITEM_FAILED && error_out && !error.empty()) {
+    char* copy = static_cast<char*>(malloc(error.size() + 1));
+    if (copy) {
+      memcpy(copy, error.c_str(), error.size() + 1);
+      *error_out = copy;
+    }
+  }
+  return state;
+}
+
+static void Backend_CloseDevTools(void* data, uint32_t window_id) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    backend->CloseDevTools(window_id);
+}
+
+static bool Backend_IsDevToolsOpen(void* data, uint32_t window_id) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->IsDevToolsOpen(window_id);
+  return false;
+}
+
+static bool Backend_IsDevToolsEnabled(void* data, uint32_t window_id) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->IsDevToolsEnabled(window_id);
+  return false;
+}
+
+// --- Window state, constraints, screens and chrome (API >= 38) ---
+
+static uint32_t Backend_WindowCapabilities(void* data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->WindowCapabilities();
+  return 0;
+}
+
+static void Backend_SetWindowState(void* data, uint32_t window_id, int action) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    backend->SetWindowState(window_id, action);
+}
+
+static uint32_t Backend_GetWindowState(void* data, uint32_t window_id) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->GetWindowState(window_id);
+  return 0;
+}
+
+static void Backend_SetWindowStateHandler(void* data,
+                                          laufey_window_state_fn handler,
+                                          void* user_data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    backend->SetWindowStateHandler(handler, user_data);
+}
+
+static void Backend_SetWindowSizeConstraints(void* data, uint32_t window_id,
+                                             int min_width, int min_height,
+                                             int max_width, int max_height) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    backend->SetWindowSizeConstraints(window_id, min_width, min_height,
+                                      max_width, max_height);
+}
+
+static void Backend_GetWindowSizeConstraints(void* data, uint32_t window_id,
+                                             int* min_width, int* min_height,
+                                             int* max_width, int* max_height) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend()) {
+    backend->GetWindowSizeConstraints(window_id, min_width, min_height,
+                                      max_width, max_height);
+    return;
+  }
+  for (int* p : {min_width, min_height, max_width, max_height}) {
+    if (p)
+      *p = 0;
+  }
+}
+
+static size_t Backend_GetScreens(void* data, laufey_screen_t* out,
+                                 size_t capacity) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->GetScreens(out, capacity);
+  return 0;
+}
+
+static int64_t Backend_GetWindowScreen(void* data, uint32_t window_id) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->GetWindowScreen(window_id);
+  return 0;
+}
+
+static void Backend_SetDisplayChangedHandler(void* data,
+                                             laufey_display_changed_fn handler,
+                                             void* user_data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    backend->SetDisplayChangedHandler(handler, user_data);
+}
+
+static bool Backend_SetWindowTitlebarStyle(void* data, uint32_t window_id,
+                                           int style) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->SetWindowTitlebarStyle(window_id, style);
+  return false;
+}
+
+static bool Backend_SetWindowTrafficLightPosition(void* data,
+                                                  uint32_t window_id, int x,
+                                                  int y) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->SetWindowTrafficLightPosition(window_id, x, y);
+  return false;
+}
+
+static bool Backend_SetWindowBackdrop(void* data, uint32_t window_id,
+                                      int backdrop, int material) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->SetWindowBackdrop(window_id, backdrop, material);
+  return false;
+}
+
+static bool Backend_GetWindowNormalBounds(void* data, uint32_t window_id,
+                                          int* x, int* y, int* width,
+                                          int* height) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->GetWindowNormalBounds(window_id, x, y, width, height);
+  return false;
+}
+
+static void Backend_SetQuitOnLastWindowClosed(void* data, bool quit) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    backend->SetQuitOnLastWindowClosed(quit);
+}
+
+// --- UI-thread tasks (API >= 42) ---
+
+static void Backend_DispatchUiTask(void* /*data*/, laufey_ui_task_fn task,
+                                   void* task_data) {
+  laufey_common::UiTaskDispatcher::Get().Dispatch(task, task_data);
+}
+
+static bool Backend_IsUiThread(void* /*data*/) {
+  return laufey_common::UiTaskDispatcher::Get().IsUiThread();
+}
+
+// --- Auth session (API >= 42) ---
+
+static uint32_t Backend_AuthSessionCapabilities(void* data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend())
+    return backend->AuthSessionCapabilities();
+  return 0;
+}
+
+static void Backend_AuthSessionStart(void* data, uint32_t window_id,
+                                     const char* url, const char* callback,
+                                     uint32_t flags,
+                                     laufey_auth_session_result_fn on_result,
+                                     void* user_data) {
+  if (!on_result)
+    return;
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  if (LaufeyBackend* backend = loader->GetBackend()) {
+    backend->AuthSessionStart(window_id, url, callback, flags, on_result,
+                              user_data);
+  } else {
+    on_result(user_data, LAUFEY_AUTH_SESSION_FAILED, "backend not initialized");
+  }
+}
+
+static bool Backend_TestCancelAuthSession(void* /*data*/) {
+  return laufey_common::AuthSessionCancelCurrent(
+      "the user cancelled the sign-in");
+}
+
+// API >= 43: the app cancels the running session (no session runs off
+// macOS, so it answers false there).
+static bool Backend_AuthSessionCancel(void* /*data*/) {
+  return laufey_common::AuthSessionCancelCurrent(
+      "the app cancelled the sign-in");
+}
+
 // --- Tray / status bar ---
 
 static uint32_t Backend_CreateTrayIcon(void* data) {
@@ -678,6 +1198,42 @@ static void Backend_SetTrayTooltip(void* data, uint32_t tray_id,
 // independent — the shared registry in backend-common holds the handlers.
 static bool Backend_TestClickMenuItem(void* /*data*/, const char* item_id) {
   return laufey_common::TestClickMenuItem(item_id);
+}
+
+static void InjectKey(void* ctx, uint32_t window_id, int state, const char* key,
+                      const char* code, uint32_t modifiers, bool repeat) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchKeyboardEvent(
+      window_id, state, key, code, modifiers, repeat);
+}
+static void InjectClick(void* ctx, uint32_t window_id, int state, int button,
+                        double x, double y, uint32_t modifiers,
+                        int32_t click_count) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchMouseClickEvent(
+      window_id, state, button, x, y, modifiers, click_count);
+}
+static void InjectMove(void* ctx, uint32_t window_id, double x, double y,
+                       uint32_t modifiers) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchMouseMoveEvent(window_id, x, y,
+                                                           modifiers);
+}
+static void InjectWheel(void* ctx, uint32_t window_id, double delta_x,
+                        double delta_y, double x, double y, uint32_t modifiers,
+                        int32_t delta_mode) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchWheelEvent(
+      window_id, delta_x, delta_y, x, y, modifiers, delta_mode);
+}
+static void InjectEnterLeave(void* ctx, uint32_t window_id, int entered,
+                             double x, double y, uint32_t modifiers) {
+  static_cast<RuntimeLoader*>(ctx)->DispatchCursorEnterLeaveEvent(
+      window_id, entered, x, y, modifiers);
+}
+
+static bool Backend_TestInjectInput(void* data, uint32_t window_id,
+                                    const laufey_test_input_t* event) {
+  laufey_common::TestInjectSink sink = {
+      InjectKey, InjectClick, InjectMove, InjectWheel, InjectEnterLeave, data,
+  };
+  return laufey_common::TestInjectInput(window_id, event, sink);
 }
 
 static void Backend_SetTrayMenu(void* data, uint32_t tray_id,
@@ -756,6 +1312,81 @@ static void Backend_RequestPermission(void* data, int kind,
   }
 }
 
+// --- Menus and notifications (API >= 41) ---
+
+static uint32_t Backend_MenuCapabilities(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->MenuCapabilities();
+  return 0;
+}
+
+static void Backend_ShowContextMenuEx(void* data, uint32_t window_id, int x,
+                                      int y, laufey_value_t* menu_template,
+                                      laufey_menu_click_fn on_click,
+                                      void* on_click_data,
+                                      laufey_menu_closed_fn on_closed,
+                                      void* on_closed_data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  LaufeyBackend* backend = loader->GetBackend();
+  if (!backend || !menu_template) {
+    if (on_closed)
+      on_closed(on_closed_data, window_id);
+    return;
+  }
+  // Every backend parses the template before returning; it is ours to free.
+  backend->ShowContextMenuEx(window_id, x, y, menu_template,
+                             &loader->GetBackendApi(), on_click, on_click_data,
+                             on_closed, on_closed_data);
+  loader->GetBackendApi().value_free(menu_template);
+}
+
+static bool Backend_TestDismissContextMenu(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->TestDismissContextMenu();
+  return false;
+}
+
+static bool Backend_TestTriggerMenuAccelerator(void* data, uint32_t window_id,
+                                               const char* accelerator) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->TestTriggerMenuAccelerator(window_id, accelerator);
+  return false;
+}
+
+static uint32_t Backend_NotificationCapabilities(void* data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->NotificationCapabilities();
+  return 0;
+}
+
+static void Backend_SetNotificationResponseHandler(
+    void* data, laufey_notification_response_fn handler, void* user_data) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    backend->SetNotificationResponseHandler(handler, user_data);
+}
+
+static void Backend_ListScheduledNotifications(void* data,
+                                               laufey_notification_list_fn cb,
+                                               void* user_data) {
+  if (LaufeyBackend* backend = BackendOf(data)) {
+    backend->ListScheduledNotifications(cb, user_data);
+  } else if (cb) {
+    cb(user_data, "[]");
+  }
+}
+
+static void Backend_CancelNotification(void* data, const char* tag) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    backend->CancelNotification(tag);
+}
+
+static bool Backend_TestNotificationRespond(void* data, const char* tag,
+                                            const char* action_id) {
+  if (LaufeyBackend* backend = BackendOf(data))
+    return backend->TestNotificationRespond(tag, action_id);
+  return false;
+}
+
 void RuntimeLoader::InitializeBackendApi() {
   memset(&backend_api_, 0, sizeof(backend_api_));
   backend_api_.version = LAUFEY_API_VERSION;
@@ -768,14 +1399,17 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.quit = Backend_Quit;
   backend_api_.set_window_size = Backend_SetWindowSize;
   backend_api_.get_window_size = Backend_GetWindowSize;
+  backend_api_.get_window_outer_size = Backend_GetWindowOuterSize;
   backend_api_.set_window_position = Backend_SetWindowPosition;
   backend_api_.get_window_position = Backend_GetWindowPosition;
+  backend_api_.get_window_inner_position = Backend_GetWindowInnerPosition;
   backend_api_.set_resizable = Backend_SetResizable;
   backend_api_.is_resizable = Backend_IsResizable;
   backend_api_.set_always_on_top = Backend_SetAlwaysOnTop;
   backend_api_.is_always_on_top = Backend_IsAlwaysOnTop;
   backend_api_.set_window_opacity = Backend_SetWindowOpacity;
   backend_api_.get_window_opacity = Backend_GetWindowOpacity;
+  backend_api_.get_window_scale_factor = Backend_GetWindowScaleFactor;
   backend_api_.set_click_passthrough = Backend_SetClickPassthrough;
   backend_api_.is_click_passthrough = Backend_IsClickPassthrough;
   backend_api_.set_click_passthrough_forward =
@@ -791,6 +1425,39 @@ void RuntimeLoader::InitializeBackendApi() {
 
   backend_api_.set_js_call_handler = Backend_SetJsCallHandler;
   backend_api_.js_call_respond = Backend_JsCallRespond;
+  backend_api_.set_js_call_handler_ex = Backend_SetJsCallHandlerEx;
+  backend_api_.platform_features = Backend_PlatformFeatures;
+  backend_api_.tray_unavailable_reason = Backend_TrayUnavailableReason;
+  backend_api_.set_platform_features_changed_handler =
+      Backend_SetPlatformFeaturesChangedHandler;
+  backend_api_.exit_app = Backend_ExitApp;
+  backend_api_.title_bar_preferences = Backend_TitleBarPreferences;
+  backend_api_.set_title_bar_preferences_changed_handler =
+      Backend_SetTitleBarPreferencesChangedHandler;
+#if defined(__linux__) || (defined(__APPLE__) && !TARGET_OS_IPHONE)
+  // The secure store (API 47): the Secret Service through libsecret on
+  // Linux, the Keychain (Security.framework, items only this app may read
+  // without a prompt; see docs/secure-store.md) on macOS. Windows keeps NULL
+  // (its Credential Locker is the embedder's).
+  backend_api_.secret_lookup = [](void*, const char* service,
+                                  const char* account, uint32_t timeout_ms,
+                                  char** value, char** reason) {
+    return laufey_common::SecretLookupForAbi(service, account, timeout_ms,
+                                             value, reason);
+  };
+  backend_api_.secret_store =
+      [](void*, const char* service, const char* account, const char* label,
+         const char* value, uint32_t timeout_ms, char** reason) {
+        return laufey_common::SecretStoreForAbi(service, account, label, value,
+                                                timeout_ms, reason);
+      };
+  backend_api_.secret_delete = [](void*, const char* service,
+                                  const char* account, uint32_t timeout_ms,
+                                  char** reason) {
+    return laufey_common::SecretDeleteForAbi(service, account, timeout_ms,
+                                             reason);
+  };
+#endif
 
   backend_api_.register_scheme_handler = Backend_RegisterSchemeHandler;
   backend_api_.scheme_request_read_body = Backend_SchemeRequestReadBody;
@@ -832,6 +1499,26 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.close_window = Backend_CloseWindow;
   backend_api_.set_close_requested_handler = Backend_SetCloseRequestedHandler;
   backend_api_.test_trigger_close_requested = Backend_TestTriggerCloseRequested;
+  backend_api_.test_inject_input = Backend_TestInjectInput;
+
+  // Window state, constraints, screens and chrome (API >= 38): see
+  // docs/window-management.md for what each OS / backend supports.
+  backend_api_.set_window_state = Backend_SetWindowState;
+  backend_api_.get_window_state = Backend_GetWindowState;
+  backend_api_.set_window_state_handler = Backend_SetWindowStateHandler;
+  backend_api_.set_window_size_constraints = Backend_SetWindowSizeConstraints;
+  backend_api_.get_window_size_constraints = Backend_GetWindowSizeConstraints;
+  backend_api_.get_screens = Backend_GetScreens;
+  backend_api_.get_window_screen = Backend_GetWindowScreen;
+  backend_api_.set_display_changed_handler = Backend_SetDisplayChangedHandler;
+  backend_api_.window_capabilities = Backend_WindowCapabilities;
+  backend_api_.set_window_titlebar_style = Backend_SetWindowTitlebarStyle;
+  backend_api_.set_window_traffic_light_position =
+      Backend_SetWindowTrafficLightPosition;
+  backend_api_.set_window_backdrop = Backend_SetWindowBackdrop;
+  backend_api_.get_window_normal_bounds = Backend_GetWindowNormalBounds;
+  backend_api_.set_quit_on_last_window_closed =
+      Backend_SetQuitOnLastWindowClosed;
   backend_api_.set_page_load_handler = Backend_SetPageLoadHandler;
   backend_api_.show_dialog = Backend_ShowDialog;
   backend_api_.string_free = Backend_StringFree;
@@ -843,6 +1530,60 @@ void RuntimeLoader::InitializeBackendApi() {
   backend_api_.set_dock_menu = Backend_SetDockMenu;
   backend_api_.set_dock_visible = Backend_SetDockVisible;
   backend_api_.set_dock_reopen_handler = Backend_SetDockReopenHandler;
+
+  // Deep links are macOS-only (see set_open_url_handler in laufey.h). Leave
+  // the pointers NULL elsewhere so an embedder can detect the absence rather
+  // than register a handler that silently never fires.
+#if defined(__APPLE__)
+  backend_api_.set_open_url_handler = Backend_SetOpenUrlHandler;
+  backend_api_.test_trigger_open_url = Backend_TestTriggerOpenUrl;
+#endif
+
+  // Single instance (API >= 36): see docs/deep-links.md. The desktop
+  // backends implement it on every OS; iOS keeps the no-op default.
+  backend_api_.set_second_instance_handler = Backend_SetSecondInstanceHandler;
+
+  // Passkeys (API >= 37): see docs/passkeys.md. macOS and Windows run real
+  // ceremonies; Linux and iOS answer not_supported.
+  backend_api_.passkey_capabilities = Backend_PasskeyCapabilities;
+  backend_api_.passkey_request = Backend_PasskeyRequest;
+
+  // Drag and drop, file dialogs and the rich clipboard (API >= 39): see
+  // docs/drag-and-drop.md, docs/file-dialogs.md, docs/clipboard.md. The
+  // desktop backends implement them over backend-common; iOS keeps the
+  // unsupported defaults.
+  backend_api_.set_file_drop_handler = Backend_SetFileDropHandler;
+  backend_api_.start_file_drag = Backend_StartFileDrag;
+  backend_api_.test_trigger_file_drop = Backend_TestTriggerFileDrop;
+  backend_api_.show_file_dialog = Backend_ShowFileDialog;
+  backend_api_.cancel_file_dialog = Backend_CancelFileDialog;
+  backend_api_.test_file_dialog_respond = Backend_TestFileDialogRespond;
+  backend_api_.clipboard_capabilities = Backend_ClipboardCapabilities;
+  backend_api_.read_clipboard_html = Backend_ReadClipboardHtml;
+  backend_api_.write_clipboard_html = Backend_WriteClipboardHtml;
+  backend_api_.read_clipboard_image = Backend_ReadClipboardImage;
+  backend_api_.write_clipboard_image = Backend_WriteClipboardImage;
+  backend_api_.read_clipboard_formats = Backend_ReadClipboardFormats;
+  backend_api_.set_clipboard_change_handler = Backend_SetClipboardChangeHandler;
+  backend_api_.buffer_free = Backend_BufferFree;
+
+  // Global shortcuts, launch at login, DevTools (API >= 40): see
+  // docs/global-shortcuts.md, docs/launch-at-login.md, docs/devtools.md. The
+  // desktop backends implement them over backend-common; iOS keeps the
+  // unsupported defaults.
+  backend_api_.system_capabilities = Backend_SystemCapabilities;
+  backend_api_.set_shortcut_handler = Backend_SetShortcutHandler;
+  backend_api_.register_shortcut = Backend_RegisterShortcut;
+  backend_api_.unregister_shortcut = Backend_UnregisterShortcut;
+  backend_api_.unregister_all_shortcuts = Backend_UnregisterAllShortcuts;
+  backend_api_.list_shortcuts = Backend_ListShortcuts;
+  backend_api_.canonicalize_accelerator = Backend_CanonicalizeAccelerator;
+  backend_api_.test_trigger_shortcut = Backend_TestTriggerShortcut;
+  backend_api_.get_launch_at_login = Backend_GetLaunchAtLogin;
+  backend_api_.set_launch_at_login = Backend_SetLaunchAtLogin;
+  backend_api_.close_devtools = Backend_CloseDevTools;
+  backend_api_.is_devtools_open = Backend_IsDevToolsOpen;
+  backend_api_.is_devtools_enabled = Backend_IsDevToolsEnabled;
 
   backend_api_.create_tray_icon = Backend_CreateTrayIcon;
   backend_api_.destroy_tray_icon = Backend_DestroyTrayIcon;
@@ -860,6 +1601,30 @@ void RuntimeLoader::InitializeBackendApi() {
 
   backend_api_.query_permission = Backend_QueryPermission;
   backend_api_.request_permission = Backend_RequestPermission;
+
+  // Menus and notifications (API >= 41): see docs/menus.md and
+  // docs/notifications.md. iOS keeps the unsupported defaults.
+  backend_api_.menu_capabilities = Backend_MenuCapabilities;
+  backend_api_.show_context_menu_ex = Backend_ShowContextMenuEx;
+  backend_api_.test_dismiss_context_menu = Backend_TestDismissContextMenu;
+  backend_api_.test_trigger_menu_accelerator =
+      Backend_TestTriggerMenuAccelerator;
+  backend_api_.notification_capabilities = Backend_NotificationCapabilities;
+  backend_api_.set_notification_response_handler =
+      Backend_SetNotificationResponseHandler;
+  backend_api_.list_scheduled_notifications =
+      Backend_ListScheduledNotifications;
+  backend_api_.cancel_notification = Backend_CancelNotification;
+  backend_api_.test_notification_respond = Backend_TestNotificationRespond;
+
+  // UI-thread tasks and auth sessions (API >= 42): see docs/c-abi.md and
+  // docs/auth-session.md. The dispatcher is bound to the UI thread in Load.
+  backend_api_.dispatch_ui_task = Backend_DispatchUiTask;
+  backend_api_.is_ui_thread = Backend_IsUiThread;
+  backend_api_.auth_session_capabilities = Backend_AuthSessionCapabilities;
+  backend_api_.auth_session_start = Backend_AuthSessionStart;
+  backend_api_.test_cancel_auth_session = Backend_TestCancelAuthSession;
+  backend_api_.auth_session_cancel = Backend_AuthSessionCancel;
 }
 
 RuntimeLoader::RuntimeLoader() {
@@ -887,6 +1652,21 @@ RuntimeLoader* RuntimeLoader::GetInstance() {
 }
 
 bool RuntimeLoader::Load(const std::string& path) {
+  // Load runs on the UI thread (each host's main thread, which runs the
+  // backend's loop): bind dispatch_ui_task's queue to it before the runtime
+  // can dispatch anything.
+  laufey_common::UiTaskDispatcher::Get().Bind(
+      [this](void (*task)(void*), void* task_data) {
+        LaufeyBackend* backend = GetBackend();
+        if (!backend)
+          return false;  // a headless worker has no UI thread
+        return backend->PostUiTask(task, task_data);
+      });
+#if defined(__linux__)
+  // Deno.exit() ends the process from the runtime thread: keep the UI thread
+  // from drawing while exit tears the libraries down.
+  laufey_common::InstallUiExitGuard();
+#endif
 #ifndef _WIN32
   library_handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!library_handle_) {
@@ -980,6 +1760,7 @@ void RuntimeLoader::RuntimeThread() {
     std::cerr << "Runtime start returned error: " << result << std::endl;
   }
   running_ = false;
+  runtime_exit_.Done();
 }
 
 void RuntimeLoader::Shutdown() {
@@ -988,7 +1769,26 @@ void RuntimeLoader::Shutdown() {
   }
 
   if (runtime_thread_.joinable()) {
-    runtime_thread_.join();
+    // The app asked to exit (exit_app): its thread may never return (an
+    // exit() that blocks for good, as Deno.exit()), and the process ends
+    // with the code it asked for without it. A runtime that does return is
+    // given a moment to.
+    if (laufey_common::ExitRequested() &&
+        !runtime_exit_.WaitFor(kRuntimeExitGrace)) {
+      runtime_thread_.detach();
+      return;
+    }
+    // The loop has ended (UiLoopEnded), so the runtime's synchronous UI calls
+    // already return. A runtime that still ignores the shutdown is abandoned
+    // after the timeout, as on Winit, rather than hanging the exit.
+    if (runtime_exit_.WaitFor(kRuntimeShutdownTimeout)) {
+      runtime_thread_.join();
+    } else {
+      std::cerr << "laufey: the runtime did not stop within "
+                << kRuntimeShutdownTimeout.count()
+                << " ms of shutdown; exiting without it" << std::endl;
+      runtime_thread_.detach();
+    }
   }
 }
 
@@ -1005,6 +1805,18 @@ void RuntimeLoader::SetSchemeRequestHandler(const std::string& scheme,
   if (handler && backend_) {
     backend_->RegisterSchemeHandler(scheme);
   }
+}
+
+void RuntimeLoader::DispatchSchemeCancel(SchemeExchangeBase* exchange) {
+  laufey_scheme_cancel_fn on_cancel;
+  void* user_data;
+  {
+    std::lock_guard<std::mutex> lock(scheme_mutex_);
+    on_cancel = scheme_cancel_handler_;
+    user_data = scheme_user_data_;
+  }
+  if (on_cancel)
+    on_cancel(user_data, reinterpret_cast<laufey_scheme_exchange_t*>(exchange));
 }
 
 void RuntimeLoader::DispatchSchemeRequest(uint32_t window_id,
@@ -1030,13 +1842,33 @@ void RuntimeLoader::DispatchSchemeRequest(uint32_t window_id,
   }
 }
 
-void RuntimeLoader::OnJsCall(uint32_t window_id, uint64_t call_id,
+const laufey_common::BridgeOriginPolicy& RuntimeLoader::BridgePolicy() const {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // The iOS shell has no launch file.
+  static const laufey_common::BridgeOriginPolicy unrestricted;
+  return unrestricted;
+#else
+  return laufey_common::ProcessBridgeOriginPolicy();
+#endif
+}
+
+void RuntimeLoader::OnJsCall(uint32_t window_id, uint64_t page_call_id,
                              const std::string& method_path,
-                             laufey::ValuePtr args) {
-  StoreCallWindow(call_id, window_id);
+                             laufey::ValuePtr args, const std::string& origin) {
+  uint64_t call_id = js_calls_.Add(window_id, page_call_id);
+  // A document the launch file's bridge pin doesn't cover never reaches the
+  // runtime (its bridge script isn't installed either; this catches a page
+  // that posts to the engine's message channel itself).
+  if (!laufey_common::BridgeOriginAllowed(BridgePolicy(), origin)) {
+    std::cerr << "laufey: refused a bridge call from " << origin
+              << " (not in the app's bridgeOrigins)" << std::endl;
+    RespondToCall(call_id, nullptr,
+                  laufey::Value::String(laufey_common::kBridgeOriginRefused));
+    return;
+  }
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
-    pending_js_calls_.push({window_id, call_id, method_path, args});
+    pending_js_calls_.push({window_id, call_id, method_path, args, origin});
   }
 
   std::lock_guard<std::mutex> lock(notify_mutex_);
@@ -1060,10 +1892,14 @@ void RuntimeLoader::PollPendingJsCalls() {
 
   laufey_js_call_fn handler;
   void* user_data;
+  laufey_js_call_ex_fn handler_ex;
+  void* user_data_ex;
   {
     std::lock_guard<std::mutex> lock(handler_mutex_);
     handler = js_call_handler_;
     user_data = js_call_user_data_;
+    handler_ex = js_call_handler_ex_;
+    user_data_ex = js_call_user_data_ex_;
   }
 
   for (auto& call : calls) {
@@ -1078,25 +1914,35 @@ void RuntimeLoader::PollPendingJsCalls() {
           url = list[0]->GetString();
         }
       }
-      if (!url.empty()) {
+      if (IsAllowedExternalLinkUrl(url)) {
         if (LaufeyBackend* backend = GetBackend()) {
           backend->OpenExternalURL(url);
         }
       }
-      JsCallRespond(call.window_id, call.call_id, laufey::Value::Null(),
-                    nullptr);
+      RespondToCall(call.call_id, laufey::Value::Null(), nullptr);
       continue;
     }
 
-    if (handler) {
+    if (handler_ex) {
+      laufey_value_t* argsWrapper = new laufey_value(call.args);
+      handler_ex(user_data_ex, call.window_id, call.call_id,
+                 call.method_path.c_str(), argsWrapper, call.origin.c_str());
+    } else if (handler) {
       laufey_value_t* argsWrapper = new laufey_value(call.args);
       handler(user_data, call.window_id, call.call_id, call.method_path.c_str(),
               argsWrapper);
     } else {
-      JsCallRespond(call.window_id, call.call_id, nullptr,
+      RespondToCall(call.call_id, nullptr,
                     laufey::Value::String("No JS call handler registered"));
     }
   }
+}
+
+void RuntimeLoader::RespondToCall(uint64_t call_id, laufey::ValuePtr result,
+                                  laufey::ValuePtr error) {
+  laufey_common::JsCallRoute route;
+  if (js_calls_.Take(call_id, &route))
+    JsCallRespond(route.window_id, route.page_call_id, result, error);
 }
 
 void RuntimeLoader::JsCallRespond(uint32_t window_id, uint64_t call_id,

@@ -4,9 +4,12 @@
 
 #include "runtime_loader.h"
 #include "laufey_backend_common.h"
+#include "laufey_menu.h"
 
 #include <atomic>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -59,6 +62,19 @@ double GetNSWindowOpacity(void* cef_handle) {
     return (double)[nswindow alphaValue];
   }
   return 1.0;
+}
+
+bool GetNSWindowOuterSize(void* cef_handle, int* width, int* height) {
+  NSView* view = (__bridge NSView*)cef_handle;
+  NSWindow* nswindow = [view window];
+  if (!nswindow)
+    return false;
+  NSRect frame = [nswindow frame];
+  if (width)
+    *width = (int)frame.size.width;
+  if (height)
+    *height = (int)frame.size.height;
+  return true;
 }
 
 void SetNSWindowClickPassthrough(void* cef_handle, bool enabled) {
@@ -129,6 +145,13 @@ void RegisterNSWindowForCefHandle(void* cef_handle, uint32_t window_id) {
     RuntimeLoader::GetInstance()->RegisterNSWindow((__bridge void*)nswindow,
                                                    window_id);
   }
+}
+
+void* NSWindowForCefHandle(void* cef_handle) {
+  if (!cef_handle)
+    return nullptr;
+  NSView* view = (__bridge NSView*)cef_handle;
+  return (__bridge void*)[view window];
 }
 
 void UnregisterNSWindowForCefHandle(void* cef_handle) {
@@ -635,41 +658,42 @@ NativeDialogResult ShowNativeJSDialog_Mac(int type, const std::string& message,
 // Menu construction lives in backend-common
 // (laufey_common::BuildNSMenuFromValue).
 
+void Backend_ShowContextMenuEx_Mac(void* data, uint32_t window_id, int x, int y,
+                                   laufey_value_t* menu_template,
+                                   laufey_menu_click_fn on_click,
+                                   void* on_click_data,
+                                   laufey_menu_closed_fn on_closed,
+                                   void* on_closed_data) {
+  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
+  const laufey_backend_api_t* api = &loader->GetBackendApi();
+  // Parsed here: the template is the caller's only for this call.
+  auto entries = std::make_shared<std::vector<laufey_common::MenuEntry>>(
+      laufey_common::ParseMenuTemplate(menu_template, api, true));
+  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
+  void* handle = browser ? browser->GetHost()->GetWindowHandle() : nullptr;
+  // Not a main-queue block: the menu's tracking loop must leave the main
+  // queue free for the work posted there while it is open.
+  laufey_common::RunFromMainRunLoopMac([handle, x, y, entries, on_click,
+                                        on_click_data, on_closed,
+                                        on_closed_data, window_id] {
+    NSView* view = (__bridge NSView*)handle;
+    NSWindow* win = [view window];
+    // LAUFEY coordinates are window-relative with a top-left origin; the
+    // content view decides how they map (see ShowContextMenuMac).
+    laufey_common::ShowContextMenuMac(
+        win ? (__bridge void*)[win contentView] : nullptr, x, y, *entries,
+        on_click, on_click_data, on_closed, on_closed_data, window_id);
+  });
+}
+
 void Backend_ShowContextMenu_Mac(void* data, uint32_t window_id, int x, int y,
                                  laufey_value_t* menu_template,
                                  laufey_menu_click_fn on_click,
                                  void* on_click_data) {
   if (!menu_template)
     return;
-  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
-  const laufey_backend_api_t* api = &loader->GetBackendApi();
-
-  CefRefPtr<CefBrowser> browser = loader->GetBrowserForWindow(window_id);
-  if (!browser)
-    return;
-
-  void* handle = browser->GetHost()->GetWindowHandle();
-  dispatch_async(dispatch_get_main_queue(), ^{
-    NSMenu* menu = laufey_common::BuildNSMenuFromValue(
-        menu_template, api, on_click, on_click_data, window_id);
-    if (!menu)
-      return;
-
-    NSView* view = (__bridge NSView*)handle;
-    NSWindow* win = [view window];
-    if (!win)
-      return;
-
-    NSView* contentView = [win contentView];
-    // LAUFEY coordinates are window-relative with a top-left origin (the web
-    // convention). -popUpMenuPositioningItem:atLocation:inView: reads the
-    // location in the view's *own* coordinate system, which is top-left only
-    // when the view is flipped. Flipping unconditionally mirrors the menu
-    // about the window's midline whenever the content view already is.
-    NSPoint loc = NSMakePoint(
-        x, [contentView isFlipped] ? y : [contentView frame].size.height - y);
-    [menu popUpMenuPositioningItem:nil atLocation:loc inView:contentView];
-  });
+  Backend_ShowContextMenuEx_Mac(data, window_id, x, y, menu_template, on_click,
+                                on_click_data, nullptr, nullptr);
 }
 
 void Backend_SetApplicationMenu_Mac(void* data, uint32_t window_id,
@@ -679,22 +703,23 @@ void Backend_SetApplicationMenu_Mac(void* data, uint32_t window_id,
   if (!menu_template)
     return;
   RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
-  const laufey_backend_api_t* api = &loader->GetBackendApi();
+  auto entries = std::make_shared<std::vector<laufey_common::MenuEntry>>(
+      laufey_common::ParseMenuTemplate(menu_template, &loader->GetBackendApi(),
+                                       true));
   dispatch_async(dispatch_get_main_queue(), ^{
-    NSMenu* menubar = laufey_common::BuildNSMenuFromValue(
-        menu_template, api, on_click, on_click_data, window_id);
-    if (menubar) {
-      EnsureEditMenu(menubar);
-      // Store per-window
-      {
-        std::lock_guard<std::mutex> lock(g_window_menus_mutex);
-        g_window_menus[window_id] = menubar;
-      }
-      // If this window is currently key, apply immediately
-      uint32_t keyWid = LaufeyIdForNSWindow([NSApp keyWindow]);
-      if (keyWid == window_id) {
-        [NSApp setMainMenu:menubar];
-      }
+    NSMenu* menubar = laufey_common::BuildNSMenuFromEntries(
+        *entries, on_click, on_click_data, window_id);
+    EnsureEditMenu(menubar);
+    // Store per-window
+    {
+      std::lock_guard<std::mutex> lock(g_window_menus_mutex);
+      g_window_menus[window_id] = menubar;
+    }
+    laufey_common::RegisterWindowMenuMac(window_id, menubar);
+    // If this window is currently key, apply immediately
+    uint32_t keyWid = LaufeyIdForNSWindow([NSApp keyWindow]);
+    if (keyWid == window_id) {
+      [NSApp setMainMenu:menubar];
     }
   });
 }
@@ -736,6 +761,20 @@ void Backend_SetDockReopenHandler_Mac(void* /*data*/,
                                       laufey_dock_reopen_fn handler,
                                       void* user_data) {
   laufey_common::SetDockReopenHandlerMac(handler, user_data);
+}
+
+// --- Deep links / custom URL schemes (macOS) ---
+//
+// Storage and the cold-start buffer live in backend-common;
+// LaufeyAppDelegate's application:openURLs: (main_mac.mm) is what feeds them.
+
+void Backend_SetOpenUrlHandler_Mac(void* /*data*/, laufey_open_url_fn handler,
+                                   void* user_data) {
+  laufey_common::SetOpenUrlHandlerMac(handler, user_data);
+}
+
+bool Backend_TestTriggerOpenUrl_Mac(void* /*data*/, const char* url) {
+  return laufey_common::TestTriggerOpenUrlMac(url);
 }
 
 // --- Tray / status-bar icon (macOS) ---
@@ -792,46 +831,5 @@ void Backend_SetTrayDoubleClickHandler_Mac(void* /*data*/, uint32_t tray_id,
   laufey_common::SetTrayDoubleClickHandlerMac(tray_id, handler, user_data);
 }
 
-// --- Notifications (macOS) ---
-//
-// Thin trampolines over backend-common/src/notifications_mac.mm
-// (UNUserNotificationCenter-backed).
-
-uint32_t Backend_ShowNotification_Mac(void* data, laufey_value_t* options,
-                                      laufey_notification_event_fn on_event,
-                                      void* user_data) {
-  RuntimeLoader* loader = static_cast<RuntimeLoader*>(data);
-  laufey_common::NotificationOptions opts =
-      laufey_common::ParseNotificationOptions(options,
-                                              &loader->GetBackendApi());
-  return laufey_common::ShowNotificationMac(opts, on_event, user_data);
-}
-
-void Backend_CloseNotification_Mac(void* /*data*/, uint32_t notification_id) {
-  laufey_common::CloseNotificationMac(notification_id);
-}
-
-// --- Permissions (UNUserNotificationCenter) ---
-//
-// UN is the modern (10.14+) replacement for NSUserNotification's
-// implicit "always granted" model. It requires the process to run
-// inside a bundled .app with a CFBundleIdentifier; without one
-// `getNotificationSettings:` returns garbage and `requestAuthorization:`
-// fails immediately. We detect that case and report UNSUPPORTED so the
-// embedder (Deno) can branch on it instead of seeing a phantom DENIED.
-
-// --- Permissions (macOS) ---
-//
-// Thin trampolines over backend-common/src/permissions_mac.mm.
-
-void Backend_QueryPermission_Mac(void* /*data*/, int kind,
-                                 laufey_permission_callback_fn cb,
-                                 void* user_data) {
-  laufey_common::QueryPermissionMac(kind, cb, user_data);
-}
-
-void Backend_RequestPermission_Mac(void* /*data*/, int kind,
-                                   laufey_permission_callback_fn cb,
-                                   void* user_data) {
-  laufey_common::RequestPermissionMac(kind, cb, user_data);
-}
+// Notifications and permissions: runtime_loader.cc over
+// laufey_notifications.h, the same on every platform.

@@ -2,8 +2,10 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <unistd.h>
 #include <map>
 #include <set>
@@ -17,13 +19,95 @@
 #include "include/wrapper/cef_helpers.h"
 
 #include "app.h"
+#include "custom_schemes.h"
+#include "laufey_backend_common.h"
+#include "laufey_cef_sandbox.h"
+#include "laufey_launch_args.h"
+#include "laufey_launch_config.h"
+#include "laufey_auth_session.h"
+#include "laufey_notifications.h"
+#include "laufey_platform_features.h"
+#include "laufey_single_instance.h"
 #include "renderer_app.h"
+#include "laufey_window.h"
 #include "runtime_loader.h"
 
 #include <gio/gio.h>
 
 void LaufeyOpenExternalURL(const std::string& url) {
   g_app_info_launch_default_for_uri(url.c_str(), nullptr, nullptr);
+}
+
+// Chromium's cookie store encrypts with a key it keeps in the Secret Service
+// or KWallet (OSCrypt). When no one here can hand it out (a Secret Service
+// that is locked, or not running and may start locked, with no one to
+// answer its unlock prompt: a headless, ssh or CI session; a closed KWallet,
+// whose key request Chromium never gets answered), Chromium waits for the
+// key forever, and every request that carries cookies (navigations,
+// fetches, WebSocket handshakes) waits with it. In that case use
+// --password-store=basic (a fixed key: the cookies are only obfuscated) and
+// say so once. With no Secret Service at all (or no session bus) Chromium
+// falls back to basic by itself. An explicit --password-store is kept.
+//
+// On KDE the OS store is pinned to the kwalletd the probe asked
+// (--password-store=kwallet6 / kwallet5 / kwallet). Left to itself
+// Chromium picks its daemon from the environment alone: XDG_CURRENT_DESKTOP
+// =KDE without KDE_SESSION_VERSION (ssh, a systemd unit, a wrapper that
+// copies part of the environment) is KDE 4's org.kde.kwalletd at
+// /modules/kwalletd, a name Plasma 6's kwalletd6 owns with no object behind
+// it. Chromium's KWallet start then fails, and it falls back to basic,
+// dropping every OS-key cookie, while the probe (which asked kwalletd6)
+// reported the OS key.
+// platform_features() reports the choice as "cookieEncryption". Browser
+// process only.
+//
+// Never basic on a profile that holds cookies encrypted with the OS key
+// ("v11" rows in its cookie database, read here before CefInitialize):
+// Chromium drops a cookie it can't decrypt and then deletes its whole
+// site's cookies from the database, so one basic launch would lose them for
+// good. Such a profile keeps the OS key even when no one may be able to
+// unlock it: requests that carry cookies wait until the keystore is
+// unlocked, stderr says so, and platform_features() reports the reason as
+// "cookieEncryptionWait". A database that can't be read counts as holding
+// such cookies. An explicit --password-store=basic is honoured, with a
+// warning that those cookies will be deleted. Basic (v10) cookies stay
+// readable under the OS key, so a profile with none of its own moves
+// between the two freely. The profile also records "os" once it has the OS
+// key (laufey_platform_features.h, kPasswordStoreMarkerName): a hint; the
+// database decides.
+static std::string g_root_cache_path;
+
+static void LaufeyApplyPasswordStore(CefRefPtr<CefCommandLine> command_line) {
+  laufey_common::RemoveStalePasswordStoreTemps(
+      g_root_cache_path, static_cast<int64_t>(time(nullptr)));
+  std::string explicit_store;
+  bool has_explicit = command_line->HasSwitch("password-store");
+  if (has_explicit)
+    explicit_store = command_line->GetSwitchValue("password-store");
+  std::string detail;
+  laufey_common::ProfileCookieKeys cookies =
+      laufey_common::ReadProfileCookieKeys(g_root_cache_path, &detail);
+  laufey_common::PasswordStoreChoice choice =
+      laufey_common::ChoosePasswordStore(
+          has_explicit ? &explicit_store : nullptr,
+          laufey_common::ReadPasswordStoreMarker(g_root_cache_path), cookies,
+          [] {
+            laufey_common::PlatformFeatures features;
+            laufey_common::ProbeSecretService(&features);
+            return features;
+          });
+  if (choice.append_basic)
+    command_line->AppendSwitchWithValue("password-store", "basic");
+  else if (!choice.append_store.empty())
+    command_line->AppendSwitchWithValue("password-store", choice.append_store);
+  if (choice.record)
+    laufey_common::WritePasswordStoreMarker(g_root_cache_path, choice.store);
+  laufey_common::SetCookieEncryption(
+      choice.store.c_str(), choice.wait ? choice.reason.c_str() : nullptr);
+  std::string warning =
+      laufey_common::PasswordStoreWarning(choice, cookies, detail);
+  if (!warning.empty())
+    std::cerr << warning << std::endl;
 }
 
 // --- Native event monitors (Linux / X11) ---
@@ -36,6 +120,7 @@ void LaufeyOpenExternalURL(const std::string& url) {
 // into the GLib main loop via g_io_add_watch.
 
 #include <gdk/gdk.h>
+#include <gtk/gtk.h>
 #ifdef GDK_WINDOWING_X11
 #include <gdk/gdkx.h>
 #include <X11/Xlib.h>
@@ -523,6 +608,27 @@ double GetLinuxWindowOpacity(unsigned long xid) {
 #endif
 }
 
+void LaufeySetDialogTransientFor(void* dialog, unsigned long parent_xid) {
+#ifdef GDK_WINDOWING_X11
+  GtkWidget* dlg = static_cast<GtkWidget*>(dialog);
+  GdkDisplay* gdk_display = gdk_display_get_default();
+  if (!dlg || !parent_xid || !gdk_display || !GDK_IS_X11_DISPLAY(gdk_display))
+    return;
+  GdkWindow* parent =
+      gdk_x11_window_foreign_new_for_display(gdk_display, parent_xid);
+  if (!parent)
+    return;
+  gtk_widget_realize(dlg);
+  gdk_window_set_transient_for(gtk_widget_get_window(dlg), parent);
+  // The foreign wrapper lives as long as the dialog.
+  g_object_set_data_full(G_OBJECT(dlg), "laufey-transient-parent", parent,
+                         g_object_unref);
+#else
+  (void)dialog;
+  (void)parent_xid;
+#endif
+}
+
 // X11 has no cheap query for "is the input shape empty", so remember which
 // windows we made click-passthrough. Only touched on the CEF UI thread.
 static std::set<unsigned long> g_click_passthrough_xids;
@@ -633,31 +739,18 @@ static int run_headless(const std::string& runtimePath) {
     return 1;
   }
 
+  // No UI loop in a headless worker: UI tasks are answered "not run" at
+  // once instead of waiting for a loop that never runs.
+  laufey_common::UiLoopEnded();
   if (!loader->Start()) {
     std::cerr << "Failed to start headless worker runtime." << std::endl;
     return 1;
   }
 
+  // It ends when the runtime returns, however long that takes.
+  loader->WaitForRuntime();
   loader->Shutdown();
   return 0;
-}
-
-static bool is_forked_worker() {
-  return getenv("NODE_CHANNEL_FD") != nullptr ||
-         getenv("NEXT_PRIVATE_WORKER") != nullptr;
-}
-
-static bool is_cli_worker_command(int argc, char* argv[]) {
-  if (argc < 3 || strcmp(argv[1], "run") != 0) {
-    return false;
-  }
-  for (int i = 2; i < argc; ++i) {
-    if (argv[i][0] == '-') {
-      continue;
-    }
-    return true;
-  }
-  return false;
 }
 
 // Combined app that handles both browser and renderer processes (single-exe
@@ -674,28 +767,55 @@ class LaufeyCombinedApp : public CefApp, public CefBrowserProcessHandler {
     return renderer_app_->GetRenderProcessHandler();
   }
 
+  // "app" plus the schemes declared with --laufey-custom-schemes /
+  // LAUFEY_CUSTOM_SCHEMES become standard, secure, fetch/CORS-enabled schemes
+  // in every process (single-exe model: this runs in the browser and in each
+  // subprocess). See custom_schemes.h.
+  void OnRegisterCustomSchemes(
+      CefRawPtr<CefSchemeRegistrar> registrar) override {
+    laufey_schemes::RegisterAll(registrar);
+  }
+
+  void OnBeforeChildProcessLaunch(
+      CefRefPtr<CefCommandLine> command_line) override {
+    laufey_schemes::ForwardToChild(command_line);
+  }
+
+  bool OnAlreadyRunningAppRelaunch(
+      CefRefPtr<CefCommandLine> command_line,
+      const CefString& current_directory) override {
+    return LaufeyHandleAlreadyRunningAppRelaunch();
+  }
+
   void OnBeforeCommandLineProcessing(
       const CefString& process_type,
       CefRefPtr<CefCommandLine> command_line) override {
-    // Native Wayland support. By default CEF/Chromium uses the X11 Ozone
-    // backend and runs through XWayland on Wayland sessions. Mirror the
-    // approach Electron/Chrome standardized on: --ozone-platform-hint=auto,
-    // which selects Wayland on a Wayland session and X11 otherwise. `auto`
-    // keys off XDG_SESSION_TYPE, so it misses sessions that export only
-    // WAYLAND_DISPLAY (sandboxed / nested / misconfigured); cover that gap by
-    // hard-selecting Wayland when WAYLAND_DISPLAY is present. The explicit
-    // --ozone-platform wins over the hint, so the result is: Wayland whenever a
-    // Wayland display exists, auto-detect (X11 in practice) otherwise.
-    // Only the browser process (empty process_type) needs the switch; CEF
-    // propagates the resolved platform to its subprocesses. Respect an explicit
-    // override.
+    // A deep-link launch keeps none of its own command line's Chromium
+    // switches. First, so the defaults below see what is left.
+    if (process_type.empty()) {
+      LaufeyStripDeepLinkSwitches(command_line);
+      LaufeyApplyPasswordStore(command_line);
+    }
+
+    // The Ozone platform: the display that is actually there
+    // (laufey_common::DisplayBackend: a Wayland socket that exists, else
+    // $DISPLAY), always as an explicit --ozone-platform. Chromium's own
+    // --ozone-platform-hint=auto keys off XDG_SESSION_TYPE, which is only a
+    // hint and often wrong: GDM's autologin into an Xorg session (XFCE, i3)
+    // leaves it "wayland" with only $DISPLAY set, and Ozone/Wayland then
+    // finds no compositor and opens no window. The hint is left only when
+    // there is no display at all. Only the browser process (empty
+    // process_type) needs the switch; CEF propagates the resolved platform to
+    // its subprocesses. An app's own --ozone-platform or
+    // --ozone-platform-hint wins.
     if (process_type.empty() &&
         !command_line->HasSwitch("ozone-platform-hint") &&
         !command_line->HasSwitch("ozone-platform")) {
-      command_line->AppendSwitchWithValue("ozone-platform-hint", "auto");
-      const char* wayland_display = getenv("WAYLAND_DISPLAY");
-      if (wayland_display && *wayland_display) {
-        command_line->AppendSwitchWithValue("ozone-platform", "wayland");
+      const std::string backend = laufey_common::DisplayBackend();
+      if (backend.empty()) {
+        command_line->AppendSwitchWithValue("ozone-platform-hint", "auto");
+      } else {
+        command_line->AppendSwitchWithValue("ozone-platform", backend);
       }
     }
 
@@ -719,11 +839,19 @@ class LaufeyCombinedApp : public CefApp, public CefBrowserProcessHandler {
     // propagates it to subprocesses.
     if (process_type.empty()) {
       command_line->AppendSwitch("disable-background-networking");
+      // What --disable-background-networking leaves: the Chrome services
+      // that still contact Google at startup (laufey_cef_network_quiet.h).
+      LaufeyApplyNetworkQuietDefaults(command_line);
+      LaufeyApplyInspectableToCommandLine(command_line);
     }
   }
 
   void OnContextInitialized() override {
     CEF_REQUIRE_UI_THREAD();
+
+    // Before any browser starts the spellchecker, which would download a
+    // missing Hunspell dictionary from Google.
+    LaufeyKeepLocalSpellcheckDictionaries(g_root_cache_path);
 
     // Keep the handler alive for the lifetime of the app.
     // Backend_CreateWindow uses LaufeyHandler::GetInstance() from the runtime
@@ -762,8 +890,83 @@ class LaufeyCombinedApp : public CefApp, public CefBrowserProcessHandler {
   IMPLEMENT_REFCOUNTING(LaufeyCombinedApp);
 };
 
+// The Chromium sandbox (laufey_cef_sandbox.h): on when this machine has a
+// layer-1 sandbox Chromium can use, else off. One line on stderr says which
+// and why. Chromium looks for chrome-sandbox next to the real executable
+// (/proc/self/exe). CHROME_DEVEL_SANDBOX (Chromium's override of the helper's
+// path) is not consulted: it can only make Chromium pick a helper and abort
+// when that one is unusable, never turn the sandbox off. The choice is a
+// platform fact ("sandbox", "sandboxReason"). An app that requires the
+// sandbox (LaunchRequireSandbox) refuses to start without one: false with
+// `*refuse` set.
+static bool LaufeyChooseSandbox(bool* refuse) {
+  std::string exe_dir;
+  char exe[4096];
+  ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  if (len > 0) {
+    exe[len] = '\0';
+    exe_dir = exe;
+    size_t slash = exe_dir.find_last_of('/');
+    exe_dir =
+        slash == std::string::npos ? std::string() : exe_dir.substr(0, slash);
+  }
+  laufey_common::LinuxSandboxDecision decision =
+      laufey_common::DecideLinuxSandbox(
+          laufey_common::ProbeLinuxSandbox(exe_dir));
+  std::cerr << "laufey: sandbox: "
+            << laufey_common::LinuxSandboxModeName(decision.mode) << " ("
+            << decision.reason << ")" << std::endl;
+  laufey_common::SetSandboxMode(
+      laufey_common::LinuxSandboxModeName(decision.mode),
+      decision.reason.c_str());
+  std::string message;
+  *refuse = laufey_common::RefuseUnsandboxedStart(
+      decision, laufey_common::LaunchRequireSandbox(), &message);
+  if (*refuse)
+    std::cerr << message << std::endl;
+  return decision.enabled();
+}
+
+// SIGTERM, SIGINT and SIGHUP end the app through its own quit, the path
+// quit() and closing the last window take: the windows close, the runtime is
+// shut down, and CefShutdown writes the profile and ends the child processes
+// (laufey_common::InstallTerminationSignalHandlers). They replace the
+// handlers Chromium installs during CefInitialize
+// (chrome/browser/shutdown_signal_handlers_posix.cc), which for SIGTERM call
+// chrome::SessionEnding(): that ends the browser process at once with
+// _exit(0), without the runtime's shutdown or CefShutdown, and leaves the
+// GPU, renderer and zygote processes to find their browser gone.
+
 int main(int argc, char* argv[]) {
-  CefMainArgs main_args(argc, argv);
+  // D-Bus activation for a notification click (`<app id>.service` passes
+  // --laufey-dbus-activated): noted, and left out of the copy of argv that
+  // Chromium and the single-instance forwarding get. (A CEF subprocess never
+  // has it.) The process's argv is never changed: the runtime library's
+  // .init_array functions still get its original argc and argv. The runtime
+  // leaves the argument out itself (laufey::args_os).
+  // Deliberately leaked: whatever keeps a pointer into the copy (the
+  // toolkit, at-exit handlers) can still read it during exit, whatever the
+  // order static destructors run in.
+  static auto* host_argv = new std::vector<char*>;
+  laufey_common::SetDBusActivationLaunch(
+      laufey_common::CopyArgvWithoutDBusActivationArg(argc, argv, host_argv));
+  argc = static_cast<int>(host_argv->size()) - 1;
+  argv = host_argv->data();
+
+  // LAUFEY_CWD is only for the Windows CEF host behind CEF's bootstrap
+  // (cef/src/main_windows.cc); never pass it on to what the app starts.
+  unsetenv("LAUFEY_CWD");
+
+  // CEF gets its own copy of argv. Chromium sets the process title by
+  // rewriting the argv strings in place (setproctitle), which garbles the
+  // arguments the runtime later reads with std::env::args() or its
+  // equivalent (they point at the original argv); see docs/deep-links.md.
+  std::vector<std::string> cef_arg_storage(argv, argv + argc);
+  std::vector<char*> cef_argv;
+  for (std::string& arg : cef_arg_storage)
+    cef_argv.push_back(&arg[0]);
+  cef_argv.push_back(nullptr);
+  CefMainArgs main_args(argc, cef_argv.data());
 
   // Single-exe model: check if we are a subprocess first
   CefRefPtr<LaufeyCombinedApp> app(new LaufeyCombinedApp());
@@ -772,34 +975,45 @@ int main(int argc, char* argv[]) {
     return exit_code;
   }
 
-  // Parse --runtime argument
-  for (int i = 1; i < argc; ++i) {
-    if (strcmp(argv[i], "--runtime") == 0 && i + 1 < argc) {
-      g_runtime_path = argv[++i];
-    } else if (strncmp(argv[i], "--runtime=", 10) == 0) {
-      g_runtime_path = argv[i] + 10;
-    }
+  // A scheduled notification's systemd timer (`<exe> --laufey-notify <id>`,
+  // docs/notifications.md): post it and exit before CEF or the runtime
+  // starts.
+  {
+    std::string notify_id;
+    if (laufey_common::ParseNotifyLaunch(
+            std::vector<std::string>(argv + (argc > 0 ? 1 : 0), argv + argc),
+            &notify_id))
+      return laufey_common::RunNotifyLaunch(notify_id);
   }
 
-  if (g_runtime_path.empty()) {
-    const char* envPath = getenv("LAUFEY_RUNTIME_PATH");
-    if (envPath) {
-      g_runtime_path = envPath;
-    }
-  }
+  // The browser process's command line hook drops every Chromium switch of a
+  // deep-link launch (LaufeyStripDeepLinkSwitches): a link handed to the app
+  // by its .desktop entry's %u can't pass switches through, as on Windows.
+  // See laufey_launch_args.h.
+  laufey_common::SetProcessArgs(
+      std::vector<std::string>(argv + (argc > 0 ? 1 : 0), argv + argc));
 
-  if (g_runtime_path.empty()) {
-    g_runtime_path = LaufeyFindColocatedRuntime();
+  // The runtime library: a packaged app (a launch file, or a runtime next to
+  // the executable) loads only the one next to its executable; a development
+  // host takes --runtime (before "--"), then LAUFEY_RUNTIME_PATH. See
+  // laufey_launch_args.h.
+  {
+    laufey_common::RuntimeChoice choice = laufey_common::ResolveRuntimePath(
+        std::vector<std::string>(argv + 1, argv + argc),
+        {LaufeyFindColocatedRuntime()}, {});
+    // A packaged app without its runtime exits at once, before CEF starts.
+    if (laufey_common::IsMissingPackagedRuntime(choice)) {
+      laufey_common::ReportMissingPackagedRuntime();
+      return laufey_common::kMissingRuntimeExitCode;
+    }
+    g_runtime_path = choice.path;
   }
 
   // Wayland app_id / X11 WM_CLASS for our windows (see LaufeyWindowDelegate::
   // GetLinuxWindowProperties). Prefer the reverse-DNS identifier the embedder
-  // also uses for the `.desktop` file; fall back to the display name.
-  if (const char* app_id = getenv("LAUFEY_APP_ID")) {
-    if (*app_id) {
-      g_app_id = app_id;
-    }
-  }
+  // also uses for the `.desktop` file (LAUFEY_APP_ID, or "appId" in the
+  // launch file); fall back to the display name.
+  g_app_id = laufey_common::LaunchAppId();
   if (g_app_id.empty()) {
     if (const char* app_name = getenv("LAUFEY_APP_NAME")) {
       if (*app_name) {
@@ -809,19 +1023,58 @@ int main(int argc, char* argv[]) {
   }
 
   // Check for headless / forked worker mode (skip CEF entirely)
-  if (is_forked_worker() || is_cli_worker_command(argc, argv)) {
+  if (laufey_common::IsHeadlessWorkerLaunch(
+          std::vector<std::string>(argv + 1, argv + argc))) {
     return run_headless(g_runtime_path);
   }
 
+  // Single-instance mode (docs/deep-links.md): a second launch forwards its
+  // arguments to the running instance and exits here, before CefInitialize
+  // (so CEF's own profile singleton is never reached) and before the runtime
+  // loads.
+  int single_instance_exit = 0;
+  if (!laufey_common::SingleInstanceStartup(argc, argv,
+                                            &single_instance_exit)) {
+    return single_instance_exit;
+  }
+  // Notifications (API 41): the Windows toast activator / the Linux
+  // scheduler start before the runtime, so a click on a toast that launched
+  // the app, or a notification scheduled for while it wasn't running, is
+  // delivered.
+  laufey_common::InitNotificationsAtLaunch();
+
   CefSettings settings;
-  settings.no_sandbox = true;
+  bool refuse_unsandboxed = false;
+  settings.no_sandbox = !LaufeyChooseSandbox(&refuse_unsandboxed);
+  if (refuse_unsandboxed)
+    return laufey_common::kSandboxRequiredExitCode;
   settings.log_severity = LaufeyCefLogSeverity();
 
-  // Set cache path
-  std::string cache_path = "/tmp/laufey_cef_" + std::to_string(getpid());
-  CefString(&settings.root_cache_path) = cache_path;
+  // Set cache path. With a per-app data dir (LAUFEY_DATA_DIR / LAUFEY_APP_ID)
+  // the profile persists there; cache_path must be set too (equal to the root)
+  // or CEF runs the browser "incognito" and keeps localStorage/cookies in
+  // memory. Without one, a throwaway per-process root: a fresh 0700
+  // directory with a random name under $TMPDIR or /tmp (never a fixed name
+  // another user of /tmp could create first). If even that fails the root
+  // stays unset and CEF keeps the profile in memory.
+  std::string cache_path = laufey_common::AppDataSubdir("CEF");
+  if (!cache_path.empty()) {
+    CefString(&settings.root_cache_path) = cache_path;
+    CefString(&settings.cache_path) = cache_path;
+  } else {
+    cache_path = laufey_common::MakePrivateTempDir("", "laufey_cef_");
+    if (!cache_path.empty())
+      CefString(&settings.root_cache_path) = cache_path;
+  }
+  // Where the profile records its password store (LaufeyApplyPasswordStore,
+  // called from CefInitialize).
+  g_root_cache_path = cache_path;
 
-  if (const char* port_env = getenv("LAUFEY_REMOTE_DEBUGGING_PORT")) {
+  // No remote debugging while DevTools are off (API 40, inspectable).
+  const char* port_env = laufey_common::LaunchInspectable()
+                             ? getenv("LAUFEY_REMOTE_DEBUGGING_PORT")
+                             : nullptr;
+  if (port_env) {
     int port = atoi(port_env);
     if (port > 0 && port < 65536) {
       settings.remote_debugging_port = port;
@@ -829,14 +1082,27 @@ int main(int argc, char* argv[]) {
   }
 
   if (!CefInitialize(main_args, settings, app.get(), nullptr)) {
+    LaufeyReportCefInitializeFailure(cache_path);
     return 1;
   }
+  LaufeyInstallSecondInstanceHooks();
+  laufey_common::InstallTerminationSignalHandlers(LaufeyRequestQuit);
 
   CefRunMessageLoop();
 
+  // A signal from here on takes its default action.
+  laufey_common::RemoveTerminationSignalHandlers();
+
+  // The loop is over: UI tasks still queued are answered "not run" and an
+  // auth session in progress ends cancelled, so a runtime thread waiting on
+  // either is released before Shutdown waits for it.
+  laufey_common::UiLoopEnded();
+
+  LaufeyClearSecondInstanceHooks();
   RuntimeLoader::GetInstance()->Shutdown();
 
   CefShutdown();
 
-  return 0;
+  // exit_app's code (API 46), else 0.
+  return laufey_common::RequestedExitCode();
 }

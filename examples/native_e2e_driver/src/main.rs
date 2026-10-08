@@ -13,7 +13,15 @@
 //!   3. spawns the backend + runtime and waits for the tray item to register,
 //!   4. reads the item's `org.kde.StatusNotifierItem` properties, walks its
 //!      `com.canonical.dbusmenu` menu, and fires a menu `Event` that must
-//!      round-trip to the app's `laufey_menu_click_fn`.
+//!      round-trip to the app's `laufey_menu_click_fn` (the battery, run with
+//!      LAUFEY_E2E_HOLD, checks that it arrived), then
+//!   5. waits for the backend and fails unless its battery passed.
+//!
+//! With LAUFEY_E2E_LATE_TRAY_HOST=<flag file> (scripts/native-e2e-run.sh
+//! --late-tray-host) it owns no watcher at first: the battery's first tray
+//! must be refused (no host), and once the battery writes the flag file the
+//! driver starts the watcher, which the backend must notice (its probe
+//! follows NameOwnerChanged) before the run goes on as above.
 //!
 //! On non-Linux targets this compiles to a stub so `cargo check --workspace`
 //! stays green everywhere. See docs/e2e-testing.md §7.1.
@@ -169,6 +177,15 @@ mod linux {
     let mut props = HashMap::new();
     if let Value::Dict(d) = &fields[1] {
       for (k, val) in d.iter() {
+        // a{sv}: read through the variant to the value itself.
+        let val = match val {
+          Value::Value(inner) => inner.as_ref(),
+          other => other,
+        };
+        let k = match k {
+          Value::Value(inner) => inner.as_ref(),
+          other => other,
+        };
         if let Value::Str(k) = k {
           if let Ok(ov) = OwnedValue::try_from(val.clone()) {
             props.insert(k.to_string(), ov);
@@ -212,6 +229,19 @@ mod linux {
       }
     }
     None
+  }
+
+  fn collect_labels(node: &MenuNode, out: &mut Vec<String>) {
+    if let Some(l) = node
+      .props
+      .get("label")
+      .and_then(|v| String::try_from(v.clone()).ok())
+    {
+      out.push(l);
+    }
+    for c in &node.children {
+      collect_labels(c, out);
+    }
   }
 
   async fn run_assertions(
@@ -258,10 +288,37 @@ mod linux {
       Proxy::new(conn, bus_name, menu_path.as_str(), "com.canonical.dbusmenu")
         .await?;
 
-    let (_revision, root): (u32, OwnedValue) = menu
-      .call("GetLayout", &(0i32, -1i32, Vec::<String>::new()))
-      .await?;
-    let root_node = parse_node(&root).expect("layout root");
+    // The reply is `(u (ia{sv}av))`: a revision and a bare structure, not a
+    // variant, so read the whole body dynamically. The app sets its menu
+    // just after creating the tray, so ask again until "Ping" is there.
+    let mut root_node = None;
+    for _ in 0..50 {
+      let reply = menu
+        .call_method("GetLayout", &(0i32, -1i32, Vec::<String>::new()))
+        .await?;
+      let body = reply.body();
+      let layout: zbus::zvariant::Structure<'_> = body.deserialize()?;
+      root_node = layout.fields().get(1).and_then(parse_node);
+      if root_node
+        .as_ref()
+        .is_some_and(|n| find_by_label(n, "Ping").is_some())
+      {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let Some(root_node) = root_node else {
+      check("dbusmenu GetLayout returns a layout root", false, failed);
+      return Ok(());
+    };
+    let mut labels = Vec::new();
+    collect_labels(&root_node, &mut labels);
+    eprintln!("[e2e] dbusmenu labels: {labels:?}");
+    if labels.is_empty() {
+      for c in &root_node.children {
+        eprintln!("[e2e] dbusmenu item {}: {:?}", c.id, c.props);
+      }
+    }
     check("menu has children", !root_node.children.is_empty(), failed);
 
     if let Some(target) = find_by_label(&root_node, "Ping") {
@@ -284,22 +341,27 @@ mod linux {
     let (item_tx, mut item_rx) = mpsc::unbounded_channel::<(String, String)>();
     let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<NotifyCall>();
 
-    let watcher = Watcher {
+    let mut watcher = Some(Watcher {
       items: std::sync::Mutex::new(Vec::new()),
       tx: item_tx,
-    };
+    });
     let notifications = Notifications {
       tx: notif_tx,
       next_id: std::sync::atomic::AtomicU32::new(1),
     };
 
-    let conn = connection::Builder::session()?
-      .name("org.kde.StatusNotifierWatcher")?
+    let late_host = std::env::var("LAUFEY_E2E_LATE_TRAY_HOST")
+      .ok()
+      .filter(|v| !v.is_empty());
+    let mut builder = connection::Builder::session()?
       .name("org.freedesktop.Notifications")?
-      .serve_at("/StatusNotifierWatcher", watcher)?
-      .serve_at("/org/freedesktop/Notifications", notifications)?
-      .build()
-      .await?;
+      .serve_at("/org/freedesktop/Notifications", notifications)?;
+    if late_host.is_none() {
+      builder = builder
+        .name("org.kde.StatusNotifierWatcher")?
+        .serve_at("/StatusNotifierWatcher", watcher.take().unwrap())?;
+    }
+    let conn = builder.build().await?;
     eprintln!("[e2e] shell services up; launching runtime");
 
     let mut args = std::env::args().skip(1);
@@ -311,16 +373,56 @@ mod linux {
       .spawn()
       .expect("spawn backend");
 
-    let (bus_name, sni_path) =
-      tokio::time::timeout(Duration::from_secs(20), item_rx.recv())
+    // No tray host until the battery has seen its tray refused.
+    if let Some(flag) = late_host {
+      let mut refused = false;
+      for _ in 0..1200 {
+        if std::path::Path::new(&flag).exists() {
+          refused = true;
+          break;
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+          break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+      }
+      check(
+        "the battery reached its tray refusal (no watcher yet)",
+        refused,
+        &failed,
+      );
+      if !refused {
+        let _ = child.start_kill();
+        eprintln!("[e2e] OVERALL FAIL");
+        std::process::exit(1);
+      }
+      conn
+        .object_server()
+        .at("/StatusNotifierWatcher", watcher.take().unwrap())
+        .await?;
+      conn.request_name("org.kde.StatusNotifierWatcher").await?;
+      eprintln!("[e2e] watcher started late");
+    }
+
+    // The battery creates its tray part-way through (after its windows and
+    // the custom-scheme checks), which takes a while on a CEF cold start.
+    let Some((bus_name, sni_path)) =
+      tokio::time::timeout(Duration::from_secs(120), item_rx.recv())
         .await
         .ok()
         .flatten()
-        .expect("[e2e] FAIL: backend never registered a StatusNotifierItem");
+    else {
+      let _ = child.start_kill();
+      eprintln!("[e2e] FAIL backend never registered a StatusNotifierItem");
+      eprintln!("[e2e] OVERALL FAIL");
+      std::process::exit(1);
+    };
     check("StatusNotifierItem registered on bus", true, &failed);
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    run_assertions(&conn, &bus_name, &sni_path, &failed).await?;
+    if let Err(e) = run_assertions(&conn, &bus_name, &sni_path, &failed).await {
+      check(&format!("D-Bus assertions ran ({e})"), false, &failed);
+    }
 
     if let Ok(Some(n)) =
       tokio::time::timeout(Duration::from_secs(3), notif_rx.recv()).await
@@ -336,7 +438,20 @@ mod linux {
       );
     }
 
-    let _ = child.start_kill();
+    // The battery (LAUFEY_E2E_HOLD) waits for the Event fired above to reach
+    // its on_click, then finishes and exits with its own verdict.
+    match tokio::time::timeout(Duration::from_secs(240), child.wait()).await {
+      Ok(Ok(status)) => check(
+        &format!("backend battery passed under the observer ({status})"),
+        status.success(),
+        &failed,
+      ),
+      Ok(Err(e)) => check(&format!("backend wait: {e}"), false, &failed),
+      Err(_) => {
+        let _ = child.start_kill();
+        check("backend exited within 240s", false, &failed);
+      }
+    }
     if failed.load(std::sync::atomic::Ordering::SeqCst) {
       eprintln!("[e2e] OVERALL FAIL");
       std::process::exit(1);

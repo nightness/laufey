@@ -6,9 +6,16 @@ It defines the boundary between a **backend** (a native executable embedding a
 browser engine) and a **runtime** (a shared library holding the application
 logic). The backend implements the ABI; the runtime consumes it.
 
-`LAUFEY_API_VERSION` (currently `31`) versions the contract. The `version` field
-on the API table lets a runtime detect the backend's vintage and avoid calling
-function pointers a backend predates (older backends leave new pointers `NULL`).
+`LAUFEY_API_VERSION` (currently `47`) versions the contract. The `version` field
+on the API table names the version the backend was built against, and the match
+is **exact**: the `laufey` crate's `init_api` refuses a backend whose `version`
+differs from its own `LAUFEY_API_VERSION` (`laufey_runtime_init` then fails), so
+a runtime and a backend must come from the same laufey release. The "NULL on
+backends older than API version N" notes in `laufey.h` record when each entry
+point appeared; under the exact match a runtime never meets such a backend.
+Entry points a backend does not implement — Winit has no web engine, no tray
+menus on Linux, and so on — are still `NULL`, so a runtime null-checks them as
+before.
 
 ## Runtime entry points
 
@@ -48,11 +55,19 @@ The pointers group into:
   size/position get+set, `set_resizable`/`is_resizable`,
   `set_always_on_top`/`is_always_on_top`,
   `set_window_opacity`/`get_window_opacity` (whole-window alpha, API ≥ 28),
-  `show`/`hide`/`is_visible`, `focus`, `quit`, `post_ui_task`.
+  `get_window_scale_factor` (`window.devicePixelRatio`, API ≥ 38),
+  `get_window_inner_position` (content-view origin, API ≥ 38),
+  `get_window_outer_size` (`window.outerWidth` / `outerHeight`, API ≥ 38),
+  `test_inject_input` (synthetic pointer / key / wheel, API ≥ 38),
+  `show`/`hide`/`is_visible`, `focus`, `quit`, `post_ui_task`, and from API 42
+  `dispatch_ui_task` / `is_ui_thread` (see
+  [UI-thread tasks](#ui-thread-tasks-api--42) below).
 - **Value marshalling** — the `value_*` family (below).
 - **JavaScript interop** — `set_js_call_handler`, `js_call_respond`,
   `invoke_js_callback`, `release_js_callback`, `execute_js`, `set_js_namespace`,
-  `poll_js_calls`, `set_js_call_notify`.
+  `poll_js_calls`, `set_js_call_notify`, and from API 44
+  `set_js_call_handler_ex` (the calling document's origin with every call; see
+  [below](#javascript-call-flow)).
 - **Event handlers** — `set_keyboard_event_handler`, `set_mouse_click_handler`,
   `set_mouse_move_handler`, `set_wheel_handler`,
   `set_cursor_enter_leave_handler`, `set_focused_handler`, `set_resize_handler`,
@@ -60,14 +75,109 @@ The pointers group into:
   contract as of API ≥ 31 — see below).
 - **Window handles** — `get_window_handle`, `get_display_handle`,
   `get_window_handle_type` (for GPU surface creation).
-- **Menus** — `set_application_menu`, `show_context_menu`, `open_devtools`.
+- **Menus** — `set_application_menu`, `show_context_menu`, and from API 41
+  `show_context_menu_ex` (a close callback fired exactly once; the backend takes
+  the template), `menu_capabilities`, and the `test_trigger_menu_accelerator` /
+  `test_dismiss_context_menu` hooks. App-menu accelerators fire their items on
+  every desktop backend from API 41. See [menus.md](menus.md).
+- **DevTools** — `open_devtools` and, from API 40, `close_devtools`,
+  `is_devtools_open` and `is_devtools_enabled` (read back from the engine;
+  `LAUFEY_INSPECTABLE=0` / `"inspectable": false` turns DevTools off for the
+  process). See [devtools.md](devtools.md).
 - **Dialogs** — `show_dialog`, `string_free`.
 - **Dock / taskbar** — `set_dock_badge`, `bounce_dock`, `set_dock_menu`,
   `set_dock_visible`, `set_dock_reopen_handler`.
+- **Deep links** (API ≥ 35) — `set_open_url_handler`, macOS-only and buffered
+  until a handler registers (see [deep-links.md](deep-links.md)).
+- **Single instance** (API ≥ 36) — `set_second_instance_handler`: a later launch
+  of the app forwarded by the opt-in single-instance lock (arguments and working
+  directory), buffered until a handler registers. CEF and WebView on every
+  desktop OS; `NULL` on Winit (see
+  [deep-links.md](deep-links.md#single-instance)).
+- **Window state, screens and chrome** (API ≥ 38) — `set_window_state` /
+  `get_window_state` / `set_window_state_handler` (maximize, minimize, restore,
+  fullscreen with change events), `set_window_size_constraints` /
+  `get_window_size_constraints`, `get_screens` / `get_window_screen` /
+  `set_display_changed_handler`, `window_capabilities` (what this backend / OS
+  can do), `set_window_titlebar_style` / `set_window_traffic_light_position`
+  (macOS), `set_window_backdrop` (Mica / Acrylic on Windows 11, vibrancy on
+  macOS), `get_window_normal_bounds`, `set_quit_on_last_window_closed`, the
+  `quit` contract (ends the loop like the last window closing) and, from API 46,
+  `exit_app` (`quit` with the process's exit code, without waiting for the
+  calling thread; see [backends.md](backends.md#how-an-app-ends)). See
+  [window-management.md](window-management.md). API 39 adds the
+  `LAUFEY_WINDOW_CAP_FILE_*` bits for drag and drop and file dialogs.
+- **Drag and drop** (API ≥ 39) — `set_file_drop_handler` (files dragged over and
+  dropped on a window, with native paths; the page keeps its DOM drag events),
+  `start_file_drag` (drag files out to other apps), and the
+  `test_trigger_file_drop` hook. See [drag-and-drop.md](drag-and-drop.md).
+- **File dialogs** (API ≥ 39) — `show_file_dialog` (the OS's open / save /
+  folder dialog, from any thread, resolved through a callback; never blocks the
+  caller), `cancel_file_dialog`, and the `test_file_dialog_respond` hook. See
+  [file-dialogs.md](file-dialogs.md).
+- **Clipboard** — `read_clipboard_text` / `write_clipboard_text` (API ≥ 27) and,
+  from API 39, `clipboard_capabilities`, HTML and PNG reads and writes,
+  `read_clipboard_formats`, `set_clipboard_change_handler` and `buffer_free`;
+  every clipboard call may then be made from any thread. See
+  [clipboard.md](clipboard.md).
+- **Passkeys** (API ≥ 37) — `passkey_capabilities`, `passkey_request`: WebAuthn
+  ceremonies through the OS platform authenticator, one at a time, with the
+  result (a JSON envelope) delivered exactly once on any thread. macOS and
+  Windows; not supported on Linux; `NULL` on Winit (see
+  [passkeys.md](passkeys.md)).
+- **Global shortcuts** (API ≥ 40) — `system_capabilities`,
+  `set_shortcut_handler`, `register_shortcut` (any thread, never blocks, the
+  result delivered exactly once: OK with the canonical accelerator, or INVALID /
+  CONFLICT / ALREADY_REGISTERED / NOT_SUPPORTED / DENIED / FAILED),
+  `unregister_shortcut`, `unregister_all_shortcuts`, `list_shortcuts`,
+  `canonicalize_accelerator` and the `test_trigger_shortcut` hook. macOS,
+  Windows, X11 and the Wayland portal; `NULL` on Winit (see
+  [global-shortcuts.md](global-shortcuts.md)).
+- **Launch at login** (API ≥ 40) — `get_launch_at_login`, `set_launch_at_login`
+  (`SMAppService`, the HKCU `Run` key, XDG autostart; `NULL` on Winit; see
+  [launch-at-login.md](launch-at-login.md)).
 - **Tray** — `create_tray_icon`, `destroy_tray_icon`, `set_tray_icon`(`_dark`),
   `set_tray_tooltip`, `set_tray_menu`, click handlers, `get_tray_icon_bounds`.
-- **Notifications** — `show_notification`, `close_notification`.
-- **Permissions** — `query_permission`, `request_permission`.
+  On Linux `create_tray_icon` returns 0 when the session has no tray host (no
+  `org.kde.StatusNotifierWatcher` and no XEmbed tray, as on stock GNOME); the
+  reason is `tray_unavailable_reason` (the tray part of the probe only) and
+  `platform_features`' `"trayReason"`.
+- **Platform features** (API ≥ 45) — `platform_features`: what this session
+  provides, as JSON (the tray host, the Secret Service, the notification server,
+  the session type, the portal versions, CEF's cookie store);
+  `tray_unavailable_reason`; `set_platform_features_changed_handler` (fires when
+  a tray host appears or goes away: create the tray again). See
+  [platform-features.md](platform-features.md).
+- **Title bar preferences** (API ≥ 47) — `title_bar_preferences`: how the user
+  set up title bars (the buttons on each side, the double-click action, the
+  colour scheme, the accent colour, the title bar font), as JSON, for an app
+  that draws its own; `set_title_bar_preferences_changed_handler` (fires when
+  that answer changes). See [title-bar.md](title-bar.md).
+- **Secure store** (API ≥ 47) — `secret_lookup`, `secret_store`,
+  `secret_delete`: a small secret per (service, account) in the Secret Service
+  on Linux and in the Keychain on macOS, as an item only the app may read
+  without a prompt (CEF and WebView; what another program can write, and what an
+  unsigned or ad-hoc build shares, in secure-store.md), blocking with a timeout;
+  a missing provider or a locked keyring is `LAUFEY_SECRET_UNAVAILABLE` with a
+  reason, never "not found" and never a hang. `NULL` elsewhere. See
+  [secure-store.md](secure-store.md).
+- **Notifications** — `show_notification`, `close_notification`, and from API 41
+  the `"schedule_at"` and `"data"` options, `notification_capabilities`,
+  `set_notification_response_handler` (clicks no live callback owns, buffered
+  until a handler registers: the cold-start click),
+  `list_scheduled_notifications`, `cancel_notification` and the
+  `test_notification_respond` hook. See [notifications.md](notifications.md).
+- **Permissions** — `query_permission`, `request_permission`
+  (`LAUFEY_PERMISSION_NOTIFICATIONS_PROVISIONAL` from API 41).
+- **Auth session** (API ≥ 42) — `auth_session_capabilities`,
+  `auth_session_start` (an OS-run browser sign-in that ends at a callback URL,
+  one at a time, the result delivered exactly once on any thread), from API 43
+  `auth_session_cancel` (the app ends the running session: `CANCELLED`, once),
+  and the `test_cancel_auth_session` hook. macOS `ASWebAuthenticationSession`
+  (WKWebView and CEF); `NOT_SUPPORTED` on Windows and Linux, where RFC 8252 says
+  to use the system browser, and `auth_session_cancel` answers `false` there;
+  `NULL` on Winit, except `auth_session_cancel`, which answers `false` (see
+  [auth-session.md](auth-session.md)).
 - **Custom URL scheme handler** (API ≥ 26) — `register_scheme_handler`,
   `scheme_request_read_body`, `scheme_response_begin`, `scheme_response_write`,
   `scheme_response_finish`.
@@ -95,9 +205,12 @@ JS-callback handles:
 - **Free:** `value_free`.
 
 **Ownership.** Constructors return a value the caller owns and must `value_free`
-(unless handed off). Functions that accept a template — `set_application_menu`,
-`show_context_menu`, `set_tray_menu`, `set_dock_menu`, `show_notification` —
-take ownership of the passed value and free it themselves.
+(unless handed off). So do `value_list_get` and `value_dict_get`: each returns a
+new value (a copy of the item or entry), or `NULL` when there is none, which the
+caller frees with `value_free`; the container is unchanged by that. Functions
+that accept a template — `set_application_menu`, `show_context_menu`,
+`set_tray_menu`, `set_dock_menu`, `show_notification` — take ownership of the
+passed value and free it themselves.
 
 A `_callback` value wraps a JS function passed as an argument: read its
 `value_get_callback_id`, then call it later with `invoke_js_callback(id, args)`
@@ -115,6 +228,48 @@ and free it with `release_js_callback(id)`.
    error)` — resolving or rejecting the
    JS-side promise.
 
+`call_id` is issued by the backend, unique in the process; it is not the page's
+own number for the call. An answer reaches exactly the call that asked, and an
+id that was never issued or was already answered reaches nothing.
+
+Only a window's top-level document can call: CEF binds the namespace in the main
+frame and drops a call from any other frame, WKWebView takes script messages
+from the main frame only, WebView2 the top document's, and on WebKitGTK the top
+frame's bridge script sends a per-window token.
+
+### The calling document's origin (API ≥ 44)
+
+```c
+typedef void (*laufey_js_call_ex_fn)(void* user_data, uint32_t window_id,
+                                     uint64_t call_id, const char* method_path,
+                                     laufey_value_t* args, const char* origin);
+void (*set_js_call_handler_ex)(void* backend_data, laufey_js_call_ex_fn handler,
+                               void* user_data);
+```
+
+A window's top-level document can navigate anywhere, and the bridge goes with
+it. `set_js_call_handler_ex` registers a handler that also receives the origin
+of the document that made each call, so the runtime can refuse a binding to a
+document it doesn't trust. `origin` is the HTML serialization: lowercase
+`scheme://host`, plus `:port` when the port isn't the scheme's default
+(`"myapp://app"`, `"http://127.0.0.1:5173"`), or `"null"` for an opaque origin
+(`about:blank`, `data:`, `file:`). It is never `NULL` and is valid for the
+duration of the call. Each backend takes it from the engine, not from the page:
+CEF from the frame's URL in the browser process, WKWebView from the frame's
+`securityOrigin`, WebView2 from the message's source, WebKitGTK from the web
+view's URL.
+
+There is one handler slot: while an ex handler is set it receives every call and
+the plain handler none; a `NULL` ex handler gives the slot back. Winit accepts
+the handler and never calls it (no web engine).
+
+A packaged app also pins its bridge in [laufey-launch.json](launch-config.md):
+`"bridgeOrigins"`, or by default one `<scheme>://*` per `"customSchemes"` entry.
+A document on any other origin gets no bridge namespace, and a call from one is
+rejected by the backend (`"laufey: this page's origin may not call the app"`)
+before it reaches either handler. Without a launch file, or with one that pins
+neither key, every origin may call, as before API 44.
+
 `execute_js` runs a script in a window and delivers its result/error through a
 `laufey_js_result_fn`. When the runtime services calls off the UI thread, the
 backend signals readiness via `set_js_call_notify` and the runtime drains the
@@ -131,7 +286,11 @@ embedded browser over an in-memory byte channel instead of a TCP loopback.
    `register_scheme_handler(scheme, handler, on_cancel,
    user_data)` with the
    scheme name (e.g. `"app"`, no `://`). The backend registers it as a standard,
-   secure, fetch/CORS-enabled scheme and installs a handler factory.
+   secure, fetch/CORS-enabled scheme and installs a handler factory. Call it
+   once per scheme: every web-engine backend serves the built-in `app`, and an
+   embedder may add its own (`"myapp"`). One handler serves every registered
+   scheme (a later call replaces the handler and adds the scheme), so dispatch
+   on the request URL.
 2. When the webview requests `<scheme>://…`, the backend invokes `handler` with
    request metadata (method, URL, headers) and an opaque
    `laufey_scheme_exchange_t*`. Headers use a flat `name\0value\0…\0` encoding
@@ -140,12 +299,62 @@ embedded browser over an in-memory byte channel instead of a TCP loopback.
    (returns >0 bytes, 0 at EOF, <0 on error), then streams the response:
    `scheme_response_begin(status, headers)` once, `scheme_response_write(bytes)`
    any number of times, and `scheme_response_finish` to release the exchange.
+   Every web-engine backend buffers the whole request body before it invokes
+   `handler`, so `scheme_request_read_body` returns immediately. On Linux this
+   needs WebKitGTK 2.40 or newer (`webkit_uri_scheme_request_get_http_body`); a
+   WebView backend built against an older WebKitGTK forwards every request with
+   an empty body.
+
+`scheme_response_write` never blocks. It returns `len` when it took the bytes
+and, from API 44, **0** when it took none because the page is behind: the
+backend already holds its high-water mark (4 MiB) of the response. The runtime
+then waits (a few milliseconds, or until `on_cancel`) and writes the same bytes
+again; a write is taken whole whenever less than the mark is waiting, never in
+part. See [custom-schemes.md](custom-schemes.md) for each backend.
 
 If the webview cancels (navigation away, window closed) before the response
 finishes, `scheme_response_write` / `scheme_request_read_body` return negative;
-the runtime should stop and call `scheme_response_finish`. Backends predating
-API version 26 leave these pointers `NULL`; the runtime must null-check and fall
-back to a socket transport.
+the runtime should stop and call `scheme_response_finish`. A backend without a
+web engine (Winit) leaves these pointers `NULL`; the runtime must null-check and
+fall back to a socket transport.
+
+### Registered schemes are real origins
+
+A page served over a registered scheme behaves like an `https` origin on every
+web-engine backend: `location.origin` is `<scheme>://<host>`, `isSecureContext`
+is true (so `crypto.subtle` and other secure-only APIs work), same-origin
+`fetch` streams the response as the runtime writes it, cross-origin requests
+carry `Origin: <scheme>://<host>` and honor CORS, and `localStorage` / IndexedDB
+are scoped to that origin. On the WebView backends that storage persists across
+launches; the CEF host keeps its profile in a per-process temporary directory,
+so there it lasts for one run, as for any other origin. Scheme names follow the
+RFC 3986 grammar (a letter, then letters, digits, `+`, `-`, `.`), are
+case-insensitive and stored lowercase; an invalid name is logged and ignored.
+
+**Register every scheme before creating the first window.** The engines read
+their scheme tables when a web view is created — the `WKWebViewConfiguration` on
+macOS, the default `WebKitWebContext` on Linux, the WebView2 environment options
+on Windows — so a scheme registered after a window exists is not served by that
+window. WebView2 goes further: all environments in a process share one user data
+folder and must carry identical custom-scheme registrations, so the backend
+freezes the set at the first window and later registrations are logged and
+ignored. WebKitGTK is the lenient one: its schemes live on the shared web
+context, so a late registration reaches existing windows too — portable code
+must not rely on it. The WebView backends warn on stderr when the contract is
+broken.
+
+The CEF backend needs one more step. Chromium learns custom schemes in
+`CefApp::OnRegisterCustomSchemes`, which runs during `CefInitialize` in every
+process — before the runtime library is loaded and can call
+`register_scheme_handler`. The embedder therefore declares its schemes when it
+launches the CEF host, either as `--laufey-custom-schemes=myapp,other` or as
+`LAUFEY_CUSTOM_SCHEMES=myapp,other` (comma-separated; `app` is implicit). The
+browser process forwards the switch to its renderer and utility processes. On
+CEF, registration timing does not matter for a declared scheme: its handler
+factory is global, so every window serves it from the moment it is registered. A
+scheme that is registered at runtime but was not declared is still served, but
+as a non-standard scheme — opaque origin, insecure context — and the backend
+logs a warning.
 
 ## Close-requested handler defers the close (API ≥ 31)
 
@@ -221,8 +430,58 @@ into their async runtime from that thread; e.g. the Rust `laufey` crate's
 ahead of time rather than relying on a bare `tokio::spawn`, which requires an
 ambient runtime context this thread doesn't have.
 
+## UI-thread tasks (API ≥ 42)
+
+```c
+typedef void (*laufey_ui_task_fn)(void* data, bool ran);
+void (*dispatch_ui_task)(void* backend_data, laufey_ui_task_fn task, void* data);
+bool (*is_ui_thread)(void* backend_data);
+```
+
+`post_ui_task` hands a task to the platform's queue (a GCD block, a window
+message, a GLib idle source, a CEF task, a Winit user event) and forgets it.
+Once the event loop has ended nothing drains that queue, so a runtime thread
+waiting for such a task waits forever, and the backend's shutdown, which waits
+for the runtime thread, waits with it. `dispatch_ui_task` adds the guarantee:
+`task` is called **exactly once**, with `ran == true` on the UI thread (queued
+behind the work already posted there, never inline), or with `ran == false` when
+the loop has ended or ends before the task ran. The backend answers every
+pending task that way on the thread that ends the loop, **before** it calls
+`laufey_runtime_shutdown`, and answers later dispatches synchronously. A
+headless worker (no loop) answers every dispatch with `ran == false`.
+
+The backends' own synchronous hops ride the same guarantee: an entry point a
+runtime thread calls that has to run on the UI thread and answer (a getter such
+as `get_window_size`, `is_visible`, `get_screens`, a clipboard read, a dialog)
+waits for the UI thread through the same dispatcher. Called after the loop has
+ended, or still waiting when it ends, such a call returns at once with its
+defaults (`0`, `false`, `NULL`, an empty list) instead of waiting forever. Once
+the loop has ended the backend calls `laufey_runtime_shutdown` and waits up to
+10 seconds for the runtime's thread to return from `laufey_runtime_start` (5 on
+Winit); a runtime still running then is abandoned and the process exits without
+it. After `exit_app` it waits only 200 ms: that thread may never return.
+
+`is_ui_thread` is true on the thread that runs those tasks: the process main
+thread on macOS (every backend) and for the WebView backends, CEF's `TID_UI`
+(the main thread), the Winit event loop's thread. Both are callable from any
+thread; the shared implementation is `backend-common/include/laufey_ui_tasks.h`
+(`backend-winit-common/src/ui_tasks.rs` for Winit).
+
+In the `laufey` crate: `is_ui_thread()`, `try_run_on_ui_thread(f)` (blocks;
+inline on the UI thread; `Err(UiThreadError::Shutdown)` once the loop ended),
+`spawn_on_ui_thread(f)` (a future; never blocks), and `run_on_ui_thread(f)`
+(littledivy/laufey#79, which now hops through `dispatch_ui_task` on every
+platform and panics instead of hanging when the loop has ended). A panic in `f`
+is resumed on the caller. Blocking a thread the UI thread is itself waiting for
+deadlocks: prefer `spawn_on_ui_thread` from an async runtime.
+
 ## Threading
 
-All API calls must happen on the UI thread the backend's event loop runs on.
-`post_ui_task` hops onto it from another thread. `show_dialog` blocks on the UI
-thread but pumps OS events so other windows stay responsive.
+All API calls must happen on the UI thread the backend's event loop runs on,
+unless their documentation says otherwise. `post_ui_task` hops onto it from
+another thread, and `dispatch_ui_task` (API ≥ 42) does so with an answer
+guaranteed even when the app quits. `show_dialog` blocks on the UI thread but
+pumps OS events so other windows stay responsive. The API 38 window calls, the
+API 39 file dialogs, drag-out and every clipboard call may be made from any
+thread; the backend hops itself, and a file dialog resolves through its callback
+instead of blocking the caller.

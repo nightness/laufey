@@ -4,6 +4,7 @@
 #define LAUFEY_RUNTIME_LOADER_H_
 
 #include <string>
+#include <chrono>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -11,6 +12,9 @@
 #include <map>
 
 #include "laufey.h"
+#include "laufey_bridge_origin.h"
+#include "laufey_js_calls.h"
+#include "laufey_sync_call.h"
 #include "scheme_exchange.h"
 #include "webview_value.h"
 
@@ -43,6 +47,17 @@ class RuntimeLoader {
 
   void Shutdown();
 
+  // A headless launch (`run <script>`: a forked worker, the updater's
+  // helper; no UI loop) waits here for its runtime to return on its own,
+  // however long it runs, before Shutdown. Shutdown alone gives a runtime
+  // kRuntimeShutdownTimeout and then exits without it, the bound for a
+  // windowed app whose loop has ended; a headless runtime was cut off there
+  // (a helper waiting for the old app's processes, a long worker).
+  void WaitForRuntime() {
+    if (runtime_thread_.joinable())
+      runtime_thread_.join();
+  }
+
   void SetBackend(LaufeyBackend* backend) {
     backend_ = backend;
   }
@@ -57,34 +72,53 @@ class RuntimeLoader {
     return next_window_id_.fetch_add(1);
   }
 
-  void StoreCallWindow(uint64_t call_id, uint32_t window_id) {
-    std::lock_guard<std::mutex> lock(call_map_mutex_);
-    call_to_window_[call_id] = window_id;
+  // A bridge call travels to the runtime under a backend-issued id, not the
+  // page's own number (laufey_js_calls.h). Returns where the answer goes;
+  // false for an id the backend never issued or already answered.
+  bool TakeJsCall(uint64_t call_id, laufey_common::JsCallRoute* route) {
+    return js_calls_.Take(call_id, route);
   }
 
-  uint32_t ConsumeCallWindow(uint64_t call_id) {
-    std::lock_guard<std::mutex> lock(call_map_mutex_);
-    auto it = call_to_window_.find(call_id);
-    if (it != call_to_window_.end()) {
-      uint32_t wid = it->second;
-      call_to_window_.erase(it);
-      return wid;
-    }
-    return 0;
-  }
-
-  void OnJsCall(uint32_t window_id, uint64_t call_id,
-                const std::string& method_path, laufey::ValuePtr args);
+  // `page_call_id` is the number the page gave the call (its bridge script's
+  // callId); the runtime sees a backend-issued id instead.
+  // `origin` is the serialized origin of the calling document (a call from
+  // one the bridge policy refuses is answered with an error right away).
+  void OnJsCall(uint32_t window_id, uint64_t page_call_id,
+                const std::string& method_path, laufey::ValuePtr args,
+                const std::string& origin);
 
   void PollPendingJsCalls();
 
-  void JsCallRespond(uint32_t window_id, uint64_t call_id,
+  // Answers the page's call `page_call_id` in `window_id`.
+  void JsCallRespond(uint32_t window_id, uint64_t page_call_id,
                      laufey::ValuePtr result, laufey::ValuePtr error);
+
+  // Answers the call the runtime knows as `call_id` (a backend-issued id);
+  // nothing for an unknown or answered id.
+  void RespondToCall(uint64_t call_id, laufey::ValuePtr result,
+                     laufey::ValuePtr error);
 
   void SetJsCallHandler(laufey_js_call_fn handler, void* user_data) {
     std::lock_guard<std::mutex> lock(handler_mutex_);
     js_call_handler_ = handler;
     js_call_user_data_ = user_data;
+  }
+
+  // API 44: the handler that also receives the calling document's origin.
+  // While set, it takes every call (see laufey.h).
+  void SetJsCallHandlerEx(laufey_js_call_ex_fn handler, void* user_data) {
+    std::lock_guard<std::mutex> lock(handler_mutex_);
+    js_call_handler_ex_ = handler;
+    js_call_user_data_ex_ = user_data;
+  }
+
+  // The origins the launch file lets use the bridge (laufey_bridge_origin.h).
+  const laufey_common::BridgeOriginPolicy& BridgePolicy() const;
+
+  // The JS expression the bridge script tests before installing anything:
+  // true when the document's origin may use the bridge.
+  std::string BridgeGuardJs() const {
+    return laufey_common::BridgeOriginGuardJs(BridgePolicy());
   }
 
   // --- Custom URL scheme handler (API >= 26) ---
@@ -100,6 +134,11 @@ class RuntimeLoader {
   void DispatchSchemeRequest(uint32_t window_id, SchemeExchangeBase* exchange,
                              const std::string& method, const std::string& url,
                              const std::string& flat_headers);
+  // The engine cancelled `exchange` before the runtime finished it: call the
+  // registered on_cancel, if any. Backends call it through their
+  // SchemeCancelGate (laufey_scheme_cancel.h): at most once, never after
+  // the exchange was finished.
+  void DispatchSchemeCancel(SchemeExchangeBase* exchange);
 
   void SetKeyboardEventHandler(laufey_keyboard_event_fn handler,
                                void* user_data) {
@@ -290,6 +329,12 @@ class RuntimeLoader {
   laufey_runtime_shutdown_fn shutdown_fn_ = nullptr;
 
   std::thread runtime_thread_;
+  // Signalled as the runtime thread ends (laufey_start returned).
+  laufey_common::ThreadExit runtime_exit_;
+  // How long Shutdown waits for the runtime thread before abandoning it.
+  static constexpr std::chrono::milliseconds kRuntimeShutdownTimeout{10000};
+  // How long it waits after exit_app, whose caller may never return.
+  static constexpr std::chrono::milliseconds kRuntimeExitGrace{200};
   std::atomic<bool> running_{false};
 
   LaufeyBackend* backend_ = nullptr;
@@ -297,6 +342,8 @@ class RuntimeLoader {
 
   laufey_js_call_fn js_call_handler_ = nullptr;
   void* js_call_user_data_ = nullptr;
+  laufey_js_call_ex_fn js_call_handler_ex_ = nullptr;
+  void* js_call_user_data_ex_ = nullptr;
   std::mutex handler_mutex_;
 
   laufey_scheme_request_fn scheme_request_handler_ = nullptr;
@@ -345,8 +392,7 @@ class RuntimeLoader {
   std::mutex page_load_mutex_;
 
   std::atomic<uint32_t> next_window_id_{1};
-  std::map<uint64_t, uint32_t> call_to_window_;
-  std::mutex call_map_mutex_;
+  laufey_common::JsCallTable js_calls_;
 
   void (*js_call_notify_fn_)(void*) = nullptr;
   void* js_call_notify_data_ = nullptr;
@@ -360,6 +406,7 @@ class RuntimeLoader {
     uint64_t call_id;
     std::string method_path;
     laufey::ValuePtr args;
+    std::string origin;
   };
   std::queue<PendingJsCall> pending_js_calls_;
   std::mutex pending_mutex_;
@@ -389,8 +436,22 @@ class LaufeyBackend {
                          laufey_js_result_fn callback, void* callback_data) = 0;
   virtual void SetWindowSize(uint32_t window_id, int width, int height) = 0;
   virtual void GetWindowSize(uint32_t window_id, int* width, int* height) = 0;
+  // Chrome-inclusive size in the same space as GetWindowSize. Default is
+  // the content size (no client chrome).
+  virtual void GetWindowOuterSize(uint32_t window_id, int* width, int* height) {
+    GetWindowSize(window_id, width, height);
+  }
+  // Physical pixels per DIP (`window.devicePixelRatio`). Default 1.0.
+  virtual double GetWindowScaleFactor(uint32_t /*window_id*/) {
+    return 1.0;
+  }
   virtual void SetWindowPosition(uint32_t window_id, int x, int y) = 0;
   virtual void GetWindowPosition(uint32_t window_id, int* x, int* y) = 0;
+  // Content-view origin in the same space as GetWindowPosition. Default is
+  // the frame origin (no chrome offset).
+  virtual void GetWindowInnerPosition(uint32_t window_id, int* x, int* y) {
+    GetWindowPosition(window_id, x, y);
+  }
   virtual void SetResizable(uint32_t window_id, bool resizable) = 0;
   virtual bool IsResizable(uint32_t window_id) = 0;
   virtual void SetAlwaysOnTop(uint32_t window_id, bool always_on_top) = 0;
@@ -426,8 +487,16 @@ class LaufeyBackend {
 
   // Global operations
   virtual void Quit() = 0;
-  virtual void PostUiTask(void (*task)(void*), void* data) = 0;
+  // Queues `task(data)` on the UI thread; false if it could not be queued
+  // (it will never run).
+  virtual bool PostUiTask(void (*task)(void*), void* data) = 0;
   virtual void Run() = 0;
+  // After the loop has ended and the runtime has been shut down, before the
+  // process ends: get what the pages stored (localStorage) onto disk, waiting
+  // a bounded time. The WebKit ports write localStorage in a transaction that
+  // stays open up to 500 ms after a write, from another process, so a write
+  // made just before the app ended was lost now and then. UI thread.
+  virtual void FlushWebStorage() {}
 
   // JS interop (broadcast to all windows for callback operations)
   virtual void InvokeJsCallback(uint32_t window_id, uint64_t callback_id,
@@ -513,6 +582,225 @@ class LaufeyBackend {
   virtual void SetDockReopenHandler(laufey_dock_reopen_fn /*handler*/,
                                     void* /*user_data*/) {}
 
+  // --- Deep links / custom URL schemes ---
+  // macOS only (AppKit's application:openURLs:); Windows/Linux get the URL as
+  // argv in a brand-new process, which is the embedder's to handle. The
+  // default no-op leaves the C ABI pointer inert on those platforms.
+  virtual void SetOpenUrlHandler(laufey_open_url_fn /*handler*/,
+                                 void* /*user_data*/) {}
+  virtual bool TestTriggerOpenUrl(const char* /*url*/) {
+    return false;
+  }
+
+  // --- Single instance ---
+  // Desktop backends forward to laufey_common::SetSecondInstanceHandler
+  // (backend-common, which iOS doesn't link); the default no-op leaves the
+  // handler inert.
+  virtual void SetSecondInstanceHandler(laufey_second_instance_fn /*handler*/,
+                                        void* /*user_data*/) {}
+
+  // --- Passkeys (API >= 37) ---
+  // The macOS and Windows backends override both with laufey_passkey.h
+  // (backend-common, which iOS doesn't link). The defaults are the answer of
+  // a platform without a passkey API (Linux, iOS): no capabilities, and every
+  // request refused with not_supported before its options are read (the text
+  // of laufey_common::PasskeyReportNotSupported).
+  virtual uint32_t PasskeyCapabilities() {
+    return 0;
+  }
+  virtual void PasskeyRequest(uint32_t /*window_id*/, uint32_t /*kind*/,
+                              const char* /*options_json*/,
+                              laufey_passkey_result_fn callback,
+                              void* user_data) {
+    if (callback) {
+      callback(user_data,
+               "{\"ok\":false,\"error\":{\"code\":\"not_supported\","
+               "\"message\":\"Native passkeys are not supported on this "
+               "platform.\"}}");
+    }
+  }
+
+  // --- Drag and drop, file dialogs, rich clipboard (API >= 39) ---
+  // See laufey.h. The desktop backends override these with laufey_io.h
+  // (backend-common, which iOS doesn't link). The defaults are a backend that
+  // has none of it: no drop events, drag-out and dialogs answering FAILED
+  // (exactly once, on the calling thread), plain-text clipboard only.
+  virtual void SetFileDropHandler(laufey_file_drop_fn /*handler*/,
+                                  void* /*user_data*/) {}
+  virtual bool TestTriggerFileDrop(uint32_t /*window_id*/, int /*phase*/,
+                                   double /*x*/, double /*y*/,
+                                   const char* const* /*paths*/,
+                                   size_t /*count*/) {
+    return false;
+  }
+  virtual void StartFileDrag(uint32_t /*window_id*/,
+                             const char* const* /*paths*/, size_t /*count*/,
+                             const uint8_t* /*icon_png*/, size_t /*icon_len*/,
+                             laufey_drag_result_fn callback, void* user_data) {
+    if (callback)
+      callback(user_data, LAUFEY_DRAG_RESULT_FAILED);
+  }
+  virtual uint32_t ShowFileDialog(uint32_t /*window_id*/,
+                                  const laufey_file_dialog_options_t* /*opts*/,
+                                  laufey_file_dialog_result_fn callback,
+                                  void* user_data) {
+    if (callback)
+      callback(user_data, 0, LAUFEY_FILE_DIALOG_FAILED, nullptr, 0);
+    return 0;
+  }
+  virtual bool CancelFileDialog(uint32_t /*dialog_id*/) {
+    return false;
+  }
+  virtual bool TestFileDialogRespond(int /*action*/, const char* /*path*/) {
+    return false;
+  }
+  virtual uint32_t ClipboardCapabilities() {
+    return LAUFEY_CLIPBOARD_CAP_TEXT;
+  }
+  virtual char* ReadClipboardHtml() {
+    return nullptr;
+  }
+  virtual bool WriteClipboardHtml(const std::string& /*html*/,
+                                  const char* /*text_or_null*/) {
+    return false;
+  }
+  virtual uint8_t* ReadClipboardImage(size_t* len_out) {
+    if (len_out)
+      *len_out = 0;
+    return nullptr;
+  }
+  virtual bool WriteClipboardImage(const uint8_t* /*png*/, size_t /*len*/) {
+    return false;
+  }
+  virtual char* ReadClipboardFormats() {
+    return nullptr;
+  }
+  virtual void SetClipboardChangeHandler(laufey_clipboard_change_fn /*fn*/,
+                                         void* /*user_data*/) {}
+
+  // --- Global shortcuts, launch at login, DevTools (API >= 40) ---
+  // See laufey.h. The desktop backends override these with laufey_system.h
+  // (backend-common, which iOS doesn't link). The defaults are a backend that
+  // has none of it: registrations answer NOT_SUPPORTED (exactly once, on the
+  // calling thread), launch at login is NOT_SUPPORTED, DevTools stay closed.
+  virtual uint32_t SystemCapabilities() {
+    return 0;
+  }
+  virtual void SetShortcutHandler(laufey_shortcut_fn /*handler*/,
+                                  void* /*user_data*/) {}
+  virtual void RegisterShortcut(const char* /*accelerator*/,
+                                laufey_shortcut_result_fn callback,
+                                void* user_data) {
+    if (callback)
+      callback(user_data, LAUFEY_SHORTCUT_NOT_SUPPORTED, nullptr);
+  }
+  virtual bool UnregisterShortcut(const char* /*accelerator*/) {
+    return false;
+  }
+  virtual void UnregisterAllShortcuts() {}
+  virtual char* ListShortcuts() {
+    char* s = static_cast<char*>(malloc(1));
+    if (s)
+      s[0] = 0;
+    return s;
+  }
+  virtual char* CanonicalizeAccelerator(const char* /*accelerator*/) {
+    return nullptr;
+  }
+
+  // --- Platform features (API 45) -------------------------------------------
+  // The platform_features JSON (malloc'd, freed with string_free); NULL
+  // where the backend can't say (iOS, which has no backend-common).
+  virtual char* PlatformFeatures() {
+    return nullptr;
+  }
+  virtual bool TestTriggerShortcut(const char* /*accelerator*/) {
+    return false;
+  }
+  virtual int GetLaunchAtLogin() {
+    return LAUFEY_LOGIN_ITEM_NOT_SUPPORTED;
+  }
+  virtual int SetLaunchAtLogin(bool /*enabled*/, std::string* /*error*/) {
+    return LAUFEY_LOGIN_ITEM_NOT_SUPPORTED;
+  }
+  virtual void CloseDevTools(uint32_t /*window_id*/) {}
+  virtual bool IsDevToolsOpen(uint32_t /*window_id*/) {
+    return false;
+  }
+  virtual bool IsDevToolsEnabled(uint32_t /*window_id*/) {
+    return false;
+  }
+
+  // --- Window state, constraints, screens and chrome (API >= 38) ---
+  // See laufey.h. The defaults are a backend that can do none of it (iOS):
+  // no capabilities, every setter a no-op or false, getters "unknown".
+  virtual uint32_t WindowCapabilities() {
+    return 0;
+  }
+  virtual void SetWindowState(uint32_t /*window_id*/, int /*action*/) {}
+  virtual uint32_t GetWindowState(uint32_t /*window_id*/) {
+    return 0;
+  }
+  virtual void SetWindowStateHandler(laufey_window_state_fn /*handler*/,
+                                     void* /*user_data*/) {}
+  virtual void SetWindowSizeConstraints(uint32_t /*window_id*/,
+                                        int /*min_width*/, int /*min_height*/,
+                                        int /*max_width*/, int /*max_height*/) {
+  }
+  virtual void GetWindowSizeConstraints(uint32_t /*window_id*/, int* min_width,
+                                        int* min_height, int* max_width,
+                                        int* max_height) {
+    for (int* p : {min_width, min_height, max_width, max_height}) {
+      if (p)
+        *p = 0;
+    }
+  }
+  virtual size_t GetScreens(laufey_screen_t* /*out*/, size_t /*capacity*/) {
+    return 0;
+  }
+  virtual int64_t GetWindowScreen(uint32_t /*window_id*/) {
+    return 0;
+  }
+  virtual void SetDisplayChangedHandler(laufey_display_changed_fn /*handler*/,
+                                        void* /*user_data*/) {}
+  virtual bool SetWindowTitlebarStyle(uint32_t /*window_id*/, int /*style*/) {
+    return false;
+  }
+  virtual bool SetWindowTrafficLightPosition(uint32_t /*window_id*/, int /*x*/,
+                                             int /*y*/) {
+    return false;
+  }
+  virtual bool SetWindowBackdrop(uint32_t /*window_id*/, int /*backdrop*/,
+                                 int /*material*/) {
+    return false;
+  }
+  virtual bool GetWindowNormalBounds(uint32_t /*window_id*/, int* /*x*/,
+                                     int* /*y*/, int* /*width*/,
+                                     int* /*height*/) {
+    return false;
+  }
+  virtual void SetQuitOnLastWindowClosed(bool /*quit*/) {}
+
+  // --- Auth session (API >= 42) ---
+  // The macOS backend overrides both with laufey_auth_session.h
+  // (ASWebAuthenticationSession). The defaults are the answer of a platform
+  // without an OS auth session (Windows, Linux, iOS): no capabilities, every
+  // request NOT_SUPPORTED (RFC 8252: the embedder opens the system browser).
+  virtual uint32_t AuthSessionCapabilities() {
+    return 0;
+  }
+  virtual void AuthSessionStart(uint32_t /*window_id*/, const char* /*url*/,
+                                const char* /*callback*/, uint32_t /*flags*/,
+                                laufey_auth_session_result_fn on_result,
+                                void* user_data) {
+    if (on_result) {
+      on_result(user_data, LAUFEY_AUTH_SESSION_NOT_SUPPORTED,
+                "this platform has no OS auth session; open the system "
+                "browser and receive the redirect through a loopback or "
+                "custom-scheme listener (RFC 8252)");
+    }
+  }
+
   // --- Tray / status-bar icon ---
   virtual uint32_t CreateTrayIcon() {
     return 0;
@@ -554,11 +842,54 @@ class LaufeyBackend {
   }
   virtual void CloseNotification(uint32_t /*notification_id*/) {}
 
+  // --- Notifications: scheduling, actions, responses (API >= 41) ---
+  // See laufey.h. The desktop backends override these with
+  // laufey_notifications.h (backend-common, which iOS doesn't link). The
+  // defaults are a backend without notifications.
+  virtual uint32_t NotificationCapabilities() {
+    return 0;
+  }
+  virtual void SetNotificationResponseHandler(
+      laufey_notification_response_fn /*handler*/, void* /*user_data*/) {}
+  virtual void ListScheduledNotifications(laufey_notification_list_fn cb,
+                                          void* user_data) {
+    if (cb)
+      cb(user_data, "[]");
+  }
+  virtual void CancelNotification(const char* /*tag*/) {}
+  virtual bool TestNotificationRespond(const char* /*tag*/,
+                                       const char* /*action_id*/) {
+    return false;
+  }
+
+  // --- Menus: context-menu close, accelerators (API >= 41) ---
+  // The defaults are a backend without them: a context menu request that
+  // shows nothing reports its close at once.
+  virtual uint32_t MenuCapabilities() {
+    return 0;
+  }
+  virtual void ShowContextMenuEx(uint32_t window_id, int /*x*/, int /*y*/,
+                                 laufey_value_t* /*menu_template*/,
+                                 const laufey_backend_api_t* /*api*/,
+                                 laufey_menu_click_fn /*on_click*/,
+                                 void* /*on_click_data*/,
+                                 laufey_menu_closed_fn on_closed,
+                                 void* on_closed_data) {
+    if (on_closed)
+      on_closed(on_closed_data, window_id);
+  }
+  virtual bool TestDismissContextMenu() {
+    return false;
+  }
+  virtual bool TestTriggerMenuAccelerator(uint32_t /*window_id*/,
+                                          const char* /*accelerator*/) {
+    return false;
+  }
+
   // --- Permissions / runtime authorization ---
-  // Default: synchronously report UNSUPPORTED. macOS subclass overrides
-  // to drive UNUserNotificationCenter. Windows/Linux subclasses report
-  // GRANTED for LAUFEY_PERMISSION_NOTIFICATIONS (the balloon / libnotify
-  // APIs they use have no permission model).
+  // Default: synchronously report UNSUPPORTED. The desktop backends
+  // override it with laufey_notifications.h (UNUserNotificationCenter, the
+  // toast setting, a notification server on the session bus).
   virtual void QueryPermission(int /*kind*/, laufey_permission_callback_fn cb,
                                void* user_data) {
     if (cb)

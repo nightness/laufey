@@ -10,3 +10,8 @@ crate-type = ["cdylib"]
 [dependencies]
 laufey = { path = "../../capi" }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
+
+# title_bar_checks.rs: a stand-in xdg-desktop-portal Settings interface on the
+# run's private session bus (Linux).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }

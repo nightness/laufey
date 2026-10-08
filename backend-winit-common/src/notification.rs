@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::{
-  value_dict_get, value_get_bool, value_get_string, value_is_bool,
+  value_dict_entry_ref, value_get_bool, value_get_string, value_is_bool,
   value_is_dict, value_is_string, LaufeyValue,
 };
 
@@ -60,7 +60,7 @@ fn fire_event(
 
 unsafe fn read_string(dict: *mut LaufeyValue, key: &str) -> Option<String> {
   let c_key = CString::new(key).ok()?;
-  let v = value_dict_get(dict, c_key.as_ptr());
+  let v = value_dict_entry_ref(dict, c_key.as_ptr());
   if v.is_null() || !value_is_string(v) {
     return None;
   }
@@ -76,7 +76,7 @@ unsafe fn read_string(dict: *mut LaufeyValue, key: &str) -> Option<String> {
 
 unsafe fn read_bool(dict: *mut LaufeyValue, key: &str) -> Option<bool> {
   let c_key = CString::new(key).ok()?;
-  let v = value_dict_get(dict, c_key.as_ptr());
+  let v = value_dict_entry_ref(dict, c_key.as_ptr());
   if v.is_null() || !value_is_bool(v) {
     return None;
   }

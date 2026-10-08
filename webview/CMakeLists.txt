@@ -34,8 +34,20 @@ endif()
 # (those are desktop-only AppKit/GTK surfaces); it compiles just the value
 # marshalling directly into the target instead.
 if(NOT PLATFORM_IOS)
+  # Registers backend-common's unit tests with `ctest --test-dir webview/build`.
+  enable_testing()
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../backend-common
                    ${CMAKE_BINARY_DIR}/backend-common)
+
+  # The bridge's JSON parser (src/laufey_json.h) against hostile input.
+  if(LAUFEY_BUILD_TESTS)
+    add_executable(laufey_json_test tests/laufey_json_test.cc)
+    target_include_directories(laufey_json_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(laufey_json_test PRIVATE laufey_backend_common)
+    target_compile_features(laufey_json_test PRIVATE cxx_std_17)
+    add_test(NAME laufey_json_test COMMAND laufey_json_test)
+  endif()
 endif()
 
 set(LAUFEY_SRCS_COMMON
@@ -65,7 +77,30 @@ elseif(PLATFORM_WINDOWS)
   set(LAUFEY_SRCS_PLATFORM
     src/webview_windows.cc
     src/main_windows.cc
+    src/wv2_scheme_stream.cc
+    src/wv2_scheme_stream.h
   )
+  # Embed the WebView2 streaming shim (wv2_scheme_stream_shim.js) as adjacent
+  # raw string literals; MSVC caps a single literal at 16380 bytes. Re-run on
+  # every edit of the script.
+  set(_shim_js "${CMAKE_CURRENT_SOURCE_DIR}/src/wv2_scheme_stream_shim.js")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_shim_js}")
+  file(READ "${_shim_js}" _shim)
+  string(FIND "${_shim}" ")LAUFEYJS\"" _shim_bad)
+  if(NOT _shim_bad EQUAL -1)
+    message(FATAL_ERROR "wv2_scheme_stream_shim.js contains the raw-string delimiter")
+  endif()
+  string(LENGTH "${_shim}" _shim_len)
+  set(_shim_inc "")
+  set(_shim_off 0)
+  while(_shim_off LESS _shim_len)
+    string(SUBSTRING "${_shim}" ${_shim_off} 12000 _shim_part)
+    string(APPEND _shim_inc "R\"LAUFEYJS(${_shim_part})LAUFEYJS\"\n")
+    math(EXPR _shim_off "${_shim_off} + 12000")
+  endwhile()
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/wv2_scheme_stream_shim.inc"
+       CONTENT "${_shim_inc}" @ONLY)
 endif()
 
 set(LAUFEY_TARGET "laufey_webview")
@@ -154,7 +189,9 @@ elseif(PLATFORM_LINUX)
 
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(WEBKITGTK REQUIRED webkit2gtk-4.1)
-  pkg_check_modules(GTK REQUIRED gtk+-3.0)
+  # gtk+-unix-print-3.0: the printer lookup behind print_to_pdf (its
+  # header only; the symbols are libgtk-3's own).
+  pkg_check_modules(GTK REQUIRED gtk+-3.0 gtk+-unix-print-3.0)
 
   # No appindicator build dependency: the tray in backend-common
   # dlopen()s the Ayatana or legacy appindicator library at runtime.
@@ -230,8 +267,20 @@ target_include_directories(${LAUFEY_TARGET} PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${LAUFEY_INCLUDE_DIR}
 )
+if(PLATFORM_WINDOWS)
+  target_include_directories(${LAUFEY_TARGET} PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
+  )
+endif()
 
 set_target_properties(${LAUFEY_TARGET} PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED ON
 )
+
+# A headless launch (`run <script>`) runs its runtime to the end, on every
+# desktop host (backend-common/CMakeLists.txt).
+if(NOT PLATFORM_IOS)
+  laufey_add_headless_launch_test(${LAUFEY_TARGET}
+                                  "$<TARGET_FILE:${LAUFEY_TARGET}>")
+endif()

@@ -42,7 +42,9 @@ if(MSVC)
 endif()
 
 # Shared native-API implementations (notifications, tray, dock, dialogs, ...).
-# Each platform branch links laufey_backend_common below.
+# Each platform branch links laufey_backend_common below. enable_testing()
+# registers backend-common's unit tests with `ctest --test-dir cef/build`.
+enable_testing()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../backend-common
                  ${CMAKE_BINARY_DIR}/backend-common)
 
@@ -72,6 +74,8 @@ if(OS_MAC)
   set(LAUFEY_SRCS_COMMON
     src/app.cc
     src/app.h
+    src/custom_schemes.cc
+    src/custom_schemes.h
     src/scheme_handler.cc
     src/scheme_handler.h
     src/runtime_loader.cc
@@ -80,11 +84,19 @@ if(OS_MAC)
   )
 
   set(LAUFEY_SRCS_MAC
+    src/drag_paths_mac.mm
     src/main_mac.mm
   )
 
+  # The helpers read the launch file's custom schemes (custom_schemes.cc ->
+  # launch_config.cc, which validates with data_dir.cc) without linking all of
+  # laufey_backend_common.
   set(LAUFEY_HELPER_SRCS
     src/helper.cc
+    src/custom_schemes.cc
+    src/custom_schemes.h
+    ../backend-common/src/launch_config.cc
+    ../backend-common/src/data_dir.cc
     ${LAUFEY_RENDERER_SRCS}
   )
 
@@ -147,7 +159,13 @@ if(OS_MAC)
     add_executable(${_helper_target} MACOSX_BUNDLE ${LAUFEY_HELPER_SRCS})
     SET_EXECUTABLE_TARGET_PROPERTIES(${_helper_target})
     target_link_libraries(${_helper_target} libcef_dll_wrapper ${CEF_STANDARD_LIBS})
-    target_include_directories(${_helper_target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${LAUFEY_INCLUDE_DIR}")
+    # backend-common/include for the scheme-name helpers and launch file
+    # reader used by custom_schemes.cc; the helper does not link
+    # laufey_backend_common (see LAUFEY_HELPER_SRCS).
+    target_include_directories(${_helper_target} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${LAUFEY_INCLUDE_DIR}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../backend-common/include")
     set_target_properties(${_helper_target} PROPERTIES
       MACOSX_BUNDLE_INFO_PLIST ${_helper_info_plist}
       OUTPUT_NAME ${_helper_output_name}
@@ -185,34 +203,56 @@ elseif(OS_WINDOWS)
   set(LAUFEY_SRCS_COMMON
     src/app.cc
     src/app.h
+    src/custom_schemes.cc
+    src/custom_schemes.h
     src/scheme_handler.cc
     src/scheme_handler.h
     src/runtime_loader.cc
+    src/views_menu.cc
     src/runtime_loader.h
   )
 
   set(LAUFEY_SRCS_WIN
+    src/drag_paths_win.cc
     src/main_windows.cc
+    src/modal_loop_input_win.cc
     ${LAUFEY_RENDERER_SRCS}
   )
 
-  add_executable(${CEF_TARGET} WIN32 ${LAUFEY_SRCS_COMMON} ${LAUFEY_SRCS_WIN})
-  SET_EXECUTABLE_TARGET_PROPERTIES(${CEF_TARGET})
+  # Chromium's sandbox (docs/backends.md, "The Chromium sandbox"). CEF 149
+  # links the Windows sandbox into the distribution's bootstrap.exe only
+  # (USE_SANDBOX, on by default in cef_variables.cmake, defines
+  # CEF_USE_BOOTSTRAP), so with it the host is a DLL: laufey.dll exports
+  # RunWinMain, and bootstrap.exe, copied in as laufey.exe, creates the
+  # sandbox information and calls it (an <app>.exe loads the <app>.dll next
+  # to it). bootstrap.exe carries its own manifest, with the Windows 10
+  # supportedOS GUID that keeps Chromium's GPU acceleration on (see the
+  # manifest note below and denoland/deno#36523). -DUSE_SANDBOX=OFF builds
+  # the unsandboxed single laufey.exe instead.
+  if(USE_SANDBOX)
+    add_library(${CEF_TARGET} SHARED ${LAUFEY_SRCS_COMMON} ${LAUFEY_SRCS_WIN})
+    SET_LIBRARY_TARGET_PROPERTIES(${CEF_TARGET})
+  else()
+    add_executable(${CEF_TARGET} WIN32 ${LAUFEY_SRCS_COMMON} ${LAUFEY_SRCS_WIN})
+    SET_EXECUTABLE_TARGET_PROPERTIES(${CEF_TARGET})
 
-  # Embed the application manifest (win/laufey.exe.manifest merged with
-  # win/compatibility.manifest, same layout as cefclient). CEF's toolchain
-  # links with /MANIFEST:NO, so without this post-build mt.exe step the exe
-  # ships with no manifest at all. The Win10 supportedOS GUID in the
-  # compatibility section is load-bearing: GetVersionEx caps the reported OS
-  # version at Windows 8 for unmanifested exes, and Chromium then treats the
-  # OS as unsupported and disables all GPU acceleration (WebGL included) —
-  # see denoland/deno#36523.
-  ADD_WINDOWS_MANIFEST("${CMAKE_CURRENT_SOURCE_DIR}/win" "${CEF_TARGET}" "exe")
+    # Embed the application manifest (win/laufey.exe.manifest merged with
+    # win/compatibility.manifest, same layout as cefclient). CEF's toolchain
+    # links with /MANIFEST:NO, so without this post-build mt.exe step the exe
+    # ships with no manifest at all. The Win10 supportedOS GUID in the
+    # compatibility section is load-bearing: GetVersionEx caps the reported
+    # OS version at Windows 8 for unmanifested exes, and Chromium then treats
+    # the OS as unsupported and disables all GPU acceleration (WebGL
+    # included) — see denoland/deno#36523.
+    ADD_WINDOWS_MANIFEST("${CMAKE_CURRENT_SOURCE_DIR}/win" "${CEF_TARGET}" "exe")
+  endif()
 
   target_link_libraries(${CEF_TARGET} libcef_dll_wrapper ${CEF_LIB_RELEASE} ${CEF_STANDARD_LIBS} laufey_backend_common)
   target_include_directories(${CEF_TARGET} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${LAUFEY_INCLUDE_DIR}")
 
-  # Copy CEF binaries and resources to the output directory
+  # Copy CEF binaries and resources to the output directory. The
+  # distribution's bootstrap executables never ship under their own names:
+  # with the sandbox, bootstrap.exe becomes laufey.exe.
   add_custom_command(
     TARGET ${CEF_TARGET}
     POST_BUILD
@@ -222,8 +262,21 @@ elseif(OS_WINDOWS)
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CEF_RESOURCE_DIR}"
             "${CEF_TARGET_OUT_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E remove -f
+            "${CEF_TARGET_OUT_DIR}/bootstrap.exe"
+            "${CEF_TARGET_OUT_DIR}/bootstrapc.exe"
     VERBATIM
   )
+  if(USE_SANDBOX)
+    add_custom_command(
+      TARGET ${CEF_TARGET}
+      POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy
+              "${CEF_BINARY_DIR_RELEASE}/bootstrap.exe"
+              "${CEF_TARGET_OUT_DIR}/${CEF_TARGET}.exe"
+      VERBATIM
+    )
+  endif()
 
 elseif(OS_LINUX)
   set(CEF_WRAPPER_LIB "${CEF_ROOT}/libcef_dll_wrapper/libcef_dll_wrapper.a")
@@ -248,13 +301,17 @@ elseif(OS_LINUX)
   set(LAUFEY_SRCS_COMMON
     src/app.cc
     src/app.h
+    src/custom_schemes.cc
+    src/custom_schemes.h
     src/scheme_handler.cc
     src/scheme_handler.h
     src/runtime_loader.cc
+    src/views_menu.cc
     src/runtime_loader.h
   )
 
   set(LAUFEY_SRCS_LINUX
+    src/drag_paths_linux.cc
     src/main_linux.cc
     src/runtime_loader_linux.cc
     ${LAUFEY_RENDERER_SRCS}
@@ -294,4 +351,14 @@ elseif(OS_LINUX)
             "${CEF_TARGET_OUT_DIR}"
     VERBATIM
   )
+endif()
+
+# A headless launch (`run <script>`) runs its runtime to the end
+# (backend-common/CMakeLists.txt). On Windows a launch starts laufey.exe:
+# the host itself, or CEF's bootstrap in front of the host DLL.
+if(OS_WINDOWS)
+  laufey_add_headless_launch_test(${CEF_TARGET}
+    "$<TARGET_FILE_DIR:${CEF_TARGET}>/${CEF_TARGET}.exe")
+else()
+  laufey_add_headless_launch_test(${CEF_TARGET} "$<TARGET_FILE:${CEF_TARGET}>")
 endif()

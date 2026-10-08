@@ -1,58 +1,54 @@
 // Copyright 2025 Divy Srivastava. All rights reserved. MIT license.
 
 #include <gtk/gtk.h>
+#include <gtk/gtkunixprint.h>
 #include <gdk/gdkkeysyms.h>
 
 #include "runtime_loader.h"
+#include "laufey_window.h"
 #include "laufey_backend_common.h"
+#include "laufey_io.h"
+#include "laufey_platform_features.h"
+#include "laufey_launch_config.h"
+#include "laufey_menu.h"
+#include "laufey_notifications.h"
+#include "laufey_system.h"
+#include "laufey_single_instance.h"
+#include "laufey_bridge_origin.h"
 #include "laufey_json.h"
+#include "laufey_scheme_body_stream.h"
+#include "laufey_scheme_cancel.h"
+#include "laufey_scheme_registry.h"
+#include "laufey_ui_tasks.h"
 #include "init_script.h"
 #include <webkit2/webkit2.h>
 #include <JavaScriptCore/JavaScript.h>
-#include <gio/gunixinputstream.h>
 
 #include <errno.h>
+#include <sys/random.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 
 #include <iostream>
 #include <map>
 #include <mutex>
-#include <condition_variable>
+#include <set>
 
-// Helper to run a callback synchronously on the GTK main thread.
-// If already on the main thread, runs immediately.
+// Runs `fn` synchronously on the GTK main thread (inline when already
+// there). Through the UI task dispatcher (laufey_ui_tasks.h), so a call never
+// outlives the loop: false when `fn` did not run because the loop had ended,
+// and the caller answers with its defaults.
 template <typename F>
-static void gtk_invoke_sync(F&& fn) {
+static bool gtk_invoke_sync(F&& fn) {
   if (g_main_context_is_owner(g_main_context_default())) {
     fn();
-    return;
+    return true;
   }
-  std::mutex mtx;
-  std::condition_variable cv;
-  bool done = false;
-  struct Ctx {
-    F* fn;
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    bool* done;
-  };
-  Ctx ctx{&fn, &mtx, &cv, &done};
-  g_idle_add(
-      [](gpointer data) -> gboolean {
-        auto* c = static_cast<Ctx*>(data);
-        (*c->fn)();
-        {
-          std::lock_guard<std::mutex> lock(*c->mtx);
-          *c->done = true;
-        }
-        c->cv->notify_one();
-        return G_SOURCE_REMOVE;
-      },
-      &ctx);
-  std::unique_lock<std::mutex> lock(mtx);
-  cv.wait(lock, [&done] { return done; });
+  return laufey_common::RunOnUiThreadAndWait(fn);
 }
 
 namespace keyboard {
@@ -105,16 +101,97 @@ static void UnregisterWidget(GtkWidget* widget) {
   g_widget_to_laufey_id.erase(widget);
 }
 
+// DevTools: WebKitGTK opens the inspector in two steps.
+// webkit_web_inspector_show() makes the inspector's page at once (so
+// webkit_web_inspector_get_web_view() answers it), asks the inspected page's
+// web process to start, and only when that process answers loads the
+// inspector and opens it ("attach" or "open-window"). A
+// webkit_web_inspector_close() in between drops the page, but the answer
+// still arrives and opens a new one: DevTools closed right after they were
+// opened came back on their own (WebInspectorUIProxy::connect and
+// openLocalInspectorFrontend). So a close while the inspector is still
+// opening is also remembered, and done again once it has opened. GTK thread.
+namespace {
+
+struct InspectorState {
+  // Opened ("attach" / "open-window") and not closed since.
+  bool shown = false;
+  // When a close came while the inspector was still opening (0 = none). A
+  // later open clears it; an inspector that only opens long after (the web
+  // process never answered) isn't closed by a stale one.
+  gint64 close_pending_since = 0;
+};
+
+constexpr gint64 kInspectorClosePendingUsec = 10 * G_USEC_PER_SEC;
+
+InspectorState* InspectorStateOf(WebKitWebInspector* inspector) {
+  return static_cast<InspectorState*>(
+      g_object_get_data(G_OBJECT(inspector), "laufey-inspector-state"));
+}
+
+bool InspectorClosePending(InspectorState* st) {
+  return st && st->close_pending_since != 0 &&
+         g_get_monotonic_time() - st->close_pending_since <
+             kInspectorClosePendingUsec;
+}
+
+gboolean OnInspectorShown(WebKitWebInspector* inspector, gpointer) {
+  InspectorState* st = InspectorStateOf(inspector);
+  if (!st)
+    return FALSE;
+  st->shown = true;
+  if (InspectorClosePending(st)) {
+    // Not from inside WebKit's own open: once it has returned. It reads as
+    // closed meanwhile.
+    g_idle_add(
+        [](gpointer data) -> gboolean {
+          auto* insp = static_cast<WebKitWebInspector*>(data);
+          if (InspectorState* state = InspectorStateOf(insp)) {
+            if (InspectorClosePending(state))
+              webkit_web_inspector_close(insp);
+            state->close_pending_since = 0;
+          }
+          g_object_unref(insp);
+          return G_SOURCE_REMOVE;
+        },
+        g_object_ref(inspector));
+  }
+  return FALSE;  // WebKit attaches it / opens its window as usual.
+}
+
+void OnInspectorClosed(WebKitWebInspector* inspector, gpointer) {
+  if (InspectorState* st = InspectorStateOf(inspector))
+    st->shown = false;
+}
+
+void TrackInspector(WebKitWebView* webview) {
+  WebKitWebInspector* inspector = webkit_web_view_get_inspector(webview);
+  g_object_set_data_full(
+      G_OBJECT(inspector), "laufey-inspector-state", new InspectorState(),
+      [](gpointer data) { delete static_cast<InspectorState*>(data); });
+  g_signal_connect(inspector, "attach", G_CALLBACK(OnInspectorShown), nullptr);
+  g_signal_connect(inspector, "open-window", G_CALLBACK(OnInspectorShown),
+                   nullptr);
+  g_signal_connect(inspector, "closed", G_CALLBACK(OnInspectorClosed), nullptr);
+}
+
+}  // namespace
+
 // Per-window state
 struct LinuxWindowState {
   uint32_t window_id;
   GtkWidget* window;
   GtkWidget* vbox;      // container for menu bar + webview
   GtkWidget* menu_bar;  // per-window menu bar (nullptr = none)
+  // The menu bar's accelerators, bound on the window (nullptr = none).
+  GtkAccelGroup* accel_group = nullptr;
   WebKitWebView* webview;
   WebKitUserContentManager* content_manager;
   // GTK has no getter for the input shape region, so remember what we set.
   bool click_passthrough = false;
+  // The secret the bridge script of this window's top frame sends with every
+  // call (see BridgeToken). Fixed for the window's life.
+  std::string bridge_token;
 };
 
 // Track the click_count from press events for use in the corresponding release.
@@ -270,6 +347,139 @@ static gboolean on_focus_out_event(GtkWidget* widget, GdkEventFocus* event,
   return FALSE;
 }
 
+// --- File drags over a web view (API >= 39) --------------------------------
+//
+// The handlers are connected to the WebKitWebView with g_signal_connect, so
+// they run before WebKitWebViewBase's own (RUN_LAST class handlers) and only
+// observe: each returns FALSE / doesn't stop the emission, and WebKit handles
+// the drag for the page exactly as before. The paths come from the
+// text/uri-list data WebKit itself requests when a drag enters (requesting it
+// again here would hand WebKit a reply it didn't ask for), so ENTER waits for
+// that data and carries the paths. GTK emits drag-leave right before
+// drag-drop, so LEAVE is deferred to an idle callback that the drop cancels.
+// WebKit's answer decides whether the drop happens at all: a page that
+// refuses file drops (dropEffect "none") hides them from the runtime too.
+
+namespace {
+
+struct GtkFileDrag {
+  bool active = false;   // a uri-list drag is over the view
+  bool entered = false;  // ENTER was dispatched (the data had arrived)
+  std::vector<std::string> paths;
+  double x = 0, y = 0;
+  guint leave_idle = 0;
+};
+
+// Keyed by window id; UI thread only.
+std::map<uint32_t, GtkFileDrag> g_file_drags;
+
+bool DragHasUris(GdkDragContext* ctx) {
+  GdkAtom uri_list = gdk_atom_intern_static_string("text/uri-list");
+  for (GList* l = gdk_drag_context_list_targets(ctx); l; l = l->next) {
+    if (GDK_POINTER_TO_ATOM(l->data) == uri_list)
+      return true;
+  }
+  return false;
+}
+
+void EndFileDrag(uint32_t wid, bool send_leave) {
+  auto it = g_file_drags.find(wid);
+  if (it == g_file_drags.end())
+    return;
+  GtkFileDrag d = std::move(it->second);
+  g_file_drags.erase(it);
+  if (d.leave_idle)
+    g_source_remove(d.leave_idle);
+  if (send_leave && d.entered)
+    laufey_common::DispatchFileDrop(wid, LAUFEY_DRAG_LEAVE, d.x, d.y, {}, 0);
+}
+
+gboolean on_file_drag_motion(GtkWidget*, GdkDragContext* ctx, gint x, gint y,
+                             guint, gpointer user_data) {
+  if (!DragHasUris(ctx))
+    return FALSE;
+  uint32_t wid = GPOINTER_TO_UINT(user_data);
+  GtkFileDrag& d = g_file_drags[wid];
+  if (d.leave_idle) {
+    g_source_remove(d.leave_idle);
+    d.leave_idle = 0;
+  }
+  bool moved = !d.active || d.x != x || d.y != y;
+  d.active = true;
+  d.x = x;
+  d.y = y;
+  if (d.entered && moved)
+    laufey_common::DispatchFileDrop(wid, LAUFEY_DRAG_OVER, x, y, d.paths,
+                                    d.paths.size());
+  return FALSE;
+}
+
+void on_file_drag_data_received(GtkWidget*, GdkDragContext* ctx, gint, gint,
+                                GtkSelectionData* data, guint, guint,
+                                gpointer user_data) {
+  uint32_t wid = GPOINTER_TO_UINT(user_data);
+  auto it = g_file_drags.find(wid);
+  if (it == g_file_drags.end() || !it->second.active || !data)
+    return;
+  if (gtk_selection_data_get_target(data) !=
+      gdk_atom_intern_static_string("text/uri-list"))
+    return;
+  GtkFileDrag& d = it->second;
+  d.paths.clear();
+  if (gchar** uris = gtk_selection_data_get_uris(data)) {
+    for (gchar** u = uris; *u; u++) {
+      if (gchar* path = g_filename_from_uri(*u, nullptr, nullptr)) {
+        if (d.paths.size() < LAUFEY_MAX_DROP_PATHS &&
+            g_utf8_validate(path, -1, nullptr))
+          d.paths.emplace_back(path);
+        g_free(path);
+      }
+    }
+    g_strfreev(uris);
+  }
+  if (!d.entered && !d.paths.empty()) {
+    d.entered = true;
+    laufey_common::DispatchFileDrop(wid, LAUFEY_DRAG_ENTER, d.x, d.y, d.paths,
+                                    d.paths.size());
+  }
+  (void)ctx;
+}
+
+void on_file_drag_leave(GtkWidget*, GdkDragContext*, guint,
+                        gpointer user_data) {
+  uint32_t wid = GPOINTER_TO_UINT(user_data);
+  auto it = g_file_drags.find(wid);
+  if (it == g_file_drags.end() || it->second.leave_idle)
+    return;
+  it->second.leave_idle = g_idle_add(
+      [](gpointer data) -> gboolean {
+        uint32_t id = GPOINTER_TO_UINT(data);
+        auto found = g_file_drags.find(id);
+        if (found != g_file_drags.end())
+          found->second.leave_idle = 0;
+        EndFileDrag(id, true);
+        return G_SOURCE_REMOVE;
+      },
+      GUINT_TO_POINTER(wid));
+}
+
+gboolean on_file_drag_drop(GtkWidget*, GdkDragContext* ctx, gint x, gint y,
+                           guint, gpointer user_data) {
+  if (!DragHasUris(ctx))
+    return FALSE;
+  uint32_t wid = GPOINTER_TO_UINT(user_data);
+  std::vector<std::string> paths;
+  auto it = g_file_drags.find(wid);
+  if (it != g_file_drags.end())
+    paths = it->second.paths;
+  EndFileDrag(wid, false);
+  laufey_common::DispatchFileDrop(wid, LAUFEY_DRAG_DROP, x, y, paths,
+                                  paths.size());
+  return FALSE;
+}
+
+}  // namespace
+
 static gboolean on_configure_event(GtkWidget* widget, GdkEventConfigure* event,
                                    gpointer user_data) {
   uint32_t wid = LaufeyIdForWidget(widget);
@@ -278,7 +488,233 @@ static gboolean on_configure_event(GtkWidget* widget, GdkEventConfigure* event,
   RuntimeLoader::GetInstance()->DispatchResizeEvent(wid, event->width,
                                                     event->height);
   RuntimeLoader::GetInstance()->DispatchMoveEvent(wid, event->x, event->y);
+  // Normal-bounds tracker (API 38), in the get_window_position /
+  // get_window_size convention.
+  laufey_common::Bounds b;
+  gtk_window_get_position(GTK_WINDOW(widget), &b.x, &b.y);
+  gtk_window_get_size(GTK_WINDOW(widget), &b.width, &b.height);
+  laufey_common::NoteWindowGeometry(
+      wid, b, laufey_common::LastReportedWindowState(wid) == 0,
+      laufey_common::MonotonicMs());
   return FALSE;
+}
+
+// GDK window state bits to LAUFEY_WINDOW_STATE_*.
+static uint32_t LaufeyStateFromGdk(GdkWindowState s) {
+  uint32_t state = 0;
+  if (s & GDK_WINDOW_STATE_FULLSCREEN)
+    state |= LAUFEY_WINDOW_STATE_FULLSCREEN;
+  else if (s & GDK_WINDOW_STATE_MAXIMIZED)
+    state |= LAUFEY_WINDOW_STATE_MAXIMIZED;
+  if (s & GDK_WINDOW_STATE_ICONIFIED)
+    state |= LAUFEY_WINDOW_STATE_MINIMIZED;
+  return state;
+}
+
+static gboolean on_window_state_event(GtkWidget* widget,
+                                      GdkEventWindowState* event,
+                                      gpointer /*user_data*/) {
+  uint32_t wid = LaufeyIdForWidget(widget);
+  if (wid == 0)
+    return FALSE;
+  uint32_t state = LaufeyStateFromGdk(event->new_window_state);
+  if (state != 0 && laufey_common::LastReportedWindowState(wid) == 0)
+    laufey_common::NoteWindowLeftNormal(wid, laufey_common::MonotonicMs());
+  laufey_common::ReportWindowState(wid, state);
+  return FALSE;
+}
+
+// Display ids: GDK has no stable monitor id, so hash what identifies the
+// panel (manufacturer, model) plus its index among identical ones.
+static int64_t LaufeyMonitorId(GdkDisplay* display, GdkMonitor* monitor) {
+  const char* make = gdk_monitor_get_manufacturer(monitor);
+  const char* model = gdk_monitor_get_model(monitor);
+  std::string key = std::string(make ? make : "") + "/" + (model ? model : "");
+  int same = 0;
+  int n = gdk_display_get_n_monitors(display);
+  for (int i = 0; i < n; ++i) {
+    GdkMonitor* other = gdk_display_get_monitor(display, i);
+    if (other == monitor)
+      break;
+    const char* omake = gdk_monitor_get_manufacturer(other);
+    const char* omodel = gdk_monitor_get_model(other);
+    if (std::string(omake ? omake : "") + "/" + (omodel ? omodel : "") == key)
+      ++same;
+  }
+  key += "#" + std::to_string(same);
+  return laufey_common::HashDisplayName(key.data(), key.size());
+}
+
+static bool LaufeyIsWaylandDisplay(GdkDisplay* display) {
+  return display &&
+         g_strcmp0(G_OBJECT_TYPE_NAME(display), "GdkWaylandDisplay") == 0;
+}
+
+// Sets `window`'s geometry hints from its size constraints. GTK thread.
+//
+// The constraints are for the content. GTK 3 hands geometry hints to GDK as
+// they are, and GDK's Wayland backend takes them as the size of the whole
+// client-side-decorated surface (it only subtracts the shadow margins), so
+// under CSD (GNOME) the title bar and shadows came out of the content: a
+// maximum of 820x620 left 730x482 of content. Add what the decorations take
+// (the surface's frame extents less the content size; zero with server-side
+// decorations, and on X11 where the hints are the client area's). That
+// depends on the window's state (the shadow goes away when maximized or
+// tiled and comes back when floating) and is unknown before the window is
+// realized, so the hints are set again on realize and on every state change.
+static void LaufeyApplySizeHints(GtkWidget* window,
+                                 const laufey_common::SizeConstraints& c) {
+  int extra_w = 0, extra_h = 0;
+  GdkWindow* gw = gtk_widget_get_window(window);
+  if (gw && LaufeyIsWaylandDisplay(gdk_window_get_display(gw))) {
+    GdkRectangle frame = {0, 0, 0, 0};
+    gdk_window_get_frame_extents(gw, &frame);
+    int cw = 0, ch = 0;
+    gtk_window_get_size(GTK_WINDOW(window), &cw, &ch);
+    if (cw > 0 && ch > 0) {
+      extra_w = std::max(0, frame.width - cw);
+      extra_h = std::max(0, frame.height - ch);
+    }
+  }
+  GdkGeometry geometry = {};
+  int mask = 0;
+  if (c.min_width > 0 || c.min_height > 0) {
+    geometry.min_width = c.min_width > 0 ? c.min_width + extra_w : 0;
+    geometry.min_height = c.min_height > 0 ? c.min_height + extra_h : 0;
+    mask |= GDK_HINT_MIN_SIZE;
+  }
+  if (c.max_width > 0 || c.max_height > 0) {
+    geometry.max_width = c.max_width > 0 ? c.max_width + extra_w : G_MAXSHORT;
+    geometry.max_height =
+        c.max_height > 0 ? c.max_height + extra_h : G_MAXSHORT;
+    mask |= GDK_HINT_MAX_SIZE;
+  }
+  gtk_window_set_geometry_hints(GTK_WINDOW(window), nullptr,
+                                mask ? &geometry : nullptr,
+                                static_cast<GdkWindowHints>(mask));
+}
+
+// Sets the hints again for a window that has constraints (realize, and
+// after a state change).
+static void LaufeyReapplySizeHints(GtkWidget* window) {
+  uint32_t wid = LaufeyIdForWidget(window);
+  if (wid == 0 || !gtk_widget_get_realized(window))
+    return;
+  laufey_common::SizeConstraints c = laufey_common::GetSizeConstraints(wid);
+  if (c.min_width > 0 || c.min_height > 0 || c.max_width > 0 ||
+      c.max_height > 0)
+    LaufeyApplySizeHints(window, c);
+}
+
+static void on_window_realize_size_hints(GtkWidget* widget, gpointer) {
+  LaufeyReapplySizeHints(widget);
+}
+
+static gboolean on_window_state_size_hints(GtkWidget* widget,
+                                           GdkEventWindowState*, gpointer) {
+  // After GTK has restyled the decorations for the new state (the shadow
+  // margins are only right from the next main loop iteration on).
+  g_idle_add(
+      [](gpointer data) -> gboolean {
+        auto* window = static_cast<GtkWidget*>(data);
+        LaufeyReapplySizeHints(window);
+        g_object_unref(window);
+        return G_SOURCE_REMOVE;
+      },
+      g_object_ref(widget));
+  return FALSE;
+}
+
+static void on_display_monitors_changed() {
+  laufey_common::NotifyDisplayChanged();
+}
+
+static void LaufeyWatchMonitor(GdkMonitor* monitor) {
+  g_signal_connect(monitor, "notify::workarea",
+                   G_CALLBACK(+[](GObject*, GParamSpec*, gpointer) {
+                     on_display_monitors_changed();
+                   }),
+                   nullptr);
+  g_signal_connect(monitor, "notify::scale-factor",
+                   G_CALLBACK(+[](GObject*, GParamSpec*, gpointer) {
+                     on_display_monitors_changed();
+                   }),
+                   nullptr);
+  g_signal_connect(monitor, "notify::geometry",
+                   G_CALLBACK(+[](GObject*, GParamSpec*, gpointer) {
+                     on_display_monitors_changed();
+                   }),
+                   nullptr);
+}
+
+// The web context every webview (and every URI scheme registration) uses.
+// With a per-app data dir (LAUFEY_DATA_DIR / LAUFEY_APP_ID) this is an owned
+// context whose website data (localStorage, IndexedDB, caches) lives under
+// <dir>/WebKitGTK/{data,cache} and whose cookies persist to
+// <dir>/WebKitGTK/data/cookies.sqlite. Otherwise it is the default context, as
+// before (data under the prgname in the XDG dirs, cookies not persisted). GTK
+// main thread only.
+static WebKitWebContext* LaufeyWebContext() {
+  static WebKitWebContext* ctx = [] {
+    std::string root = laufey_common::AppDataSubdir("WebKitGTK");
+    if (root.empty()) {
+      return webkit_web_context_get_default();
+    }
+    std::string data_dir = laufey_common::JoinPath(root, "data");
+    std::string cache_dir = laufey_common::JoinPath(root, "cache");
+    if (!laufey_common::EnsureDirectory(data_dir) ||
+        !laufey_common::EnsureDirectory(cache_dir)) {
+      std::cerr << "laufey: could not create web data directory \"" << root
+                << "\"; web data will not be persisted per app" << std::endl;
+      return webkit_web_context_get_default();
+    }
+    WebKitWebsiteDataManager* manager = webkit_website_data_manager_new(
+        "base-data-directory", data_dir.c_str(), "base-cache-directory",
+        cache_dir.c_str(), nullptr);
+    WebKitWebContext* context =
+        webkit_web_context_new_with_website_data_manager(manager);
+    std::string cookies = laufey_common::JoinPath(data_dir, "cookies.sqlite");
+    webkit_cookie_manager_set_persistent_storage(
+        webkit_website_data_manager_get_cookie_manager(manager),
+        cookies.c_str(), WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+    g_object_unref(manager);  // the context keeps its own reference
+    return context;           // owned for the life of the process
+  }();
+  return ctx;
+}
+
+// A streamed fetch() body must reach the page as it arrives. WebKitGTK reads
+// a custom-scheme response in 8 KiB pieces (WebKitURISchemeRequest.cpp,
+// gReadBufferSize), one didReceiveData each, and with WebCore's byte-stream
+// fetch source (the ReadableByteStreamFetchSource feature, on by default)
+// a piece that arrives while the page isn't pulling is stashed in the body's
+// consumer (FetchResponse::Loader::didReceiveData), and the next pull doesn't
+// take it (FetchBodySource::pull only marks the source pulling): it waits for
+// the NEXT piece or the end of the body. So a write of 8201 bytes reached the
+// page as 8192, the 9-byte tail only with the following write. WebKit fixed
+// this upstream (https://bugs.webkit.org/show_bug.cgi?id=322545, 319981@main:
+// pull() calls feedStream()), in no WebKitGTK release yet. The non-byte
+// source does feed the stream on pull, so turn the byte source off. The same
+// change set removed the feature flag, so this does nothing on a WebKit that
+// has the fix. The cost: a fetch body is not a byte stream, so
+// res.body.getReader({ mode: "byob" }) throws (default readers, text(),
+// arrayBuffer() etc. are unaffected; new ReadableStream({ type: "bytes" })
+// still works).
+static void DisableByteStreamFetchSource(WebKitSettings* settings) {
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+  WebKitFeatureList* features = webkit_settings_get_all_features();
+  for (gsize i = 0; i < webkit_feature_list_get_length(features); ++i) {
+    WebKitFeature* feature = webkit_feature_list_get(features, i);
+    const char* id = webkit_feature_get_identifier(feature);
+    if (id && std::strcmp(id, "ReadableByteStreamFetchSource") == 0) {
+      webkit_settings_set_feature_enabled(settings, feature, FALSE);
+      break;
+    }
+  }
+  webkit_feature_list_unref(features);
+#else
+  (void)settings;
+#endif
 }
 
 // Fired as a navigation progresses through its load states. We only care about
@@ -301,15 +737,31 @@ static void on_load_changed(WebKitWebView* /*webview*/,
 // Fired when the page requests a new webview (`target="_blank"` or
 // `window.open()`). These never reach the Navigation API interceptor, so route
 // http(s) destinations to the OS browser and create no new webview.
+// `target="_blank"` / `window.open()`: no popup web view; an http(s)
+// destination opens in the OS browser when a user action started the request
+// (laufey_external_links.h). WebKitGTK's own popup blocker
+// (javascript-can-open-windows-automatically, off by default) already drops
+// most requests without one; the gesture check here covers the rest.
 static WebKitWebView* on_create(WebKitWebView* /*webview*/,
                                 WebKitNavigationAction* navigation_action,
                                 gpointer /*user_data*/) {
   WebKitURIRequest* req =
       webkit_navigation_action_get_request(navigation_action);
   const char* uri = req ? webkit_uri_request_get_uri(req) : nullptr;
-  if (uri &&
-      (g_str_has_prefix(uri, "http://") || g_str_has_prefix(uri, "https://"))) {
-    g_app_info_launch_default_for_uri(uri, nullptr, nullptr);
+  if (!uri)
+    return nullptr;
+  bool gesture = webkit_navigation_action_is_user_gesture(navigation_action);
+  switch (DecideLaufeyPopup(uri, gesture)) {
+    case LaufeyPopupDecision::kOpenInBrowser:
+      g_app_info_launch_default_for_uri(uri, nullptr, nullptr);
+      break;
+    case LaufeyPopupDecision::kBlockedNoGesture:
+      std::cerr << "laufey: not opening " << uri
+                << " in the browser: the page asked without a user gesture"
+                << std::endl;
+      break;
+    case LaufeyPopupDecision::kIgnored:
+      break;
   }
   return nullptr;
 }
@@ -354,8 +806,143 @@ class WebKitGTKBackend : public LaufeyBackend {
   void Quit() override;
   void SetWindowSize(uint32_t window_id, int width, int height) override;
   void GetWindowSize(uint32_t window_id, int* width, int* height) override;
+  void GetWindowOuterSize(uint32_t window_id, int* width, int* height) override;
+  double GetWindowScaleFactor(uint32_t window_id) override;
   void SetWindowPosition(uint32_t window_id, int x, int y) override;
+  // Drag and drop, file dialogs, rich clipboard (API >= 39).
+  void SetFileDropHandler(laufey_file_drop_fn handler,
+                          void* user_data) override {
+    laufey_common::SetFileDropHandler(handler, user_data);
+  }
+  bool TestTriggerFileDrop(uint32_t window_id, int phase, double x, double y,
+                           const char* const* paths, size_t count) override {
+    // The OS path dispatches on the GTK thread; so does the hook.
+    bool delivered = false;
+    gtk_invoke_sync([&] {
+      delivered = laufey_common::TestTriggerFileDrop(window_id, phase, x, y,
+                                                     paths, count);
+    });
+    return delivered;
+  }
+  void StartFileDrag(uint32_t window_id, const char* const* paths, size_t count,
+                     const uint8_t* icon_png, size_t icon_len,
+                     laufey_drag_result_fn callback, void* user_data) override;
+  uint32_t ShowFileDialog(uint32_t window_id,
+                          const laufey_file_dialog_options_t* options,
+                          laufey_file_dialog_result_fn callback,
+                          void* user_data) override;
+  bool CancelFileDialog(uint32_t dialog_id) override {
+    return laufey_common::CancelFileDialogLinux(dialog_id);
+  }
+  bool TestFileDialogRespond(int action, const char* path) override {
+    return laufey_common::TestFileDialogRespondLinux(action, path);
+  }
+  uint32_t ClipboardCapabilities() override {
+    return laufey_common::ClipboardCapabilitiesLinux();
+  }
+  char* ReadClipboardHtml() override {
+    return laufey_common::ClipboardReadHtmlLinux();
+  }
+  bool WriteClipboardHtml(const std::string& html,
+                          const char* text_or_null) override {
+    return laufey_common::ClipboardWriteHtmlLinux(html, text_or_null);
+  }
+  uint8_t* ReadClipboardImage(size_t* len_out) override {
+    return laufey_common::ClipboardReadImageLinux(len_out);
+  }
+  bool WriteClipboardImage(const uint8_t* png, size_t len) override {
+    return laufey_common::ClipboardWriteImageLinux(png, len);
+  }
+  char* ReadClipboardFormats() override {
+    return laufey_common::ClipboardReadFormatsLinux();
+  }
+  void SetClipboardChangeHandler(laufey_clipboard_change_fn handler,
+                                 void* user_data) override {
+    laufey_common::SetClipboardChangeHandler(handler, user_data);
+  }
+
+  // Global shortcuts, launch at login, DevTools (API >= 40). The X11 /
+  // portal shortcut platform is installed on first use.
+  static void EnsureShortcuts() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+      laufey_common::InstallShortcutPlatform(
+          laufey_common::CreateShortcutPlatformLinux());
+    });
+  }
+  uint32_t SystemCapabilities() override {
+    EnsureShortcuts();
+    uint32_t caps =
+        laufey_common::ShortcutCapabilities() | LAUFEY_SYSTEM_CAP_DEVTOOLS;
+    if (laufey_common::GetLaunchAtLogin() != LAUFEY_LOGIN_ITEM_NOT_SUPPORTED)
+      caps |= LAUFEY_SYSTEM_CAP_LAUNCH_AT_LOGIN;
+    return caps;
+  }
+  void SetShortcutHandler(laufey_shortcut_fn handler,
+                          void* user_data) override {
+    laufey_common::SetShortcutHandler(handler, user_data);
+  }
+  void RegisterShortcut(const char* accelerator,
+                        laufey_shortcut_result_fn callback,
+                        void* user_data) override {
+    EnsureShortcuts();
+    laufey_common::RegisterShortcut(accelerator, callback, user_data);
+  }
+  bool UnregisterShortcut(const char* accelerator) override {
+    return laufey_common::UnregisterShortcut(accelerator);
+  }
+  void UnregisterAllShortcuts() override {
+    laufey_common::UnregisterAllShortcuts();
+  }
+  char* ListShortcuts() override {
+    return laufey_common::ListShortcuts();
+  }
+  char* PlatformFeatures() override {
+    return laufey_common::PlatformFeaturesJsonForAbi();
+  }
+  char* CanonicalizeAccelerator(const char* accelerator) override {
+    return laufey_common::CanonicalizeAccelerator(accelerator);
+  }
+  bool TestTriggerShortcut(const char* accelerator) override {
+    return laufey_common::TestTriggerShortcut(accelerator);
+  }
+  int GetLaunchAtLogin() override {
+    return laufey_common::GetLaunchAtLogin();
+  }
+  int SetLaunchAtLogin(bool enabled, std::string* error) override {
+    return laufey_common::SetLaunchAtLogin(enabled, error);
+  }
+  void CloseDevTools(uint32_t window_id) override;
+  bool IsDevToolsOpen(uint32_t window_id) override;
+  bool IsDevToolsEnabled(uint32_t window_id) override;
+
+  // Window state, constraints and screens (API >= 38). No title bar styles
+  // or backdrops: GTK has no API for either (see
+  // docs/window-management.md), so those keep the base class's "false".
+  uint32_t WindowCapabilities() override;
+  void SetWindowState(uint32_t window_id, int action) override;
+  uint32_t GetWindowState(uint32_t window_id) override;
+  void SetWindowStateHandler(laufey_window_state_fn handler,
+                             void* user_data) override {
+    laufey_common::SetWindowStateHandler(handler, user_data);
+  }
+  void SetWindowSizeConstraints(uint32_t window_id, int min_width,
+                                int min_height, int max_width,
+                                int max_height) override;
+  void GetWindowSizeConstraints(uint32_t window_id, int* min_width,
+                                int* min_height, int* max_width,
+                                int* max_height) override;
+  size_t GetScreens(laufey_screen_t* out, size_t capacity) override;
+  int64_t GetWindowScreen(uint32_t window_id) override;
+  void SetDisplayChangedHandler(laufey_display_changed_fn handler,
+                                void* user_data) override;
+  bool GetWindowNormalBounds(uint32_t window_id, int* x, int* y, int* width,
+                             int* height) override;
+  void SetQuitOnLastWindowClosed(bool quit) override {
+    laufey_common::SetQuitOnLastWindowClosed(quit);
+  }
   void GetWindowPosition(uint32_t window_id, int* x, int* y) override;
+  void GetWindowInnerPosition(uint32_t window_id, int* x, int* y) override;
   void SetResizable(uint32_t window_id, bool resizable) override;
   bool IsResizable(uint32_t window_id) override;
   void SetAlwaysOnTop(uint32_t window_id, bool always_on_top) override;
@@ -368,7 +955,11 @@ class WebKitGTKBackend : public LaufeyBackend {
   void Show(uint32_t window_id) override;
   void Hide(uint32_t window_id) override;
   void Focus(uint32_t window_id) override;
-  void PostUiTask(void (*task)(void*), void* data) override;
+  bool PostUiTask(void (*task)(void*), void* data) override;
+  void SetSecondInstanceHandler(laufey_second_instance_fn handler,
+                                void* user_data) override {
+    laufey_common::SetSecondInstanceHandler(handler, user_data);
+  }
 
   void InvokeJsCallback(uint32_t window_id, uint64_t callback_id,
                         laufey::ValuePtr args) override;
@@ -378,6 +969,7 @@ class WebKitGTKBackend : public LaufeyBackend {
                        laufey::ValuePtr error) override;
 
   void Run() override;
+  void FlushWebStorage() override;
 
   void RegisterSchemeHandler(const std::string& scheme) override;
 
@@ -396,6 +988,10 @@ class WebKitGTKBackend : public LaufeyBackend {
 
   void PrintToPdf(uint32_t window_id, laufey_pdf_result_fn callback,
                   void* callback_data) override;
+  // The print job itself, on GTK's "Print to File" printer `printer` (found
+  // by PrintToPdf). GTK thread.
+  void PrintToPdfOn(uint32_t window_id, const std::string& printer,
+                    laufey_pdf_result_fn callback, void* callback_data);
 
   int ShowDialog(uint32_t window_id, int dialog_type, const std::string& title,
                  const std::string& message, const std::string& default_value,
@@ -428,23 +1024,68 @@ class WebKitGTKBackend : public LaufeyBackend {
                             void* user_data) override;
   void CloseNotification(uint32_t notification_id) override;
 
-  // libnotify / notify-send have no permission model — always granted.
+  // Granted when a notification server is on the session bus; no prompt.
   void QueryPermission(int kind, laufey_permission_callback_fn cb,
                        void* user_data) override {
-    laufey_common::QueryPermissionStub(kind, cb, user_data);
+    laufey_common::QueryNotificationPermission(kind, cb, user_data);
   }
   void RequestPermission(int kind, laufey_permission_callback_fn cb,
                          void* user_data) override {
-    laufey_common::RequestPermissionStub(kind, cb, user_data);
+    laufey_common::RequestNotificationPermission(kind, cb, user_data);
   }
 
+  // Notifications and menus (API >= 41): backend-common.
+  uint32_t NotificationCapabilities() override {
+    return laufey_common::NotificationCapabilities();
+  }
+  void SetNotificationResponseHandler(laufey_notification_response_fn handler,
+                                      void* user_data) override {
+    laufey_common::SetNotificationResponseHandler(handler, user_data);
+  }
+  void ListScheduledNotifications(laufey_notification_list_fn cb,
+                                  void* user_data) override {
+    laufey_common::ListScheduledNotifications(cb, user_data);
+  }
+  void CancelNotification(const char* tag) override {
+    laufey_common::CancelNotification(tag);
+  }
+  bool TestNotificationRespond(const char* tag,
+                               const char* action_id) override {
+    return laufey_common::TestNotificationRespond(tag, action_id);
+  }
+  uint32_t MenuCapabilities() override {
+    return LAUFEY_MENU_CAP_APP_MENU | LAUFEY_MENU_CAP_ACCELERATORS |
+           LAUFEY_MENU_CAP_CONTEXT_MENU | LAUFEY_MENU_CAP_CONTEXT_CLOSED |
+           LAUFEY_MENU_CAP_ICONS | LAUFEY_MENU_CAP_TOOLTIPS;
+  }
+  void ShowContextMenuEx(uint32_t window_id, int x, int y,
+                         laufey_value_t* menu_template,
+                         const laufey_backend_api_t* api,
+                         laufey_menu_click_fn on_click, void* on_click_data,
+                         laufey_menu_closed_fn on_closed,
+                         void* on_closed_data) override;
+  bool TestDismissContextMenu() override {
+    return laufey_common::DismissOpenContextMenu();
+  }
+  bool TestTriggerMenuAccelerator(uint32_t window_id,
+                                  const char* accelerator) override;
+
   void HandleJsMessage(uint32_t window_id, const char* json);
+
+  // Drops the state of a window GTK destroyed on its own (the user closed it:
+  // delete-event fell through to GTK's default handler). CloseWindow() drops
+  // the state itself and never reaches this. GTK thread.
+  void ForgetDestroyedWindow(uint32_t window_id);
 
  private:
   LinuxWindowState* GetWindow(uint32_t window_id);
 
   std::map<uint32_t, LinuxWindowState> windows_;
   std::mutex windows_mutex_;
+
+  // Set once the first web view exists; a RegisterSchemeHandler after that
+  // point breaks the (cross-backend) ordering contract and warns.
+  std::atomic<bool> any_web_view_created_{false};
 };
 
 // Static instance pointer for GTK callbacks
@@ -453,6 +1094,50 @@ static WebKitGTKBackend* g_gtk_backend = nullptr;
 // GtkWidget → window_id mapping for script message routing
 static std::map<WebKitUserContentManager*, uint32_t>
     g_content_manager_to_laufey_id;
+
+// A random 128-bit token, as hex: the proof that a bridge message comes from
+// the window's top frame.
+//
+// WebKitGTK's script-message-received signal names no frame, and the message
+// handler object (window.webkit.messageHandlers.laufey) exists in every frame
+// of the page, cross-origin iframes included, although the bridge script is
+// injected into the top frame only. So the top frame's bridge script holds a
+// per-window token in its closure, captured at document start before any page
+// script runs, and sends it with every call; a message without the window's
+// token is dropped. No other frame can read the closure.
+static std::string NewBridgeToken() {
+  unsigned char bytes[16];
+  size_t got = 0;
+  while (got < sizeof(bytes)) {
+    ssize_t n = getrandom(bytes + got, sizeof(bytes) - got, 0);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    got += static_cast<size_t>(n);
+  }
+  if (got < sizeof(bytes)) {
+    // getrandom is missing (a pre-3.17 kernel): read the device instead.
+    FILE* f = std::fopen("/dev/urandom", "rb");
+    got = f ? std::fread(bytes, 1, sizeof(bytes), f) : 0;
+    if (f)
+      std::fclose(f);
+    if (got != sizeof(bytes)) {
+      std::cerr << "laufey: no random source for the bridge token; the bridge "
+                   "is disabled"
+                << std::endl;
+      return std::string();
+    }
+  }
+  static const char kHex[] = "0123456789abcdef";
+  std::string token;
+  for (unsigned char b : bytes) {
+    token.push_back(kHex[b >> 4]);
+    token.push_back(kHex[b & 0xF]);
+  }
+  return token;
+}
 
 static void on_script_message(WebKitUserContentManager* manager,
                               WebKitJavascriptResult* js_result,
@@ -473,15 +1158,28 @@ static void on_script_message(WebKitUserContentManager* manager,
 // "destroy" fires only after the widget is already being torn down -- too
 // late to veto anything, so it's just final cleanup. The close-requested
 // dispatch (and any veto) happens earlier, from "delete-event" below.
+//
+// A window CloseWindow() closes is unregistered (and its state dropped) before
+// gtk_widget_destroy, so `wid` is 0 here for it -- which also keeps this
+// handler from taking windows_mutex_, which CloseWindow holds while it
+// destroys. A window the user closed still has its id: its state goes here,
+// or every later call naming it would reach the destroyed widgets.
 static void on_window_destroy(GtkWidget* widget, gpointer user_data) {
   uint32_t wid = LaufeyIdForWidget(widget);
   if (wid > 0) {
+    // Lock order windows_mutex_ -> g_widget_mutex: the two are taken one
+    // after the other here, never nested.
+    if (g_gtk_backend)
+      g_gtk_backend->ForgetDestroyedWindow(wid);
     UnregisterWidget(widget);
+    laufey_common::ForgetWindow(wid);
   }
-  // If no more windows, quit
+  // If no more windows, quit -- unless the app keeps running without one
+  // (set_quit_on_last_window_closed(false)); quit() ends it anyway.
   {
     std::lock_guard<std::mutex> lock(g_widget_mutex);
-    if (g_widget_to_laufey_id.empty()) {
+    if (g_widget_to_laufey_id.empty() &&
+        laufey_common::ShouldEndLoopAfterLastWindow()) {
       gtk_main_quit();
     }
   }
@@ -519,6 +1217,17 @@ WebKitGTKBackend::~WebKitGTKBackend() {
   g_gtk_backend = nullptr;
 }
 
+void WebKitGTKBackend::ForgetDestroyedWindow(uint32_t window_id) {
+  std::lock_guard<std::mutex> lock(windows_mutex_);
+  auto* state = GetWindow(window_id);
+  if (!state)
+    return;
+  webkit_user_content_manager_unregister_script_message_handler(
+      state->content_manager, "laufey");
+  g_content_manager_to_laufey_id.erase(state->content_manager);
+  windows_.erase(window_id);
+}
+
 LinuxWindowState* WebKitGTKBackend::GetWindow(uint32_t window_id) {
   auto it = windows_.find(window_id);
   return it != windows_.end() ? &it->second : nullptr;
@@ -537,7 +1246,7 @@ static gboolean on_script_dialog(WebKitWebView* webview,
     GtkWidget* dlg =
         gtk_message_dialog_new(parent, GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
                                GTK_BUTTONS_OK, "%s", message);
-    gtk_dialog_run(GTK_DIALOG(dlg));
+    laufey_common::RunGtkDialog(dlg);
     gtk_widget_destroy(dlg);
     webkit_script_dialog_confirm_set_confirmed(dialog, TRUE);
     return TRUE;
@@ -547,7 +1256,7 @@ static gboolean on_script_dialog(WebKitWebView* webview,
     GtkWidget* dlg =
         gtk_message_dialog_new(parent, GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION,
                                GTK_BUTTONS_OK_CANCEL, "%s", message);
-    gint result = gtk_dialog_run(GTK_DIALOG(dlg));
+    gint result = laufey_common::RunGtkDialog(dlg);
     gtk_widget_destroy(dlg);
     webkit_script_dialog_confirm_set_confirmed(dialog,
                                                result == GTK_RESPONSE_OK);
@@ -567,7 +1276,7 @@ static gboolean on_script_dialog(WebKitWebView* webview,
     }
     gtk_container_add(GTK_CONTAINER(content), entry);
     gtk_widget_show(entry);
-    gint result = gtk_dialog_run(GTK_DIALOG(dlg));
+    gint result = laufey_common::RunGtkDialog(dlg);
     if (result == GTK_RESPONSE_OK) {
       webkit_script_dialog_prompt_set_text(
           dialog, gtk_entry_get_text(GTK_ENTRY(entry)));
@@ -723,6 +1432,14 @@ void WebKitGTKBackend::CreateWindowEx(uint32_t window_id, int width, int height,
                      nullptr);
     g_signal_connect(window, "focus-out-event", G_CALLBACK(on_focus_out_event),
                      nullptr);
+    g_signal_connect(window, "window-state-event",
+                     G_CALLBACK(on_window_state_event), nullptr);
+    // The size constraints' hints depend on the decorations: set again once
+    // they are known, and whenever they change with the window's state.
+    g_signal_connect_after(window, "realize",
+                           G_CALLBACK(on_window_realize_size_hints), nullptr);
+    g_signal_connect(window, "window-state-event",
+                     G_CALLBACK(on_window_state_size_hints), nullptr);
     g_signal_connect(window, "configure-event", G_CALLBACK(on_configure_event),
                      nullptr);
 
@@ -737,16 +1454,33 @@ void WebKitGTKBackend::CreateWindowEx(uint32_t window_id, int width, int height,
     g_content_manager_to_laufey_id[content_manager] = window_id;
 
     WebKitWebView* webview = WEBKIT_WEB_VIEW(
-        webkit_web_view_new_with_user_content_manager(content_manager));
+        g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", LaufeyWebContext(),
+                     "user-content-manager", content_manager, nullptr));
+    any_web_view_created_.store(true);
 
     g_signal_connect(webview, "script-dialog", G_CALLBACK(on_script_dialog),
                      nullptr);
     g_signal_connect(webview, "load-changed", G_CALLBACK(on_load_changed),
                      GUINT_TO_POINTER(window_id));
     g_signal_connect(webview, "create", G_CALLBACK(on_create), nullptr);
+    g_signal_connect(webview, "drag-motion", G_CALLBACK(on_file_drag_motion),
+                     GUINT_TO_POINTER(window_id));
+    g_signal_connect(webview, "drag-data-received",
+                     G_CALLBACK(on_file_drag_data_received),
+                     GUINT_TO_POINTER(window_id));
+    g_signal_connect(webview, "drag-leave", G_CALLBACK(on_file_drag_leave),
+                     GUINT_TO_POINTER(window_id));
+    g_signal_connect(webview, "drag-drop", G_CALLBACK(on_file_drag_drop),
+                     GUINT_TO_POINTER(window_id));
 
     WebKitSettings* wk_settings = webkit_web_view_get_settings(webview);
-    webkit_settings_set_enable_developer_extras(wk_settings, TRUE);
+    // DevTools (API 40): the inspector, its context-menu item and its
+    // shortcut exist only with developer extras on, which follows
+    // LAUFEY_INSPECTABLE / "inspectable" (default on).
+    webkit_settings_set_enable_developer_extras(
+        wk_settings, laufey_common::LaunchInspectable() ? TRUE : FALSE);
+    TrackInspector(webview);
+    DisableByteStreamFetchSource(wk_settings);
 
     if (transparent) {
       // Let the page's own alpha show through the webview (any region the
@@ -755,17 +1489,30 @@ void WebKitGTKBackend::CreateWindowEx(uint32_t window_id, int width, int height,
       webkit_web_view_set_background_color(webview, &clear);
     }
 
+    // The top frame's bridge script captures the handler, JSON.stringify and
+    // the window's token before any page script runs; every call carries the
+    // token, and HandleJsMessage drops a message without it (a sub-frame's).
+    std::string bridge_token = NewBridgeToken();
     std::string initScript = BuildInitScript(
         RuntimeLoader::GetInstance()->GetJsNamespace(),
-        "window.webkit.messageHandlers.laufey.postMessage(JSON.stringify({\n"
+        "__laufeyPost(__laufeyStringify({\n"
+        "            token: __laufeyToken,\n"
         "            callId: callId,\n"
         "            method: path.join('.'),\n"
         "            args: processedArgs\n"
-        "          }));");
+        "          }));",
+        "  const __laufeyHandler = window.webkit.messageHandlers.laufey;\n"
+        "  const __laufeyPost = "
+        "__laufeyHandler.postMessage.bind(__laufeyHandler);\n"
+        "  const __laufeyStringify = JSON.stringify;\n"
+        "  const __laufeyToken = '" +
+            bridge_token + "';\n",
+        RuntimeLoader::GetInstance()->BridgeGuardJs());
     // Inject the bridge into the top frame only. Cross-origin/sub frames must
     // not inherit it; otherwise embedded content could invoke bindings running
     // with the host process's permissions. Matches the macOS/iOS
-    // forMainFrameOnly:YES behavior.
+    // forMainFrameOnly:YES behavior. The handler object itself is visible to
+    // every frame, which is what the token is for.
     WebKitUserScript* script = webkit_user_script_new(
         initScript.c_str(), WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
         WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
@@ -783,6 +1530,7 @@ void WebKitGTKBackend::CreateWindowEx(uint32_t window_id, int width, int height,
     state.menu_bar = nullptr;
     state.webview = webview;
     state.content_manager = content_manager;
+    state.bridge_token = bridge_token;
 
     {
       std::lock_guard<std::mutex> lock(windows_mutex_);
@@ -808,6 +1556,7 @@ void WebKitGTKBackend::CloseWindow(uint32_t window_id) {
           state->content_manager, "laufey");
       g_content_manager_to_laufey_id.erase(state->content_manager);
       UnregisterWidget(state->window);
+      laufey_common::ForgetWindow(window_id);
       gtk_widget_destroy(state->window);
       windows_.erase(window_id);
     }
@@ -888,6 +1637,8 @@ static void on_execute_js_finished(GObject* source, GAsyncResult* result,
       gchar* json = jsc_value_to_json(value, 0);
       if (json) {
         auto val = json::ParseJson(json);
+        if (!val)
+          val = laufey::Value::Null();
         laufey_value laufey(val);
         cb_data->callback(&laufey, nullptr, cb_data->user_data);
         g_free(json);
@@ -926,6 +1677,11 @@ void WebKitGTKBackend::ExecuteJs(uint32_t window_id, const std::string& script,
 }
 
 void WebKitGTKBackend::Quit() {
+  laufey_common::MarkQuitting();
+  // A GTK modal (an alert, a script dialog) is a nested loop on the GTK
+  // thread that would keep gtk_main from returning until someone dismissed
+  // it: end it, as a cancel.
+  laufey_common::CancelGtkDialogsForQuit();
   g_idle_add(
       [](gpointer) -> gboolean {
         gtk_main_quit();
@@ -940,9 +1696,23 @@ void WebKitGTKBackend::SetWindowSize(uint32_t window_id, int width,
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state) {
-      gtk_window_resize(GTK_WINDOW(state->window), width, height);
+      int w = width, h = height;
+      laufey_common::ClampSizeForWindow(window_id, &w, &h);
+      gtk_window_resize(GTK_WINDOW(state->window), w, h);
     }
   });
+}
+
+double WebKitGTKBackend::GetWindowScaleFactor(uint32_t window_id) {
+  int scale = 1;
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (state) {
+      scale = gtk_widget_get_scale_factor(GTK_WIDGET(state->window));
+    }
+  });
+  return scale > 0 ? (double)scale : 1.0;
 }
 
 void WebKitGTKBackend::GetWindowSize(uint32_t window_id, int* width,
@@ -961,6 +1731,30 @@ void WebKitGTKBackend::GetWindowSize(uint32_t window_id, int* width,
     *height = h;
 }
 
+void WebKitGTKBackend::GetWindowOuterSize(uint32_t window_id, int* width,
+                                          int* height) {
+  int w = 0, h = 0;
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (state) {
+      GdkWindow* gw = gtk_widget_get_window(GTK_WIDGET(state->window));
+      if (gw) {
+        GdkRectangle ext = {0, 0, 0, 0};
+        gdk_window_get_frame_extents(gw, &ext);
+        w = ext.width;
+        h = ext.height;
+      } else {
+        gtk_window_get_size(GTK_WINDOW(state->window), &w, &h);
+      }
+    }
+  });
+  if (width)
+    *width = w;
+  if (height)
+    *height = h;
+}
+
 void WebKitGTKBackend::SetWindowPosition(uint32_t window_id, int x, int y) {
   gtk_invoke_sync([&] {
     std::lock_guard<std::mutex> lock(windows_mutex_);
@@ -969,6 +1763,24 @@ void WebKitGTKBackend::SetWindowPosition(uint32_t window_id, int x, int y) {
       gtk_window_move(GTK_WINDOW(state->window), x, y);
     }
   });
+}
+
+void WebKitGTKBackend::GetWindowInnerPosition(uint32_t window_id, int* x,
+                                              int* y) {
+  int wx = 0, wy = 0;
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (state && state->webview) {
+      GdkWindow* gw = gtk_widget_get_window(GTK_WIDGET(state->webview));
+      if (gw)
+        gdk_window_get_origin(gw, &wx, &wy);
+    }
+  });
+  if (x)
+    *x = wx;
+  if (y)
+    *y = wy;
 }
 
 void WebKitGTKBackend::GetWindowPosition(uint32_t window_id, int* x, int* y) {
@@ -984,6 +1796,277 @@ void WebKitGTKBackend::GetWindowPosition(uint32_t window_id, int* x, int* y) {
     *x = wx;
   if (y)
     *y = wy;
+}
+
+// --- Window state, constraints and screens (API >= 38) ---
+
+uint32_t WebKitGTKBackend::WindowCapabilities() {
+  uint32_t caps = LAUFEY_WINDOW_CAP_STATE | LAUFEY_WINDOW_CAP_STATE_EVENTS |
+                  LAUFEY_WINDOW_CAP_SIZE_CONSTRAINTS |
+                  LAUFEY_WINDOW_CAP_SCREENS | LAUFEY_WINDOW_CAP_DISPLAY_EVENTS |
+                  LAUFEY_WINDOW_CAP_NORMAL_BOUNDS |
+                  LAUFEY_WINDOW_CAP_KEEP_ALIVE;
+  bool wayland = false;
+  gtk_invoke_sync(
+      [&] { wayland = LaufeyIsWaylandDisplay(gdk_display_get_default()); });
+  // Wayland clients can't place their windows.
+  if (!wayland)
+    caps |= LAUFEY_WINDOW_CAP_SET_POSITION;
+  // Drag and drop and file dialogs (API >= 39). Drag-out uses the window as
+  // the drag source, so it works on X11 and Wayland alike.
+  caps |= LAUFEY_WINDOW_CAP_FILE_DROP |
+          LAUFEY_WINDOW_CAP_FILE_DROP_ENTER_PATHS |
+          LAUFEY_WINDOW_CAP_FILE_DRAG_OUT | LAUFEY_WINDOW_CAP_FILE_DIALOGS |
+          LAUFEY_WINDOW_CAP_FILE_DIALOG_MODAL;
+  return caps;
+}
+
+void WebKitGTKBackend::StartFileDrag(uint32_t window_id,
+                                     const char* const* paths, size_t count,
+                                     const uint8_t* icon_png, size_t icon_len,
+                                     laufey_drag_result_fn callback,
+                                     void* user_data) {
+  auto* req = new laufey_common::DragOutRequest();
+  req->callback = callback;
+  req->user_data = user_data;
+  bool known = false;
+  {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    known = GetWindow(window_id) != nullptr;
+  }
+  if (!known || !laufey_common::ValidateDragPaths(paths, count, &req->paths)) {
+    req->Finish(LAUFEY_DRAG_RESULT_FAILED);
+    delete req;
+    return;
+  }
+  if (icon_png && icon_len > 0)
+    req->icon_png.assign(icon_png, icon_png + icon_len);
+  // The window is looked up again on the GTK thread; if it closed in between
+  // there is no source and the drag fails there.
+  laufey_common::StartFileDragLinux(
+      [this, window_id]() -> void* {
+        std::lock_guard<std::mutex> lock(windows_mutex_);
+        auto* state = GetWindow(window_id);
+        return state ? state->window : nullptr;
+      },
+      req);
+}
+
+uint32_t WebKitGTKBackend::ShowFileDialog(
+    uint32_t window_id, const laufey_file_dialog_options_t* options,
+    laufey_file_dialog_result_fn callback, void* user_data) {
+  laufey_common::ParentResolver parent;
+  if (window_id != 0) {
+    parent = [this, window_id]() -> void* {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      return state ? state->window : nullptr;
+    };
+  }
+  return laufey_common::ShowFileDialogLinux(std::move(parent), options,
+                                            callback, user_data);
+}
+
+void WebKitGTKBackend::SetWindowState(uint32_t window_id, int action) {
+  gtk_invoke_sync([&] {
+    GtkWindow* window = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      if (auto* state = GetWindow(window_id))
+        window = GTK_WINDOW(state->window);
+    }
+    if (!window)
+      return;
+    switch (action) {
+      case LAUFEY_WINDOW_ACTION_MAXIMIZE:
+        gtk_window_maximize(window);
+        break;
+      case LAUFEY_WINDOW_ACTION_UNMAXIMIZE:
+        gtk_window_unmaximize(window);
+        break;
+      case LAUFEY_WINDOW_ACTION_MINIMIZE:
+        gtk_window_iconify(window);
+        break;
+      case LAUFEY_WINDOW_ACTION_RESTORE:
+        gtk_window_deiconify(window);
+        break;
+      case LAUFEY_WINDOW_ACTION_ENTER_FULLSCREEN:
+        gtk_window_fullscreen(window);
+        break;
+      case LAUFEY_WINDOW_ACTION_LEAVE_FULLSCREEN:
+        gtk_window_unfullscreen(window);
+        break;
+      default:
+        break;
+    }
+  });
+}
+
+uint32_t WebKitGTKBackend::GetWindowState(uint32_t window_id) {
+  uint32_t result = 0;
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state)
+      return;
+    GdkWindow* gw = gtk_widget_get_window(state->window);
+    if (gw)
+      result = LaufeyStateFromGdk(gdk_window_get_state(gw));
+  });
+  return result;
+}
+
+void WebKitGTKBackend::SetWindowSizeConstraints(uint32_t window_id,
+                                                int min_width, int min_height,
+                                                int max_width, int max_height) {
+  laufey_common::SizeConstraints c = laufey_common::SetSizeConstraints(
+      window_id, min_width, min_height, max_width, max_height);
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state)
+      return;
+    LaufeyApplySizeHints(state->window, c);
+    int w = 0, h = 0;
+    gtk_window_get_size(GTK_WINDOW(state->window), &w, &h);
+    if (laufey_common::ClampSize(c, &w, &h))
+      gtk_window_resize(GTK_WINDOW(state->window), w, h);
+  });
+}
+
+void WebKitGTKBackend::GetWindowSizeConstraints(uint32_t window_id,
+                                                int* min_width, int* min_height,
+                                                int* max_width,
+                                                int* max_height) {
+  laufey_common::SizeConstraints c =
+      laufey_common::GetSizeConstraints(window_id);
+  if (min_width)
+    *min_width = c.min_width;
+  if (min_height)
+    *min_height = c.min_height;
+  if (max_width)
+    *max_width = c.max_width;
+  if (max_height)
+    *max_height = c.max_height;
+}
+
+size_t WebKitGTKBackend::GetScreens(laufey_screen_t* out, size_t capacity) {
+  std::vector<laufey_screen_t> screens;
+  gtk_invoke_sync([&] {
+    GdkDisplay* display = gdk_display_get_default();
+    if (!display)
+      return;
+    int n = gdk_display_get_n_monitors(display);
+    bool any_primary = false;
+    for (int i = 0; i < n; ++i) {
+      GdkMonitor* m = gdk_display_get_monitor(display, i);
+      if (!m)
+        continue;
+      laufey_screen_t s = {};
+      s.id = LaufeyMonitorId(display, m);
+      GdkRectangle g, w;
+      gdk_monitor_get_geometry(m, &g);
+      gdk_monitor_get_workarea(m, &w);
+      s.x = g.x;
+      s.y = g.y;
+      s.width = g.width;
+      s.height = g.height;
+      s.work_x = w.x;
+      s.work_y = w.y;
+      s.work_width = w.width;
+      s.work_height = w.height;
+      s.scale_factor = gdk_monitor_get_scale_factor(m);
+      s.is_primary = gdk_monitor_is_primary(m);
+      any_primary |= s.is_primary;
+      screens.push_back(s);
+    }
+    // Wayland has no primary monitor; the first one stands in for it.
+    if (!any_primary && !screens.empty())
+      screens[0].is_primary = true;
+    std::stable_partition(
+        screens.begin(), screens.end(),
+        [](const laufey_screen_t& s) { return s.is_primary; });
+  });
+  return laufey_common::CopyScreens(screens, out, capacity);
+}
+
+int64_t WebKitGTKBackend::GetWindowScreen(uint32_t window_id) {
+  int64_t result = 0;
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state)
+      return;
+    GdkWindow* gw = gtk_widget_get_window(state->window);
+    GdkDisplay* display = gdk_display_get_default();
+    if (!gw || !display)
+      return;
+    GdkMonitor* m = gdk_display_get_monitor_at_window(display, gw);
+    if (m)
+      result = LaufeyMonitorId(display, m);
+  });
+  return result;
+}
+
+void WebKitGTKBackend::SetDisplayChangedHandler(
+    laufey_display_changed_fn handler, void* user_data) {
+  laufey_common::SetDisplayChangedHandler(handler, user_data);
+  if (!handler)
+    return;
+  gtk_invoke_sync([] {
+    static bool installed = false;
+    if (installed)
+      return;
+    installed = true;
+    GdkDisplay* display = gdk_display_get_default();
+    if (!display)
+      return;
+    int n = gdk_display_get_n_monitors(display);
+    for (int i = 0; i < n; ++i)
+      LaufeyWatchMonitor(gdk_display_get_monitor(display, i));
+    g_signal_connect(display, "monitor-added",
+                     G_CALLBACK(+[](GdkDisplay*, GdkMonitor* m, gpointer) {
+                       LaufeyWatchMonitor(m);
+                       on_display_monitors_changed();
+                     }),
+                     nullptr);
+    g_signal_connect(display, "monitor-removed",
+                     G_CALLBACK(+[](GdkDisplay*, GdkMonitor*, gpointer) {
+                       on_display_monitors_changed();
+                     }),
+                     nullptr);
+  });
+}
+
+bool WebKitGTKBackend::GetWindowNormalBounds(uint32_t window_id, int* x, int* y,
+                                             int* width, int* height) {
+  bool found = false;
+  laufey_common::Bounds b;
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state)
+      return;
+    found = true;
+    uint32_t s = 0;
+    if (GdkWindow* gw = gtk_widget_get_window(state->window))
+      s = LaufeyStateFromGdk(gdk_window_get_state(gw));
+    if (s != 0 && laufey_common::GetCommittedNormalBounds(window_id, &b))
+      return;
+    gtk_window_get_position(GTK_WINDOW(state->window), &b.x, &b.y);
+    gtk_window_get_size(GTK_WINDOW(state->window), &b.width, &b.height);
+  });
+  if (!found)
+    return false;
+  if (x)
+    *x = b.x;
+  if (y)
+    *y = b.y;
+  if (width)
+    *width = b.width;
+  if (height)
+    *height = b.height;
+  return true;
 }
 
 void WebKitGTKBackend::SetResizable(uint32_t window_id, bool resizable) {
@@ -1137,7 +2220,7 @@ void WebKitGTKBackend::Focus(uint32_t window_id) {
   });
 }
 
-void WebKitGTKBackend::PostUiTask(void (*task)(void*), void* data) {
+bool WebKitGTKBackend::PostUiTask(void (*task)(void*), void* data) {
   struct TaskData {
     void (*task)(void*);
     void* data;
@@ -1151,6 +2234,7 @@ void WebKitGTKBackend::PostUiTask(void (*task)(void*), void* data) {
         return G_SOURCE_REMOVE;
       },
       td);
+  return true;
 }
 
 void WebKitGTKBackend::InvokeJsCallback(uint32_t window_id,
@@ -1217,6 +2301,95 @@ void WebKitGTKBackend::Run() {
   gtk_main();
 }
 
+// How long the flush may hold the end of the app, and how long WebKit keeps a
+// localStorage transaction open after a write (SQLiteStorageArea's
+// transactionDuration, 500 ms) plus a margin.
+static constexpr gint64 kFlushWebStorageUs = 2 * G_USEC_PER_SEC;
+static constexpr gint64 kLocalStorageCommitUs = 600 * 1000;
+
+namespace {
+
+struct FetchDone {
+  std::atomic<bool> done{false};
+};
+
+void OnLocalStorageFetched(GObject* source, GAsyncResult* result,
+                           gpointer data) {
+  GError* error = nullptr;
+  GList* records = webkit_website_data_manager_fetch_finish(
+      WEBKIT_WEBSITE_DATA_MANAGER(source), result, &error);
+  g_list_free_full(records,
+                   reinterpret_cast<GDestroyNotify>(webkit_website_data_unref));
+  if (error)
+    g_error_free(error);
+  static_cast<FetchDone*>(data)->done.store(true);
+}
+
+// Runs the default main context until `until` (monotonic, us) or `done`.
+void RunMainContextUntil(gint64 until, const std::atomic<bool>* done) {
+  while ((!done || !done->load()) && g_get_monotonic_time() < until) {
+    if (!g_main_context_iteration(nullptr, FALSE))
+      g_usleep(5000);
+  }
+}
+
+// One localStorage fetch, to its answer or `deadline`. The network process
+// runs it on its storage queue, after every write queued there before it.
+bool FetchLocalStorage(WebKitWebsiteDataManager* manager, gint64 deadline) {
+  // Heap-held: should the deadline pass first, the answer still has somewhere
+  // to land (leaked then).
+  auto* state = new FetchDone();
+  webkit_website_data_manager_fetch(manager, WEBKIT_WEBSITE_DATA_LOCAL_STORAGE,
+                                    nullptr, OnLocalStorageFetched, state);
+  RunMainContextUntil(deadline, &state->done);
+  bool done = state->done.load();
+  if (done)
+    delete state;
+  return done;
+}
+
+}  // namespace
+
+// WebKitGTK writes localStorage from its network process, in an SQLite
+// transaction it commits 500 ms after the first write (SQLiteStorageArea), and
+// its API has no call that commits it. The process does commit when this one
+// closes its connection, but only after this process is gone, so a launch
+// right after can read the previous value. So: a fetch of the localStorage
+// records, which the network process answers from its storage queue after the
+// writes queued before it (each of which armed its commit by then); the commit
+// time; and a second fetch, queued behind that commit.
+void WebKitGTKBackend::FlushWebStorage() {
+  if (!any_web_view_created_.load())
+    return;
+  WebKitWebsiteDataManager* manager =
+      webkit_web_context_get_website_data_manager(LaufeyWebContext());
+  if (!manager)
+    return;
+  gint64 deadline = g_get_monotonic_time() + kFlushWebStorageUs;
+  bool done = FetchLocalStorage(manager, deadline);
+  if (done) {
+    RunMainContextUntil(
+        std::min(deadline, g_get_monotonic_time() + kLocalStorageCommitUs),
+        nullptr);
+    done = FetchLocalStorage(manager, deadline);
+  }
+  if (!done) {
+    std::cerr << "laufey: localStorage was not confirmed written within "
+              << kFlushWebStorageUs / G_USEC_PER_SEC << " s of the app ending"
+              << std::endl;
+  }
+}
+
+// Whether `a` and `b` are equal, in time that depends only on their lengths.
+static bool TokensEqual(const std::string& a, const std::string& b) {
+  if (a.size() != b.size())
+    return false;
+  unsigned char diff = 0;
+  for (size_t i = 0; i < a.size(); ++i)
+    diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+  return diff == 0;
+}
+
 void WebKitGTKBackend::HandleJsMessage(uint32_t window_id,
                                        const char* jsonStr) {
   laufey::ValuePtr msg = json::ParseJson(jsonStr);
@@ -1225,6 +2398,27 @@ void WebKitGTKBackend::HandleJsMessage(uint32_t window_id,
 
   const auto& dict = msg->GetDict();
 
+  // Only the window's top-frame bridge script knows its token (see
+  // NewBridgeToken); a sub-frame posting to the handler directly does not.
+  // The token proves the top frame; its origin is the web view's document's.
+  std::string expected;
+  std::string origin = laufey_common::kOpaqueOrigin;
+  {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    if (auto* state = GetWindow(window_id)) {
+      expected = state->bridge_token;
+      const gchar* uri = webkit_web_view_get_uri(state->webview);
+      if (uri)
+        origin = laufey_common::OriginOfUrl(uri);
+    }
+  }
+  auto tokenIt = dict.find("token");
+  if (expected.empty() || tokenIt == dict.end() ||
+      !tokenIt->second->IsString() ||
+      !TokensEqual(tokenIt->second->GetString(), expected)) {
+    return;
+  }
+
   auto callIdIt = dict.find("callId");
   auto methodIt = dict.find("method");
   auto argsIt = dict.find("args");
@@ -1232,11 +2426,20 @@ void WebKitGTKBackend::HandleJsMessage(uint32_t window_id,
   if (callIdIt == dict.end() || methodIt == dict.end())
     return;
 
+  // The page's own number for the call, echoed back with the answer. A
+  // number the bridge script can't have made (negative, fractional, past
+  // 2^53) is not a call.
   uint64_t call_id = 0;
-  if (callIdIt->second->IsInt()) {
+  if (callIdIt->second->IsInt() && callIdIt->second->GetInt() >= 0) {
     call_id = static_cast<uint64_t>(callIdIt->second->GetInt());
   } else if (callIdIt->second->IsDouble()) {
-    call_id = static_cast<uint64_t>(callIdIt->second->GetDouble());
+    double d = callIdIt->second->GetDouble();
+    if (!(d >= 0 && d <= 9007199254740992.0) ||
+        d != static_cast<double>(static_cast<uint64_t>(d)))
+      return;
+    call_id = static_cast<uint64_t>(d);
+  } else {
+    return;
   }
 
   std::string method =
@@ -1244,7 +2447,8 @@ void WebKitGTKBackend::HandleJsMessage(uint32_t window_id,
   laufey::ValuePtr args =
       (argsIt != dict.end()) ? argsIt->second : laufey::Value::List();
 
-  RuntimeLoader::GetInstance()->OnJsCall(window_id, call_id, method, args);
+  RuntimeLoader::GetInstance()->OnJsCall(window_id, call_id, method, args,
+                                         origin);
 }
 
 // ============================================================================
@@ -1261,47 +2465,93 @@ void WebKitGTKBackend::SetApplicationMenu(uint32_t window_id,
                                           void* on_click_data) {
   if (!menu_template)
     return;
+  std::vector<laufey_common::MenuEntry> entries =
+      laufey_common::ParseMenuTemplate(menu_template, api, false);
   gtk_invoke_sync([&] {
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (!state || !state->vbox)
       return;
 
-    // Remove old menu bar if present
+    // Remove the old menu bar and its accelerators.
     if (state->menu_bar) {
       gtk_container_remove(GTK_CONTAINER(state->vbox), state->menu_bar);
       state->menu_bar = nullptr;
     }
-
-    GtkWidget* menu_bar = laufey_common::BuildGtkMenuFromValue(
-        menu_template, api, window_id, on_click, on_click_data, true);
-    if (menu_bar) {
-      // Pack menu bar at the top (before the webview)
-      gtk_box_pack_start(GTK_BOX(state->vbox), menu_bar, FALSE, FALSE, 0);
-      gtk_box_reorder_child(GTK_BOX(state->vbox), menu_bar, 0);
-      state->menu_bar = menu_bar;
-      gtk_widget_show_all(menu_bar);
+    if (state->accel_group) {
+      gtk_window_remove_accel_group(GTK_WINDOW(state->window),
+                                    state->accel_group);
+      g_object_unref(state->accel_group);
+      state->accel_group = nullptr;
     }
+    if (entries.empty())
+      return;
+
+    // GtkWindow runs accelerators before the focused widget (the web view)
+    // sees the key, as a native menu bar's.
+    GtkAccelGroup* group = gtk_accel_group_new();
+    gtk_window_add_accel_group(GTK_WINDOW(state->window), group);
+    state->accel_group = group;
+    GtkWidget* menu_bar = laufey_common::BuildGtkMenuFromEntries(
+        entries, window_id, on_click, on_click_data, true, group);
+    // Pack menu bar at the top (before the webview)
+    gtk_box_pack_start(GTK_BOX(state->vbox), menu_bar, FALSE, FALSE, 0);
+    gtk_box_reorder_child(GTK_BOX(state->vbox), menu_bar, 0);
+    state->menu_bar = menu_bar;
+    gtk_widget_show_all(menu_bar);
   });
 }
 
-void WebKitGTKBackend::ShowContextMenu(uint32_t window_id, int /*x*/, int /*y*/,
+void WebKitGTKBackend::ShowContextMenu(uint32_t window_id, int x, int y,
                                        laufey_value_t* menu_template,
                                        const laufey_backend_api_t* api,
                                        laufey_menu_click_fn on_click,
                                        void* on_click_data) {
   if (!menu_template)
     return;
+  ShowContextMenuEx(window_id, x, y, menu_template, api, on_click,
+                    on_click_data, nullptr, nullptr);
+}
 
-  gtk_invoke_sync([&] {
-    GtkWidget* menu = laufey_common::BuildGtkMenuFromValue(
-        menu_template, api, window_id, on_click, on_click_data, false);
-    if (!menu)
-      return;
-
-    gtk_widget_show_all(menu);
-    gtk_menu_popup_at_pointer(GTK_MENU(menu), nullptr);
+void WebKitGTKBackend::ShowContextMenuEx(uint32_t window_id, int x, int y,
+                                         laufey_value_t* menu_template,
+                                         const laufey_backend_api_t* api,
+                                         laufey_menu_click_fn on_click,
+                                         void* on_click_data,
+                                         laufey_menu_closed_fn on_closed,
+                                         void* on_closed_data) {
+  // Parsed here: the template is the caller's only for this call.
+  auto entries = std::make_shared<std::vector<laufey_common::MenuEntry>>(
+      laufey_common::ParseMenuTemplate(menu_template, api, false));
+  laufey_common::GtkRunAsync([this, window_id, x, y, entries, on_click,
+                              on_click_data, on_closed, on_closed_data] {
+    GtkWidget* anchor = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      if (state)
+        anchor = state->webview ? GTK_WIDGET(state->webview) : state->window;
+    }
+    laufey_common::ShowGtkContextMenu(anchor, x, y, *entries, window_id,
+                                      on_click, on_click_data, on_closed,
+                                      on_closed_data);
   });
+}
+
+bool WebKitGTKBackend::TestTriggerMenuAccelerator(uint32_t window_id,
+                                                  const char* accelerator) {
+  bool fired = false;
+  gtk_invoke_sync([&] {
+    GtkWidget* window = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(windows_mutex_);
+      auto* state = GetWindow(window_id);
+      if (state)
+        window = state->window;
+    }
+    fired = laufey_common::TestTriggerMenuAcceleratorGtk(window, accelerator);
+  });
+  return fired;
 }
 
 // ============================================================================
@@ -1309,15 +2559,69 @@ void WebKitGTKBackend::ShowContextMenu(uint32_t window_id, int /*x*/, int /*y*/,
 // ============================================================================
 
 void WebKitGTKBackend::OpenDevTools(uint32_t window_id) {
+  if (!laufey_common::LaunchInspectable())
+    return;
   gtk_invoke_sync([&] {
     std::lock_guard<std::mutex> lock(windows_mutex_);
     auto* state = GetWindow(window_id);
     if (state && state->webview) {
       WebKitWebInspector* inspector =
           webkit_web_view_get_inspector(state->webview);
+      if (InspectorState* st = InspectorStateOf(inspector))
+        st->close_pending_since = 0;
       webkit_web_inspector_show(inspector);
     }
   });
+}
+
+void WebKitGTKBackend::CloseDevTools(uint32_t window_id) {
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state || !state->webview)
+      return;
+    WebKitWebInspector* inspector =
+        webkit_web_view_get_inspector(state->webview);
+    InspectorState* st = InspectorStateOf(inspector);
+    // Still opening (its page exists, it hasn't opened yet): close it again
+    // once it opens.
+    if (st && !st->shown && webkit_web_inspector_get_web_view(inspector))
+      st->close_pending_since = g_get_monotonic_time();
+    webkit_web_inspector_close(inspector);
+  });
+}
+
+bool WebKitGTKBackend::IsDevToolsOpen(uint32_t window_id) {
+  bool open = false;
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (!state || !state->webview)
+      return;
+    // The inspector's own web view exists while it is shown (attached or in
+    // its window) or opening, and is dropped when it closes. One closed
+    // while still opening reads as closed (see InspectorState).
+    WebKitWebInspector* inspector =
+        webkit_web_view_get_inspector(state->webview);
+    open = webkit_web_inspector_get_web_view(inspector) != nullptr &&
+           !InspectorClosePending(InspectorStateOf(inspector));
+  });
+  return open;
+}
+
+bool WebKitGTKBackend::IsDevToolsEnabled(uint32_t window_id) {
+  if (window_id == 0)
+    return laufey_common::LaunchInspectable();
+  bool enabled = false;
+  gtk_invoke_sync([&] {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (state && state->webview) {
+      enabled = webkit_settings_get_enable_developer_extras(
+                    webkit_web_view_get_settings(state->webview)) != FALSE;
+    }
+  });
+  return enabled;
 }
 
 // WebKitGTK has no in-memory PDF API; WebKitPrintOperation only writes to a
@@ -1371,78 +2675,193 @@ static void on_pdf_print_finished(WebKitPrintOperation* op,
   delete d;
 }
 
+// WebKitPrintOperation prints without a dialog to the printer the settings
+// name, and with none named, to the default printer: "Printer not found" on
+// a machine with no default printer (no CUPS queue at all, the usual
+// desktop). So the job names GTK's "Print to File" printer, which GTK's own
+// file print backend (part of libgtk-3) always provides. Its name is
+// translated, so it is found by its backend's type, which isn't.
+//
+// The search has a deadline (kPdfPrinterSearchTimeoutMs): a print backend
+// that never finishes listing (a hung CUPS) would otherwise hold the result
+// back for good. Whichever of the deadline and the search's end comes first
+// settles the callback; the other only releases its reference. Both run on
+// the GTK thread, so the struct needs no lock.
+static constexpr guint kPdfPrinterSearchTimeoutMs = 10000;
+
+struct PdfPrinterSearch {
+  uint32_t window_id;
+  laufey_pdf_result_fn callback;
+  void* callback_data;
+  std::string printer;   // the file printer's name, once found
+  bool settled = false;  // the callback has been called (or handed on)
+  guint timeout_id = 0;  // the deadline's GSource, while it is pending
+  int refs = 2;          // the search's end + the deadline
+};
+
+static void pdf_printer_search_unref(PdfPrinterSearch* search) {
+  if (--search->refs == 0)
+    delete search;
+}
+
+// The deadline. GTK thread.
+static gboolean file_printer_search_timeout(gpointer data) {
+  auto* search = static_cast<PdfPrinterSearch*>(data);
+  search->timeout_id = 0;
+  if (!search->settled) {
+    search->settled = true;
+    search->callback(nullptr, 0,
+                     "timed out after 10 s looking up GTK's \"Print to "
+                     "File\" printer (a print backend did not finish "
+                     "listing its printers)",
+                     search->callback_data);
+  }
+  pdf_printer_search_unref(search);
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean find_file_printer(GtkPrinter* printer, gpointer data) {
+  auto* search = static_cast<PdfPrinterSearch*>(data);
+  if (search->settled)
+    return TRUE;  // the deadline passed: stop listing
+  GtkPrintBackend* backend = gtk_printer_get_backend(printer);
+  if (!backend ||
+      g_strcmp0(G_OBJECT_TYPE_NAME(backend), "GtkPrintBackendFile") != 0)
+    return FALSE;
+  search->printer = gtk_printer_get_name(printer);
+  return TRUE;  // stop: the search ends (file_printer_search_done)
+}
+
+// The end of the printer search, found or not (GTK calls it exactly once).
+// GTK thread.
+static void file_printer_search_done(gpointer data) {
+  auto* search = static_cast<PdfPrinterSearch*>(data);
+  if (search->timeout_id) {
+    g_source_remove(search->timeout_id);
+    search->timeout_id = 0;
+    pdf_printer_search_unref(search);  // the deadline's reference
+  }
+  if (!search->settled) {
+    search->settled = true;
+    if (search->printer.empty()) {
+      search->callback(nullptr, 0,
+                       "no \"Print to File\" printer: GTK's file print "
+                       "backend (printbackends/libprintbackend-file.so, part "
+                       "of libgtk-3) is not installed",
+                       search->callback_data);
+    } else if (g_gtk_backend) {
+      g_gtk_backend->PrintToPdfOn(search->window_id, search->printer,
+                                  search->callback, search->callback_data);
+    } else {
+      search->callback(nullptr, 0, "backend is gone", search->callback_data);
+    }
+  }
+  pdf_printer_search_unref(search);  // the search's own reference
+}
+
 void WebKitGTKBackend::PrintToPdf(uint32_t window_id,
                                   laufey_pdf_result_fn callback,
                                   void* callback_data) {
   if (!callback)
     return;
   gtk_invoke_sync([&] {
-    // Scope the lock to the lookup only: the callback is an arbitrary user
-    // FnOnce that may re-enter backend APIs taking this same non-recursive
-    // mutex on this thread (the "failed" signal can fire synchronously from
-    // webkit_print_operation_print below). Using the webview after unlock is
-    // safe because window teardown also runs on this (main) thread.
-    WebKitWebView* webview = nullptr;
+    // The callback is a user FnOnce that may re-enter backend APIs taking
+    // windows_mutex_ (non-recursive), so it is never called under the lock:
+    // the lookup only records whether the window exists.
+    bool found;
     {
       std::lock_guard<std::mutex> lock(windows_mutex_);
       auto* state = GetWindow(window_id);
-      if (state)
-        webview = state->webview;
+      found = state && state->webview;
     }
-    if (!webview) {
+    if (!found) {
       callback(nullptr, 0, "window not found", callback_data);
       return;
     }
-
-    // Private (0600, unpredictable name) temp file for the print output;
-    // close the fd right away -- the web process opens the file by path.
-    gchar* tmp_path = nullptr;
-    GError* tmp_error = nullptr;
-    int tmp_fd = g_file_open_tmp("laufey-pdf-XXXXXX", &tmp_path, &tmp_error);
-    if (tmp_fd < 0) {
-      callback(nullptr, 0,
-               tmp_error && tmp_error->message ? tmp_error->message
-                                               : "failed to create temp file",
-               callback_data);
-      if (tmp_error)
-        g_error_free(tmp_error);
-      return;
-    }
-    close(tmp_fd);
-
-    auto* d = new PdfPrintData{callback, callback_data, tmp_path, false, ""};
-    gchar* uri = g_filename_to_uri(tmp_path, nullptr, nullptr);
-    g_free(tmp_path);
-    if (!uri) {
-      // Cannot happen for g_file_open_tmp's absolute path, but stay safe.
-      callback(nullptr, 0, "invalid temp file path", callback_data);
-      unlink(d->output_path.c_str());
-      delete d;
-      return;
-    }
-
-    GtkPrintSettings* settings = gtk_print_settings_new();
-    gtk_print_settings_set(settings, GTK_PRINT_SETTINGS_OUTPUT_URI, uri);
-    gtk_print_settings_set(settings, GTK_PRINT_SETTINGS_OUTPUT_FILE_FORMAT,
-                           "pdf");
-    g_free(uri);
-
-    WebKitPrintOperation* op = webkit_print_operation_new(webview);
-    webkit_print_operation_set_print_settings(op, settings);
-    g_object_unref(settings);
-
-    // "finished" is WebKitPrintOperation's guaranteed completion signal: it is
-    // emitted for every terminated operation, and always AFTER "failed" when an
-    // error occurred (WebKit forwards GtkPrintOperation's always-emitted "done"
-    // signal). So on_pdf_print_finished is the single owner of invoking the
-    // callback, deleting the temp file, unref-ing `op`, and freeing `d` -- the
-    // same "completion callback always fires" contract the macOS backend
-    // relies on. "failed" only records the error for that handler to report.
-    g_signal_connect(op, "failed", G_CALLBACK(on_pdf_print_failed), d);
-    g_signal_connect(op, "finished", G_CALLBACK(on_pdf_print_finished), d);
-
-    webkit_print_operation_print(op);
+    // Asynchronous: GTK lists the printers it already knows at once (the
+    // file printer among them, which ends the search there), and a slow
+    // backend (CUPS) never holds up this thread. The deadline settles the
+    // callback if the search never ends.
+    auto* search =
+        new PdfPrinterSearch{window_id, callback, callback_data, std::string()};
+    search->timeout_id = g_timeout_add(kPdfPrinterSearchTimeoutMs,
+                                       file_printer_search_timeout, search);
+    gtk_enumerate_printers(find_file_printer, search, file_printer_search_done,
+                           FALSE);
   });
+}
+
+void WebKitGTKBackend::PrintToPdfOn(uint32_t window_id,
+                                    const std::string& printer,
+                                    laufey_pdf_result_fn callback,
+                                    void* callback_data) {
+  // Scope the lock to the lookup only: the callback is an arbitrary user
+  // FnOnce that may re-enter backend APIs taking this same non-recursive
+  // mutex on this thread (the "failed" signal can fire synchronously from
+  // webkit_print_operation_print below). Using the webview after unlock is
+  // safe because window teardown also runs on this (main) thread. The window
+  // is looked up again: it may have closed during the printer search.
+  WebKitWebView* webview = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(windows_mutex_);
+    auto* state = GetWindow(window_id);
+    if (state)
+      webview = state->webview;
+  }
+  if (!webview) {
+    callback(nullptr, 0, "window not found", callback_data);
+    return;
+  }
+
+  // Private (0600, unpredictable name) temp file for the print output;
+  // close the fd right away -- the web process opens the file by path.
+  gchar* tmp_path = nullptr;
+  GError* tmp_error = nullptr;
+  int tmp_fd = g_file_open_tmp("laufey-pdf-XXXXXX", &tmp_path, &tmp_error);
+  if (tmp_fd < 0) {
+    callback(nullptr, 0,
+             tmp_error && tmp_error->message ? tmp_error->message
+                                             : "failed to create temp file",
+             callback_data);
+    if (tmp_error)
+      g_error_free(tmp_error);
+    return;
+  }
+  close(tmp_fd);
+
+  auto* d = new PdfPrintData{callback, callback_data, tmp_path, false, ""};
+  gchar* uri = g_filename_to_uri(tmp_path, nullptr, nullptr);
+  g_free(tmp_path);
+  if (!uri) {
+    // Cannot happen for g_file_open_tmp's absolute path, but stay safe.
+    callback(nullptr, 0, "invalid temp file path", callback_data);
+    unlink(d->output_path.c_str());
+    delete d;
+    return;
+  }
+
+  GtkPrintSettings* settings = gtk_print_settings_new();
+  gtk_print_settings_set_printer(settings, printer.c_str());
+  gtk_print_settings_set(settings, GTK_PRINT_SETTINGS_OUTPUT_URI, uri);
+  gtk_print_settings_set(settings, GTK_PRINT_SETTINGS_OUTPUT_FILE_FORMAT,
+                         "pdf");
+  g_free(uri);
+
+  WebKitPrintOperation* op = webkit_print_operation_new(webview);
+  webkit_print_operation_set_print_settings(op, settings);
+  g_object_unref(settings);
+
+  // "finished" is WebKitPrintOperation's guaranteed completion signal: it is
+  // emitted for every terminated operation, and always AFTER "failed" when an
+  // error occurred (WebKit forwards GtkPrintOperation's always-emitted "done"
+  // signal). So on_pdf_print_finished is the single owner of invoking the
+  // callback, deleting the temp file, unref-ing `op`, and freeing `d` -- the
+  // same "completion callback always fires" contract the macOS backend
+  // relies on. "failed" only records the error for that handler to report.
+  g_signal_connect(op, "failed", G_CALLBACK(on_pdf_print_failed), d);
+  g_signal_connect(op, "finished", G_CALLBACK(on_pdf_print_finished), d);
+
+  webkit_print_operation_print(op);
 }
 
 // ============================================================================
@@ -1482,11 +2901,14 @@ void WebKitGTKBackend::BounceDock(int /*type*/) {
   });
 }
 
-// Badge via title prefix. Saved-titles map lives in
-// laufey_common::ApplyTitlePrefixBadge.
+// Badge: the launcher's count where a dock reads LauncherEntry
+// (laufey_common::SetLauncherEntryBadge), else a title prefix (the
+// saved-titles map lives in laufey_common::ApplyTitlePrefixBadge).
 void WebKitGTKBackend::SetDockBadge(const char* badge_or_null) {
   std::string badge =
       (badge_or_null && *badge_or_null) ? std::string(badge_or_null) : "";
+  if (laufey_common::SetLauncherEntryBadge(badge))
+    badge.clear();  // the launcher shows it: no title prefix
   gtk_invoke_sync([&] {
     std::lock_guard<std::mutex> wlock(windows_mutex_);
     for (auto& [wid, state] : windows_) {
@@ -1539,85 +2961,106 @@ void WebKitGTKBackend::SetTrayClickHandler(uint32_t tray_id,
 // Notifications (WebKitGTK Linux)
 // ============================================================================
 //
-// Thin trampoline over the shared notify-send implementation in
-// backend-common/src/notifications_linux.cc.
+// Thin trampolines over backend-common (laufey_notifications.h: the
+// org.freedesktop.Notifications D-Bus client).
 
 uint32_t WebKitGTKBackend::ShowNotification(
     laufey_value_t* options, const laufey_backend_api_t* api,
     laufey_notification_event_fn on_event, void* user_data) {
   laufey_common::NotificationOptions opts =
       laufey_common::ParseNotificationOptions(options, api);
-  return laufey_common::ShowNotificationLinux(opts, on_event, user_data);
+  return laufey_common::ShowNotification(opts, on_event, user_data);
 }
 
 void WebKitGTKBackend::CloseNotification(uint32_t notification_id) {
-  laufey_common::CloseNotificationLinux(notification_id);
+  laufey_common::CloseNotification(notification_id);
 }
 
 // ============================================================================
-// Custom app:// scheme handling (in-process transport)
+// Custom URL scheme handling (in-process transport)
 // ============================================================================
+//
+// Serves "app" and every scheme the embedder registered through
+// register_scheme_handler. Each one is registered on the default
+// WebKitWebContext as secure (isSecureContext, crypto.subtle) and CORS-enabled
+// (a page on another origin may fetch it with CORS headers); with a host in
+// the URL WebKit gives it a `<scheme>://<host>` origin and per-origin storage.
 
 namespace {
 
-// Exchange wrapping a WebKitURISchemeRequest. The response is streamed through
-// a pipe: a GInputStream over the read end is handed to WebKit (on the GTK main
-// thread), and the runtime writes the body to the write end. WebKit reads the
-// stream as bytes arrive; closing the write end signals EOF.
+// Exchange wrapping a WebKitURISchemeRequest. The response body is a
+// laufey_common::SchemeBodyWriter's stream, handed to WebKit (on the GTK main
+// thread) with the head: the runtime's writes append to it and return at
+// once, whatever WebKit has read so far, and WebKit reads it from the GTK
+// main loop. (A pipe used to sit here: its write blocked the runtime's event
+// loop whenever 64 KiB were unread.) A page that stops reading makes the
+// next write fail; a body that grows past kSchemeBodyMaxQueued unread fails
+// the response, as on WebView2.
+//
+// The request body is buffered before the exchange is created (see
+// OnAppSchemeRequest), so ReadRequestBody is a non-blocking copy, as on the
+// other backends.
 class LinuxSchemeExchange : public SchemeExchangeBase {
  public:
-  explicit LinuxSchemeExchange(WebKitURISchemeRequest* request)
-      : request_(WEBKIT_URI_SCHEME_REQUEST(g_object_ref(request))) {}
+  LinuxSchemeExchange(WebKitURISchemeRequest* request,
+                      std::vector<uint8_t> request_body)
+      : request_(WEBKIT_URI_SCHEME_REQUEST(g_object_ref(request))),
+        request_body_(std::move(request_body)),
+        body_(std::make_shared<laufey_common::SchemeBodyWriter>()),
+        gate_(std::make_shared<laufey_common::SchemeCancelGate>()) {
+    // WebKit let the body stream go before it ended: the page aborted the
+    // request (or the document / window went away). WebKitGTK says nothing
+    // about a request cancelled before its head was sent, so a cancel is
+    // only seen once the head is.
+    std::shared_ptr<laufey_common::SchemeCancelGate> gate = gate_;
+    LinuxSchemeExchange* self = this;
+    body_->SetReaderGoneHandler([gate, self] {
+      gate->Cancel(
+          [self] { RuntimeLoader::GetInstance()->DispatchSchemeCancel(self); });
+    });
+  }
 
   ~LinuxSchemeExchange() override {
-    if (write_fd_ >= 0)
-      close(write_fd_);
+    body_->End();
     if (request_)
       g_object_unref(request_);
   }
 
-  // WebKitURISchemeRequest does not expose the request body.
-  intptr_t ReadRequestBody(uint8_t*, size_t) override {
-    return 0;
+  intptr_t ReadRequestBody(uint8_t* buf, size_t cap) override {
+    if (cap == 0)
+      return 0;
+    size_t remaining = request_body_.size() - req_cursor_;
+    if (remaining == 0)
+      return 0;
+    size_t n = std::min(cap, remaining);
+    memcpy(buf, request_body_.data() + req_cursor_, n);
+    req_cursor_ += n;
+    return static_cast<intptr_t>(n);
   }
 
   void Begin(int status, const char* headers, size_t headers_len) override {
-    int fds[2];
-    if (pipe(fds) != 0) {
-      failed_.store(true);
-      return;
-    }
-    read_fd_ = fds[0];
-    write_fd_ = fds[1];
+    began_ = true;
     auto* d = new BeginData;
     d->request = WEBKIT_URI_SCHEME_REQUEST(g_object_ref(request_));
-    d->read_fd = read_fd_;
+    d->body = body_;
     d->status = status;
     d->headers = LaufeyParseFlatHeaders(headers, headers_len);
     g_idle_add(BeginOnMain, d);
   }
 
+  // Never blocks (see the class comment).
   intptr_t WriteResponse(const uint8_t* buf, size_t len) override {
-    if (write_fd_ < 0 || failed_.load())
-      return -1;
-    size_t off = 0;
-    while (off < len) {
-      ssize_t n = write(write_fd_, buf + off, len - off);
-      if (n < 0) {
-        if (errno == EINTR)
-          continue;
-        failed_.store(true);
-        return -1;  // EPIPE: the webview went away
-      }
-      off += static_cast<size_t>(n);
-    }
-    return static_cast<intptr_t>(len);
+    return body_->Write(buf, len);
   }
 
   void Finish() override {
-    if (write_fd_ >= 0) {
-      close(write_fd_);  // EOF for the GInputStream
-      write_fd_ = -1;
+    // No on_cancel from now on (and one in progress has returned).
+    gate_->Finish();
+    body_->End();  // EOF for WebKit, after what was written
+    if (!began_) {
+      // Finished without a head: no response, so the request fails (it was
+      // never finished at all, which left the page's request pending).
+      g_idle_add(FailOnMain, g_object_ref(request_));
     }
     delete this;
   }
@@ -1625,25 +3068,48 @@ class LinuxSchemeExchange : public SchemeExchangeBase {
  private:
   struct BeginData {
     WebKitURISchemeRequest* request;
-    int read_fd;
+    // Shared: the exchange may finish before this runs.
+    std::shared_ptr<laufey_common::SchemeBodyWriter> body;
     int status;
     std::vector<std::pair<std::string, std::string>> headers;
   };
 
+  static gboolean FailOnMain(gpointer data) {
+    auto* request = static_cast<WebKitURISchemeRequest*>(data);
+    GError* error =
+        g_error_new_literal(G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "the scheme handler finished without a response");
+    webkit_uri_scheme_request_finish_error(request, error);
+    g_error_free(error);
+    g_object_unref(request);
+    return G_SOURCE_REMOVE;
+  }
+
   static gboolean BeginOnMain(gpointer data) {
     auto* d = static_cast<BeginData*>(data);
-    GInputStream* stream = g_unix_input_stream_new(d->read_fd, TRUE);
+    // On the GTK main thread: WebKit reads the stream from this context.
+    GInputStream* stream = d->body->CreateStream();
     WebKitURISchemeResponse* resp = webkit_uri_scheme_response_new(stream, -1);
     webkit_uri_scheme_response_set_status(resp, d->status, nullptr);
     SoupMessageHeaders* hdrs =
         soup_message_headers_new(SOUP_MESSAGE_HEADERS_RESPONSE);
     for (const auto& [k, v] : d->headers) {
       soup_message_headers_append(hdrs, k.c_str(), v.c_str());
+      // WebKit takes the response's MIME type from the content type set on
+      // the WebKitURISchemeResponse, not from the HTTP header list. Without
+      // it the type is empty, the default response policy treats the
+      // navigation as a download, and the load fails with "Frame load
+      // interrupted" — so mirror the Content-Type header into it.
+      if (g_ascii_strcasecmp(k.c_str(), "content-type") == 0) {
+        webkit_uri_scheme_response_set_content_type(resp, v.c_str());
+      }
     }
     // set_http_headers takes ownership of `hdrs`.
     webkit_uri_scheme_response_set_http_headers(resp, hdrs);
     webkit_uri_scheme_request_finish_with_response(d->request, resp);
     g_object_unref(resp);
+    // WebKit holds the stream now; when it lets go (the load ended or was
+    // cancelled) the stream closes and the next write fails.
     g_object_unref(stream);
     g_object_unref(d->request);
     delete d;
@@ -1651,11 +3117,117 @@ class LinuxSchemeExchange : public SchemeExchangeBase {
   }
 
   WebKitURISchemeRequest* request_;
-  int read_fd_ = -1;
-  int write_fd_ = -1;
-  std::atomic<bool> failed_{false};
+  std::vector<uint8_t> request_body_;
+  size_t req_cursor_ = 0;
+  std::shared_ptr<laufey_common::SchemeBodyWriter> body_;
+  std::shared_ptr<laufey_common::SchemeCancelGate> gate_;
+  // Begin and Finish come from the runtime's thread, in that order.
+  bool began_ = false;
 };
 
+// A scheme request whose body is still being read (see OnAppSchemeRequest).
+struct PendingSchemeRequest {
+  WebKitURISchemeRequest* request;  // owned reference
+  std::string method;
+  std::string uri;
+  std::string flat_headers;
+  std::vector<uint8_t> body;
+};
+
+// Hand a request (with its complete body) to the runtime. Takes `pending`.
+void DispatchPendingSchemeRequest(PendingSchemeRequest* pending) {
+  // window_id is unused by the desktop bridge (it serves a single named
+  // channel), so 0 is fine.
+  auto* exchange =
+      new LinuxSchemeExchange(pending->request, std::move(pending->body));
+  RuntimeLoader::GetInstance()->DispatchSchemeRequest(
+      0, exchange, pending->method, pending->uri, pending->flat_headers);
+  g_object_unref(pending->request);
+  delete pending;
+}
+
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+// Bytes requested per asynchronous read of a request body.
+constexpr gsize kSchemeBodyChunk = 256 * 1024;
+
+void ReadSchemeRequestBodyChunk(GInputStream* body,
+                                PendingSchemeRequest* pending);
+
+// Completion of one body read, on the GTK main thread: append the chunk and
+// read on, dispatch at end of stream, or fail the request on a read error
+// (forwarding a truncated body would be worse than failing the fetch).
+void OnSchemeRequestBodyChunk(GObject* source, GAsyncResult* result,
+                              gpointer data) {
+  GInputStream* body = G_INPUT_STREAM(source);
+  auto* pending = static_cast<PendingSchemeRequest*>(data);
+  GError* error = nullptr;
+  GBytes* chunk = g_input_stream_read_bytes_finish(body, result, &error);
+  if (!chunk) {
+    std::cerr << "laufey: failed to read the request body of "
+              << pending->method << " " << pending->uri << ": "
+              << (error ? error->message : "unknown error") << std::endl;
+    if (error) {
+      webkit_uri_scheme_request_finish_error(pending->request, error);
+      g_error_free(error);
+    } else {
+      GError* fallback = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_FAILED,
+                                             "failed to read the request body");
+      webkit_uri_scheme_request_finish_error(pending->request, fallback);
+      g_error_free(fallback);
+    }
+    g_object_unref(pending->request);
+    delete pending;
+    g_object_unref(body);
+    return;
+  }
+  gsize size = 0;
+  const auto* bytes =
+      static_cast<const uint8_t*>(g_bytes_get_data(chunk, &size));
+  if (size == 0) {
+    // End of stream.
+    g_bytes_unref(chunk);
+    g_object_unref(body);
+    DispatchPendingSchemeRequest(pending);
+    return;
+  }
+  if (!laufey_common::RequestBodyFits(pending->body.size(), size)) {
+    // Past the cap the request fails (the page's fetch rejects) without
+    // reaching the runtime, rather than the whole body being held.
+    std::cerr << "laufey: the request body of " << pending->method << " "
+              << pending->uri << " is larger than "
+              << (laufey_common::kMaxRequestBodyBytes >> 20)
+              << " MiB; failing the request" << std::endl;
+    GError* too_large =
+        g_error_new_literal(G_IO_ERROR, G_IO_ERROR_MESSAGE_TOO_LARGE,
+                            "the request body is too large");
+    webkit_uri_scheme_request_finish_error(pending->request, too_large);
+    g_error_free(too_large);
+    g_bytes_unref(chunk);
+    g_object_unref(pending->request);
+    delete pending;
+    g_object_unref(body);
+    return;
+  }
+  pending->body.insert(pending->body.end(), bytes, bytes + size);
+  g_bytes_unref(chunk);
+  ReadSchemeRequestBodyChunk(body, pending);
+}
+
+void ReadSchemeRequestBodyChunk(GInputStream* body,
+                                PendingSchemeRequest* pending) {
+  g_input_stream_read_bytes_async(body, kSchemeBodyChunk, G_PRIORITY_DEFAULT,
+                                  nullptr, OnSchemeRequestBodyChunk, pending);
+}
+#endif  // WEBKIT_CHECK_VERSION(2, 40, 0)
+
+// Runs on the GTK main thread. The request body (POST/PUT/PATCH from the page)
+// is exposed by WebKitGTK >= 2.40 as a GInputStream; it is read to the end
+// with asynchronous reads — never blocking the main loop — and the request is
+// dispatched to the runtime once it is complete, so ReadRequestBody is a plain
+// copy (the WKWebView, WebView2 and CEF backends buffer the body up front
+// too). A request without a body (NULL stream) is dispatched at once. Built
+// against WebKitGTK < 2.40, which has no body accessor, every request is
+// forwarded with an empty body.
 void OnAppSchemeRequest(WebKitURISchemeRequest* request, gpointer) {
   const char* uri = webkit_uri_scheme_request_get_uri(request);
   const char* method = webkit_uri_scheme_request_get_http_method(request);
@@ -1671,38 +3243,72 @@ void OnAppSchemeRequest(WebKitURISchemeRequest* request, gpointer) {
       headers.emplace_back(name, value);
     }
   }
-  std::string flat = LaufeyFlattenHeaders(headers);
-  // window_id is unused by the desktop bridge (it serves a single named
-  // channel), so 0 is fine.
-  auto* exchange = new LinuxSchemeExchange(request);
-  RuntimeLoader::GetInstance()->DispatchSchemeRequest(
-      0, exchange, method ? method : "GET", uri ? uri : "", flat);
+  auto* pending = new PendingSchemeRequest;
+  pending->request = WEBKIT_URI_SCHEME_REQUEST(g_object_ref(request));
+  pending->method = method ? method : "GET";
+  pending->uri = uri ? uri : "";
+  pending->flat_headers = LaufeyFlattenHeaders(headers);
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+  // (transfer full), NULL when the request has no body.
+  if (GInputStream* body = webkit_uri_scheme_request_get_http_body(request)) {
+    ReadSchemeRequestBodyChunk(body, pending);
+    return;
+  }
+#endif
+  DispatchPendingSchemeRequest(pending);
 }
 
 }  // namespace
 
 void WebKitGTKBackend::RegisterSchemeHandler(const std::string& scheme) {
-  // Register on the default web context (shared by all webviews). Must run on
-  // the GTK main thread; the runtime calls this from its own thread.
-  char* scheme_dup = g_strdup(scheme.c_str());
+  if (!laufey_common::IsValidSchemeName(scheme)) {
+    std::cerr << "laufey: ignoring invalid URL scheme name \"" << scheme
+              << "\" passed to register_scheme_handler" << std::endl;
+    return;
+  }
+  std::string normalized = laufey_common::NormalizeSchemeName(scheme);
+  bool added = laufey_common::SchemeRegistry::GetInstance()->Add(normalized);
+  if (added && any_web_view_created_.load()) {
+    // WebKitGTK applies the registration to existing web views too (the
+    // schemes live on the shared web context), but the other engines do not;
+    // flag the portability hazard.
+    std::cerr << "laufey: scheme \"" << normalized
+              << "\" was registered after a window was created; WebKitGTK "
+                 "serves it, but other backends will not (register schemes "
+                 "before the first window)"
+              << std::endl;
+  }
+
+  // Register on the web context shared by all webviews (LaufeyWebContext).
+  // Must run on the GTK main thread; the runtime calls this from its own
+  // thread. Window creation is queued on the same main loop, so a scheme
+  // registered before the first CreateWindow is installed before that window's
+  // web view exists.
   g_idle_add(
-      [](gpointer data) -> gboolean {
-        char* s = static_cast<char*>(data);
-        static std::atomic<bool> registered{false};
-        bool expected = false;
-        if (registered.compare_exchange_strong(expected, true)) {
-          WebKitWebContext* ctx = webkit_web_context_get_default();
-          webkit_web_context_register_uri_scheme(ctx, s, OnAppSchemeRequest,
-                                                 nullptr, nullptr);
-          WebKitSecurityManager* sm =
-              webkit_web_context_get_security_manager(ctx);
-          webkit_security_manager_register_uri_scheme_as_secure(sm, s);
-          webkit_security_manager_register_uri_scheme_as_cors_enabled(sm, s);
+      [](gpointer) -> gboolean {
+        // Main thread only. Install every registered scheme that isn't yet
+        // known to WebKit — the built-in "app" included, so it is served
+        // whether or not the runtime registered it by name (as the other
+        // backends do). Each name is registered exactly once; a second
+        // registration of the same name is an error.
+        static std::set<std::string> installed;
+        WebKitWebContext* ctx = LaufeyWebContext();
+        WebKitSecurityManager* sm =
+            webkit_web_context_get_security_manager(ctx);
+        for (const std::string& s :
+             laufey_common::SchemeRegistry::GetInstance()->Snapshot()) {
+          if (!installed.insert(s).second) {
+            continue;
+          }
+          webkit_web_context_register_uri_scheme(
+              ctx, s.c_str(), OnAppSchemeRequest, nullptr, nullptr);
+          webkit_security_manager_register_uri_scheme_as_secure(sm, s.c_str());
+          webkit_security_manager_register_uri_scheme_as_cors_enabled(
+              sm, s.c_str());
         }
-        g_free(s);
         return G_SOURCE_REMOVE;
       },
-      scheme_dup);
+      nullptr);
 }
 
 // ============================================================================

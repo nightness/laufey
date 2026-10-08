@@ -43,13 +43,35 @@ inline std::string BuildReleaseCallbackScript(uint64_t callback_id) {
   return "window.__laufeyReleaseCallback(" + std::to_string(callback_id) + ");";
 }
 
+inline std::string BuildBridgeScript(const std::string& ns,
+                                     const std::string& postMessage,
+                                     const std::string& prelude);
+
 // Builds the page init script. `ns` is the global namespace the proxy is
 // installed under (e.g. "laufey"); `postMessage` is the platform-specific
 // statement that ships the {callId, path, args} message to the host.
+// `prelude` runs first inside the script's closure, at document start, before
+// any page script: a backend declares there what the statement uses and the
+// page must not be able to see or replace (WebKitGTK's per-window token).
+//
+// `guard` is a JS expression (RuntimeLoader::BridgeGuardJs) that is false in
+// a document whose origin the app's launch file doesn't let use the bridge:
+// there the script installs nothing, and the backend refuses any call anyway.
 inline std::string BuildInitScript(const std::string& ns,
-                                   const std::string& postMessage) {
+                                   const std::string& postMessage,
+                                   const std::string& prelude = "",
+                                   const std::string& guard = "true") {
+  return "if (" + guard + ") {\n" +
+         BuildBridgeScript(ns, postMessage, prelude) + "}\n";
+}
+
+inline std::string BuildBridgeScript(const std::string& ns,
+                                     const std::string& postMessage,
+                                     const std::string& prelude) {
   return R"JS(
 (function() {
+)JS" + prelude +
+         R"JS(
   const pendingCalls = new Map();
   let nextCallId = 1;
 

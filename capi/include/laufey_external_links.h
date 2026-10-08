@@ -24,13 +24,73 @@
 // this path before it reaches the runtime and opens `url` in the OS browser.
 #define LAUFEY_OPEN_EXTERNAL_METHOD "__laufeyOpenExternal"
 
+// The native check on a URL the page asks to open. The reserved bridge
+// method is reachable by any script in the page, not only by the injected
+// interceptor, so the native side never trusts the page-side filter: only an
+// absolute http(s) URL with a host, and no whitespace or control characters,
+// reaches the OS's open-URL primitive (ShellExecuteW, NSWorkspace, GIO).
+// Anything else (file:, a UNC path, a custom scheme, a shortcut file) could
+// start a program or open a local file.
+inline bool IsAllowedExternalLinkUrl(const std::string& url) {
+  if (url.empty() || url.size() > 32768)
+    return false;
+  for (unsigned char c : url) {
+    if (c <= 0x20 || c == 0x7f)
+      return false;
+  }
+  size_t colon = url.find(':');
+  if (colon == std::string::npos)
+    return false;
+  std::string scheme = url.substr(0, colon);
+  for (char& c : scheme) {
+    if (c >= 'A' && c <= 'Z')
+      c = static_cast<char>(c - 'A' + 'a');
+  }
+  if (scheme != "http" && scheme != "https")
+    return false;
+  if (url.compare(colon, 3, "://") != 0 || url.size() == colon + 3)
+    return false;
+  char first = url[colon + 3];
+  return first != '/' && first != '\\' && first != '?' && first != '#' &&
+         first != '@' && first != ':';
+}
+
+// What a backend's new-window hook does with a `window.open()` /
+// `target="_blank"` request. No backend opens a popup web view; the request
+// is either handed to the OS browser or dropped.
+enum class LaufeyPopupDecision {
+  // An allowed external URL (IsAllowedExternalLinkUrl) the user asked for:
+  // open it in the OS browser.
+  kOpenInBrowser,
+  // An allowed external URL with no user gesture behind it (a script opening
+  // windows on its own, a timer, a page load): dropped and logged, so a page
+  // can't launch the user's browser at will.
+  kBlockedNoGesture,
+  // Anything else (another scheme, about:blank, a malformed URL): dropped.
+  kIgnored,
+};
+
+// `user_gesture`: the engine's word that a user action started the request
+// (CEF OnBeforePopup's user_gesture, WebView2's IsUserInitiated, WebKitGTK's
+// webkit_navigation_action_is_user_gesture; WKWebView's popup blocker, with
+// javaScriptCanOpenWindowsAutomatically off, only lets such requests reach
+// the hook at all).
+inline LaufeyPopupDecision DecideLaufeyPopup(const std::string& url,
+                                             bool user_gesture) {
+  if (!IsAllowedExternalLinkUrl(url))
+    return LaufeyPopupDecision::kIgnored;
+  return user_gesture ? LaufeyPopupDecision::kOpenInBrowser
+                      : LaufeyPopupDecision::kBlockedNoGesture;
+}
+
 // Builds the page-side interceptor for the namespace `ns` (the global the
 // laufey bridge proxy is installed under, e.g. "laufey").
 //
 // Policy (hardcoded by design — see the conversation around this feature):
-// only user-initiated, cancelable, cross-origin http(s) navigations are
-// redirected. Same-origin navigations (SPA routing, multi-page apps) and the
-// app's own `laufey://` scheme stay in the view. Downloads, reloads, history
+// only user-initiated (a trusted click on the fallback path), cancelable,
+// cross-origin http(s) navigations are redirected. Same-origin navigations
+// (SPA routing, multi-page apps) and the app's own `laufey://` scheme stay in
+// the view. Downloads, reloads, history
 // traversals and fragment changes are left alone.
 //
 // Two mechanisms, picked at runtime by capability:
@@ -94,7 +154,9 @@ inline std::string BuildExternalLinkInterceptScript(const std::string& ns) {
   // Fallback: no Navigation API. Intercept plain left clicks on anchors.
   document.addEventListener('click', function(e) {
     try {
-      if (e.defaultPrevented || e.button !== 0) return;
+      // Only a real click: a script's synthetic one (el.click()) carries no
+      // user gesture and must not reach the OS browser.
+      if (!e.isTrusted || e.defaultPrevented || e.button !== 0) return;
       var el = e.target;
       while (el && el.nodeType === 1 &&
              (el.tagName === undefined || el.tagName.toUpperCase() !== 'A')) {

@@ -152,8 +152,15 @@ mod imp {
     cb: Option<LaufeyPermissionCallbackFn>,
     user_data: *mut c_void,
   ) {
+    // Linux: granted only when a notification server runs, or D-Bus starts
+    // one (the Notification portal alone is no proof; Sway with no daemon
+    // offers it). No prompt anywhere here.
     let status = if kind == LAUFEY_PERMISSION_NOTIFICATIONS {
-      LAUFEY_PERMISSION_STATUS_GRANTED
+      if crate::platform::notification_server_usable() {
+        LAUFEY_PERMISSION_STATUS_GRANTED
+      } else {
+        LAUFEY_PERMISSION_STATUS_UNSUPPORTED
+      }
     } else {
       LAUFEY_PERMISSION_STATUS_UNSUPPORTED
     };

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{api, KeyModifiers, LAUFEY_KEY_PRESSED};
 
@@ -33,11 +33,11 @@ impl KeyState {
 }
 
 static KEYBOARD_HANDLERS: OnceLock<
-  Mutex<HashMap<u32, Box<dyn Fn(KeyboardEvent) + Send + Sync>>>,
+  Mutex<HashMap<u32, Arc<dyn Fn(KeyboardEvent) + Send + Sync>>>,
 > = OnceLock::new();
 
 fn keyboard_handlers_store(
-) -> &'static Mutex<HashMap<u32, Box<dyn Fn(KeyboardEvent) + Send + Sync>>> {
+) -> &'static Mutex<HashMap<u32, Arc<dyn Fn(KeyboardEvent) + Send + Sync>>> {
   KEYBOARD_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -88,8 +88,13 @@ unsafe extern "C" fn keyboard_event_trampoline(
     repeat,
   };
 
-  let guard = keyboard_handlers_store().lock().unwrap();
-  if let Some(handler) = guard.get(&window_id) {
+  // Cloned out: the handler runs without the lock held.
+  let handler = keyboard_handlers_store()
+    .lock()
+    .unwrap()
+    .get(&window_id)
+    .cloned();
+  if let Some(handler) = handler {
     handler(event);
   }
 }
@@ -103,7 +108,7 @@ where
   keyboard_handlers_store()
     .lock()
     .unwrap()
-    .insert(window_id, Box::new(handler));
+    .insert(window_id, Arc::new(handler));
 }
 
 #[cfg(test)]

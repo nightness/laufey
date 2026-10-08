@@ -15,6 +15,7 @@
 #include <string>
 
 #include "init_script.h"
+#include "laufey_bridge_origin.h"
 #include "laufey_json.h"
 #include "runtime_loader.h"
 
@@ -62,6 +63,9 @@ class WKWebViewIOSBackend : public LaufeyBackend {
     if (h)
       *h = (int)b.size.height;
   }
+  double GetWindowScaleFactor(uint32_t) override {
+    return (double)UIScreen.mainScreen.scale;
+  }
   void SetWindowPosition(uint32_t, int, int) override {}
   void GetWindowPosition(uint32_t, int* x, int* y) override {
     if (x)
@@ -85,10 +89,11 @@ class WKWebViewIOSBackend : public LaufeyBackend {
   void Focus(uint32_t) override {}
 
   void Quit() override {}
-  void PostUiTask(void (*task)(void*), void* data) override {
+  bool PostUiTask(void (*task)(void*), void* data) override {
     dispatch_async(dispatch_get_main_queue(), ^{
       task(data);
     });
+    return true;
   }
   void Run() override {}  // UIApplicationMain already owns the run loop.
 
@@ -187,8 +192,10 @@ class WKWebViewIOSBackend : public LaufeyBackend {
 
   // Called from the script-message handler on the main thread.
   void HandleJsMessage(uint32_t window_id, uint64_t call_id,
-                       const std::string& method, laufey::ValuePtr args) {
-    RuntimeLoader::GetInstance()->OnJsCall(window_id, call_id, method, args);
+                       const std::string& method, laufey::ValuePtr args,
+                       const std::string& origin) {
+    RuntimeLoader::GetInstance()->OnJsCall(window_id, call_id, method, args,
+                                           origin);
   }
 
   IOSWindowState* GetWindow(uint32_t window_id) {
@@ -215,31 +222,64 @@ class WKWebViewIOSBackend : public LaufeyBackend {
       didReceiveScriptMessage:(WKScriptMessage*)message {
   if (![message.name isEqualToString:@"laufey"])
     return;
+  // The handler is visible to every frame; the bridge is the main frame's.
+  WKFrameInfo* frame = message.frameInfo;
+  if (!frame || !frame.isMainFrame)
+    return;
   if (![message.body isKindOfClass:[NSDictionary class]])
     return;
+  // Every type is checked: a message from a page is never a reason to crash
+  // (the same checks as the macOS backend).
   NSDictionary* body = (NSDictionary*)message.body;
-  NSNumber* callIdNum = body[@"callId"];
-  NSString* method = body[@"method"];
+  id callIdObj = body[@"callId"];
+  id methodObj = body[@"method"];
   id argsJson = body[@"args"];
-  if (!callIdNum || !method)
+  if (![callIdObj isKindOfClass:[NSNumber class]] ||
+      ![methodObj isKindOfClass:[NSString class]])
     return;
-
-  uint64_t call_id = [callIdNum unsignedLongLongValue];
-  std::string methodStr = [method UTF8String];
+  double callIdDouble = [(NSNumber*)callIdObj doubleValue];
+  if (!(callIdDouble >= 0 && callIdDouble <= 9007199254740992.0) ||
+      callIdDouble != static_cast<double>(static_cast<uint64_t>(callIdDouble)))
+    return;
+  uint64_t call_id = static_cast<uint64_t>(callIdDouble);
+  const char* methodUtf8 = [(NSString*)methodObj UTF8String];
+  if (!methodUtf8)
+    return;
+  std::string methodStr = methodUtf8;
 
   laufey::ValuePtr args = laufey::Value::List();
-  if ([argsJson isKindOfClass:[NSArray class]]) {
-    NSData* jsonData = [NSJSONSerialization dataWithJSONObject:argsJson
-                                                       options:0
-                                                         error:nil];
-    if (jsonData) {
-      NSString* jsonStr = [[NSString alloc] initWithData:jsonData
-                                                encoding:NSUTF8StringEncoding];
-      args = json::ParseJson([jsonStr UTF8String]);
+  if (argsJson && argsJson != [NSNull null]) {
+    laufey::ValuePtr parsed;
+    if ([argsJson isKindOfClass:[NSArray class]] &&
+        [NSJSONSerialization isValidJSONObject:argsJson]) {
+      NSData* jsonData = [NSJSONSerialization dataWithJSONObject:argsJson
+                                                         options:0
+                                                           error:nil];
+      if (jsonData) {
+        std::string json(static_cast<const char*>(jsonData.bytes),
+                         jsonData.length);
+        parsed = json::ParseJson(json);
+      }
     }
+    if (!parsed || !parsed->IsList()) {
+      if (self.backend)
+        self.backend->RespondToJsCall(
+            self.windowId, call_id, nullptr,
+            laufey::Value::String(
+                "laufey: the call's arguments can't be passed to the app"));
+      return;
+    }
+    args = parsed;
   }
   if (self.backend) {
-    self.backend->HandleJsMessage(self.windowId, call_id, methodStr, args);
+    WKSecurityOrigin* o = frame.securityOrigin;
+    const char* scheme = o.protocol.UTF8String;
+    const char* host = o.host.UTF8String;
+    self.backend->HandleJsMessage(
+        self.windowId, call_id, methodStr, args,
+        laufey_common::SerializeOrigin(
+            scheme ? scheme : "", host ? host : "",
+            o.port > 0 ? static_cast<int>(o.port) : -1));
   }
 }
 @end
@@ -264,7 +304,8 @@ void WKWebViewIOSBackend::CreateWindowEx(uint32_t window_id, int width,
                           "            callId: callId,\n"
                           "            method: path.join('.'),\n"
                           "            args: processedArgs\n"
-                          "          });");
+                          "          });",
+                          "", RuntimeLoader::GetInstance()->BridgeGuardJs());
       WKUserScript* script = [[WKUserScript alloc]
             initWithSource:[NSString stringWithUTF8String:initScript.c_str()]
              injectionTime:WKUserScriptInjectionTimeAtDocumentStart

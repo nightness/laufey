@@ -3,9 +3,19 @@
 pub use winit;
 
 pub mod dock;
+pub mod file_drop;
 pub mod notification;
+pub mod open_url;
 pub mod permission;
+pub mod platform;
+mod prompt;
+pub mod title_bar;
 pub mod tray;
+pub mod ui_tasks;
+pub mod window_api;
+
+#[cfg(test)]
+mod abi_layout_tests;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,7 +33,9 @@ use muda::MenuEvent;
 use raw_window_handle::{
   HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
-use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::dpi::{
+  LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize,
+};
 use winit::event_loop::EventLoopProxy;
 use winit::window::{Window, WindowLevel};
 
@@ -33,7 +45,7 @@ use winit::window::{Window, WindowLevel};
 // Bumping this in lockstep with the capi is mandatory: the capi's `init_api`
 // rejects any backend whose reported `version` differs, and the vtable layout
 // below must match the `laufey_backend_api` struct as of this version.
-pub const LAUFEY_API_VERSION: u32 = 34;
+pub const LAUFEY_API_VERSION: u32 = 47;
 
 /// Creation-time window style flags (mirror `LAUFEY_WINDOW_FLAG_*` in laufey.h).
 pub const LAUFEY_WINDOW_FLAG_FRAMELESS: u32 = 1 << 0;
@@ -64,6 +76,15 @@ pub type LaufeyJsCallFn = unsafe extern "C" fn(
   u64,              // call_id
   *const c_char,    // method_path
   *mut LaufeyValue, // args
+);
+/// A JS call with the calling document's origin (API 44).
+pub type LaufeyJsCallExFn = unsafe extern "C" fn(
+  *mut c_void,      // user_data
+  u32,              // window_id
+  u64,              // call_id
+  *const c_char,    // method_path
+  *mut LaufeyValue, // args
+  *const c_char,    // origin
 );
 pub type LaufeyJsResultFn =
   unsafe extern "C" fn(*mut LaufeyValue, *mut LaufeyValue, *mut c_void);
@@ -564,9 +585,425 @@ pub struct LaufeyBackendApi {
     Option<unsafe extern "C" fn(*mut c_void, u32, bool)>,
   pub is_click_passthrough_forward:
     Option<unsafe extern "C" fn(*mut c_void, u32) -> bool>,
+
+  // --- Deep links / custom URL schemes (API >= 35) ---
+  // macOS only (a runtime-added `application:openURLs:` on winit's delegate —
+  // see open_url.rs). Both pointers stay None on Windows/Linux, where the OS
+  // hands the URL to a new process as argv and only the embedder can act on
+  // it. The fields MUST still be declared to keep the struct layout in sync
+  // with the `laufey_backend_api` the capi reads through the backend's
+  // pointer.
+  pub set_open_url_handler: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      Option<open_url::LaufeyOpenUrlFn>,
+      *mut c_void,
+    ),
+  >,
+  pub test_trigger_open_url:
+    Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> bool>,
+
+  // --- Single instance (API >= 36) ---
+  // Not implemented by the winit backends (no single-instance lock; see
+  // docs/deep-links.md), so always None. Declared to keep the struct layout
+  // in sync with `laufey_backend_api`.
+  pub set_second_instance_handler: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      Option<
+        unsafe extern "C" fn(
+          *mut c_void,
+          *const *const c_char,
+          usize,
+          *const c_char,
+        ),
+      >,
+      *mut c_void,
+    ),
+  >,
+
+  // --- Passkeys (API >= 37) ---
+  // Not implemented by the winit backends (no web engine to anchor a sheet
+  // to; see docs/passkeys.md), so always None: the capi reports no
+  // capabilities and answers not_supported. Declared to keep the struct
+  // layout in sync with `laufey_backend_api`.
+  pub passkey_capabilities: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+  pub passkey_request: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      u32,
+      u32,
+      *const c_char,
+      Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
+      *mut c_void,
+    ),
+  >,
+
+  // --- Device pixel ratio (API >= 38) ---
+  pub get_window_scale_factor:
+    Option<unsafe extern "C" fn(*mut c_void, u32) -> f64>,
+
+  // --- Content-view origin (API >= 38) ---
+  pub get_window_inner_position:
+    Option<unsafe extern "C" fn(*mut c_void, u32, *mut c_int, *mut c_int)>,
+
+  // --- Outer window size (API >= 38) ---
+  pub get_window_outer_size:
+    Option<unsafe extern "C" fn(*mut c_void, u32, *mut c_int, *mut c_int)>,
+
+  // --- Test input injection (API >= 38) ---
+  pub test_inject_input: Option<
+    unsafe extern "C" fn(*mut c_void, u32, *const LaufeyTestInput) -> bool,
+  >,
+
+  // --- Window state, constraints, screens and chrome (API >= 38) ---
+  // State, constraints, screens, normal bounds and keep-alive are filled by
+  // fill_common_api; display events, title bar styles and backdrops stay
+  // None (winit has no API for them; see docs/window-management.md).
+  pub set_window_state: Option<unsafe extern "C" fn(*mut c_void, u32, c_int)>,
+  pub get_window_state: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+  pub set_window_state_handler: Option<
+    unsafe extern "C" fn(*mut c_void, Option<LaufeyWindowStateFn>, *mut c_void),
+  >,
+  pub set_window_size_constraints:
+    Option<unsafe extern "C" fn(*mut c_void, u32, c_int, c_int, c_int, c_int)>,
+  pub get_window_size_constraints: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      u32,
+      *mut c_int,
+      *mut c_int,
+      *mut c_int,
+      *mut c_int,
+    ),
+  >,
+  pub get_screens: Option<
+    unsafe extern "C" fn(*mut c_void, *mut LaufeyScreen, usize) -> usize,
+  >,
+  pub get_window_screen: Option<unsafe extern "C" fn(*mut c_void, u32) -> i64>,
+  pub set_display_changed_handler: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      Option<unsafe extern "C" fn(*mut c_void)>,
+      *mut c_void,
+    ),
+  >,
+  pub window_capabilities: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+  pub set_window_titlebar_style:
+    Option<unsafe extern "C" fn(*mut c_void, u32, c_int) -> bool>,
+  pub set_window_traffic_light_position:
+    Option<unsafe extern "C" fn(*mut c_void, u32, c_int, c_int) -> bool>,
+  pub set_window_backdrop:
+    Option<unsafe extern "C" fn(*mut c_void, u32, c_int, c_int) -> bool>,
+  pub get_window_normal_bounds: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      u32,
+      *mut c_int,
+      *mut c_int,
+      *mut c_int,
+      *mut c_int,
+    ) -> bool,
+  >,
+  pub set_quit_on_last_window_closed:
+    Option<unsafe extern "C" fn(*mut c_void, bool)>,
+
+  // --- Drag and drop, file dialogs, rich clipboard (API >= 39) ---
+  // File drops (set_file_drop_handler, test_trigger_file_drop) and
+  // clipboard_capabilities are filled by fill_common_api (see file_drop.rs);
+  // drag-out, file dialogs and the rich clipboard stay None: winit has no API
+  // for them (docs/drag-and-drop.md, docs/file-dialogs.md,
+  // docs/clipboard.md). Every field is declared to keep the layout in sync
+  // with `laufey_backend_api`.
+  pub set_file_drop_handler: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      Option<file_drop::LaufeyFileDropFn>,
+      *mut c_void,
+    ),
+  >,
+  pub start_file_drag: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      u32,
+      *const *const c_char,
+      usize,
+      *const u8,
+      usize,
+      Option<unsafe extern "C" fn(*mut c_void, c_int)>,
+      *mut c_void,
+    ),
+  >,
+  pub test_trigger_file_drop: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      u32,
+      c_int,
+      f64,
+      f64,
+      *const *const c_char,
+      usize,
+    ) -> bool,
+  >,
+  pub show_file_dialog: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      u32,
+      *const c_void,
+      Option<LaufeyFileDialogResultFn>,
+      *mut c_void,
+    ) -> u32,
+  >,
+  pub cancel_file_dialog:
+    Option<unsafe extern "C" fn(*mut c_void, u32) -> bool>,
+  pub test_file_dialog_respond:
+    Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> bool>,
+  pub clipboard_capabilities: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+  pub read_clipboard_html:
+    Option<unsafe extern "C" fn(*mut c_void) -> *mut c_char>,
+  pub write_clipboard_html: Option<
+    unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> bool,
+  >,
+  pub read_clipboard_image:
+    Option<unsafe extern "C" fn(*mut c_void, *mut usize) -> *mut u8>,
+  pub write_clipboard_image:
+    Option<unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool>,
+  pub read_clipboard_formats:
+    Option<unsafe extern "C" fn(*mut c_void) -> *mut c_char>,
+  pub set_clipboard_change_handler: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      Option<unsafe extern "C" fn(*mut c_void)>,
+      *mut c_void,
+    ),
+  >,
+  pub buffer_free: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+
+  // --- Global shortcuts, launch at login, DevTools (API >= 40) ---
+  pub system_capabilities: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+  pub set_shortcut_handler:
+    Option<unsafe extern "C" fn(*mut c_void, Option<ShortcutFn>, *mut c_void)>,
+  pub register_shortcut: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      *const c_char,
+      Option<ShortcutResultFn>,
+      *mut c_void,
+    ),
+  >,
+  pub unregister_shortcut:
+    Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> bool>,
+  pub unregister_all_shortcuts: Option<unsafe extern "C" fn(*mut c_void)>,
+  pub list_shortcuts: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_char>,
+  pub canonicalize_accelerator:
+    Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_char>,
+  pub test_trigger_shortcut:
+    Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> bool>,
+  pub get_launch_at_login: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+  pub set_launch_at_login:
+    Option<unsafe extern "C" fn(*mut c_void, bool, *mut *mut c_char) -> c_int>,
+  pub close_devtools: Option<unsafe extern "C" fn(*mut c_void, u32)>,
+  pub is_devtools_open: Option<unsafe extern "C" fn(*mut c_void, u32) -> bool>,
+  pub is_devtools_enabled:
+    Option<unsafe extern "C" fn(*mut c_void, u32) -> bool>,
+
+  // --- Menus and notifications (API >= 41) ---
+  pub menu_capabilities: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+  pub show_context_menu_ex: Option<ShowContextMenuExFn>,
+  pub test_dismiss_context_menu:
+    Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+  pub test_trigger_menu_accelerator:
+    Option<unsafe extern "C" fn(*mut c_void, u32, *const c_char) -> bool>,
+  pub notification_capabilities:
+    Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+  pub set_notification_response_handler: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      Option<NotificationResponseFn>,
+      *mut c_void,
+    ),
+  >,
+  pub list_scheduled_notifications: Option<
+    unsafe extern "C" fn(*mut c_void, Option<NotificationListFn>, *mut c_void),
+  >,
+  pub cancel_notification:
+    Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
+  pub test_notification_respond: Option<
+    unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> bool,
+  >,
+  // --- UI-thread tasks, auth session (API >= 42) ---
+  pub dispatch_ui_task: Option<
+    unsafe extern "C" fn(*mut c_void, Option<ui_tasks::UiTaskFn>, *mut c_void),
+  >,
+  pub is_ui_thread: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+  pub auth_session_capabilities:
+    Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+  pub auth_session_start: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      u32,
+      *const c_char,
+      *const c_char,
+      u32,
+      Option<AuthSessionResultFn>,
+      *mut c_void,
+    ),
+  >,
+  pub test_cancel_auth_session:
+    Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+  // --- Auth session cancel (API >= 43) ---
+  pub auth_session_cancel: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+  // --- JS calls with their origin (API >= 44) ---
+  pub set_js_call_handler_ex:
+    Option<unsafe extern "C" fn(*mut c_void, LaufeyJsCallExFn, *mut c_void)>,
+  // --- Platform features (API >= 45) ---
+  pub platform_features:
+    Option<unsafe extern "C" fn(*mut c_void) -> *mut c_char>,
+  pub tray_unavailable_reason:
+    Option<unsafe extern "C" fn(*mut c_void) -> *mut c_char>,
+  pub set_platform_features_changed_handler: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      Option<unsafe extern "C" fn(*mut c_void)>,
+      *mut c_void,
+    ),
+  >,
+  // --- Exit with a code (API >= 46) ---
+  pub exit_app: Option<unsafe extern "C" fn(*mut c_void, c_int)>,
+  // --- Title bar preferences (API >= 47) ---
+  pub title_bar_preferences:
+    Option<unsafe extern "C" fn(*mut c_void) -> *mut c_char>,
+  pub set_title_bar_preferences_changed_handler: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      Option<unsafe extern "C" fn(*mut c_void)>,
+      *mut c_void,
+    ),
+  >,
+  // --- Secure store (API >= 47) ---
+  pub secret_lookup: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      *const c_char,
+      *const c_char,
+      u32,
+      *mut *mut c_char,
+      *mut *mut c_char,
+    ) -> c_int,
+  >,
+  pub secret_store: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      *const c_char,
+      *const c_char,
+      *const c_char,
+      *const c_char,
+      u32,
+      *mut *mut c_char,
+    ) -> c_int,
+  >,
+  pub secret_delete: Option<
+    unsafe extern "C" fn(
+      *mut c_void,
+      *const c_char,
+      *const c_char,
+      u32,
+      *mut *mut c_char,
+    ) -> c_int,
+  >,
 }
 
+/// `auth_session_cancel` (API 43) on Winit, which has no auth sessions:
+/// there is never one to cancel.
+unsafe extern "C" fn auth_session_cancel_none(
+  _backend_data: *mut c_void,
+) -> bool {
+  false
+}
+
+/// `laufey_auth_session_result_fn` (API 42).
+pub type AuthSessionResultFn =
+  unsafe extern "C" fn(*mut c_void, i32, *const c_char);
+
+/// `laufey_menu_closed_fn` (API 41).
+pub type MenuClosedFn = unsafe extern "C" fn(*mut c_void, u32);
+/// `show_context_menu_ex` (API 41).
+pub type ShowContextMenuExFn = unsafe extern "C" fn(
+  *mut c_void,
+  u32,
+  c_int,
+  c_int,
+  *mut LaufeyValue,
+  Option<LaufeyMenuClickFn>,
+  *mut c_void,
+  Option<MenuClosedFn>,
+  *mut c_void,
+);
+/// `laufey_notification_response_fn` (API 41).
+pub type NotificationResponseFn =
+  unsafe extern "C" fn(*mut c_void, *const c_char);
+/// `laufey_notification_list_fn` (API 41).
+pub type NotificationListFn = unsafe extern "C" fn(*mut c_void, *const c_char);
+
+/// `laufey_shortcut_fn` (API 40).
+pub type ShortcutFn = unsafe extern "C" fn(*mut c_void, *const c_char);
+/// `laufey_shortcut_result_fn` (API 40).
+pub type ShortcutResultFn =
+  unsafe extern "C" fn(*mut c_void, c_int, *const c_char);
+
+/// `laufey_file_dialog_result_fn` (API 39).
+pub type LaufeyFileDialogResultFn =
+  unsafe extern "C" fn(*mut c_void, u32, c_int, *const *const c_char, usize);
+
+/// `laufey_window_state_fn` (API 38).
+pub type LaufeyWindowStateFn = unsafe extern "C" fn(*mut c_void, u32, u32, u32);
+
+/// Mirrors `laufey_screen_t` in laufey.h.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LaufeyScreen {
+  pub id: i64,
+  pub x: i32,
+  pub y: i32,
+  pub width: i32,
+  pub height: i32,
+  pub work_x: i32,
+  pub work_y: i32,
+  pub work_width: i32,
+  pub work_height: i32,
+  pub scale_factor: f64,
+  pub is_primary: bool,
+}
+
+/// Mirrors `laufey_test_input_t` in laufey.h.
+#[repr(C)]
+pub struct LaufeyTestInput {
+  pub kind: c_int,
+  pub modifiers: u32,
+  pub key: *const c_char,
+  pub code: *const c_char,
+  pub pressed: bool,
+  pub repeat: bool,
+  pub button: c_int,
+  pub x: f64,
+  pub y: f64,
+  pub delta_x: f64,
+  pub delta_y: f64,
+  pub delta_mode: c_int,
+}
+
+pub const LAUFEY_TEST_INPUT_KEY: c_int = 0;
+pub const LAUFEY_TEST_INPUT_MOUSE_MOVE: c_int = 1;
+pub const LAUFEY_TEST_INPUT_MOUSE_BUTTON: c_int = 2;
+pub const LAUFEY_TEST_INPUT_WHEEL: c_int = 3;
+pub const LAUFEY_TEST_INPUT_CURSOR_ENTER: c_int = 4;
+pub const LAUFEY_TEST_INPUT_CURSOR_LEAVE: c_int = 5;
+pub const LAUFEY_TEST_INPUT_MODIFIERS: c_int = 6;
+
 unsafe impl Send for LaufeyBackendApi {}
+// Read-only once handed to the runtime (function pointers plus the opaque
+// backend_data the runtime passes back); every thread calls through it.
+unsafe impl Sync for LaufeyBackendApi {}
 
 pub type RuntimeInitFn = unsafe extern "C" fn(*const LaufeyBackendApi) -> c_int;
 pub type RuntimeStartFn = unsafe extern "C" fn() -> c_int;
@@ -767,9 +1204,12 @@ pub unsafe extern "C" fn value_list_size(val: *mut LaufeyValue) -> usize {
     _ => 0,
   }
 }
+/// The item at `idx` of a list, borrowed from it (null if absent). Backend
+/// internal; the exported [`value_list_get`] hands out an owned copy.
+///
 /// # Safety
-/// Caller must pass valid pointers as defined by the LAUFEY C API contract.
-pub unsafe extern "C" fn value_list_get(
+/// `val` must be null or a valid value of this backend.
+pub(crate) unsafe fn value_list_item_ref(
   val: *mut LaufeyValue,
   idx: usize,
 ) -> *mut LaufeyValue {
@@ -783,9 +1223,13 @@ pub unsafe extern "C" fn value_list_get(
     _ => std::ptr::null_mut(),
   }
 }
+/// The value under `key` of a dict, borrowed from it (null if absent).
+/// Backend internal; the exported [`value_dict_get`] hands out an owned copy.
+///
 /// # Safety
-/// Caller must pass valid pointers as defined by the LAUFEY C API contract.
-pub unsafe extern "C" fn value_dict_get(
+/// `val` must be null or a valid value of this backend; `key` null or a C
+/// string.
+pub(crate) unsafe fn value_dict_entry_ref(
   val: *mut LaufeyValue,
   key: *const c_char,
 ) -> *mut LaufeyValue {
@@ -801,6 +1245,52 @@ pub unsafe extern "C" fn value_dict_get(
       .unwrap_or(std::ptr::null_mut()),
     _ => std::ptr::null_mut(),
   }
+}
+/// A deep copy of `ptr` (null for null).
+unsafe fn laufey_clone(ptr: *mut LaufeyValue) -> *mut LaufeyValue {
+  if ptr.is_null() {
+    return std::ptr::null_mut();
+  }
+  let copy = match laufey_ref(ptr) {
+    SimpleValue::Null => SimpleValue::Null,
+    SimpleValue::Bool(v) => SimpleValue::Bool(*v),
+    SimpleValue::Int(v) => SimpleValue::Int(*v),
+    SimpleValue::Double(v) => SimpleValue::Double(*v),
+    SimpleValue::String(v) => SimpleValue::String(v.clone()),
+    SimpleValue::List(items) => {
+      SimpleValue::List(items.iter().map(|i| laufey_clone(*i)).collect())
+    }
+    SimpleValue::Dict(entries) => SimpleValue::Dict(
+      entries
+        .iter()
+        .map(|(k, v)| (k.clone(), laufey_clone(*v)))
+        .collect(),
+    ),
+    SimpleValue::Binary(v) => SimpleValue::Binary(v.clone()),
+  };
+  sv_to_laufey(copy)
+}
+/// The item at `idx` of a list as a new value the caller owns and frees
+/// with `value_free` (null if absent), as on every backend (laufey.h).
+///
+/// # Safety
+/// Caller must pass valid pointers as defined by the LAUFEY C API contract.
+pub unsafe extern "C" fn value_list_get(
+  val: *mut LaufeyValue,
+  idx: usize,
+) -> *mut LaufeyValue {
+  laufey_clone(value_list_item_ref(val, idx))
+}
+/// The value under `key` of a dict as a new value the caller owns and frees
+/// with `value_free` (null if absent), as on every backend (laufey.h).
+///
+/// # Safety
+/// Caller must pass valid pointers as defined by the LAUFEY C API contract.
+pub unsafe extern "C" fn value_dict_get(
+  val: *mut LaufeyValue,
+  key: *const c_char,
+) -> *mut LaufeyValue {
+  laufey_clone(value_dict_entry_ref(val, key))
 }
 /// # Safety
 /// Caller must pass valid pointers as defined by the LAUFEY C API contract.
@@ -1053,6 +1543,17 @@ pub unsafe extern "C" fn set_js_call_handler(
   _user_data: *mut c_void,
 ) {
 }
+/// `set_js_call_handler_ex` (API 44): Winit has no web engine, so no JS
+/// call ever arrives; the handler is accepted and never called.
+///
+/// # Safety
+/// Caller must pass valid pointers as defined by the LAUFEY C API contract.
+pub unsafe extern "C" fn set_js_call_handler_ex(
+  _data: *mut c_void,
+  _handler: LaufeyJsCallExFn,
+  _user_data: *mut c_void,
+) {
+}
 /// # Safety
 /// Caller must pass valid pointers as defined by the LAUFEY C API contract.
 pub unsafe extern "C" fn js_call_respond(
@@ -1206,6 +1707,110 @@ pub fn create_api_base() -> LaufeyBackendApi {
     // observation API.
     set_click_passthrough_forward: None,
     is_click_passthrough_forward: None,
+    // Deep links (API >= 35): filled by fill_common_api on macOS only.
+    set_open_url_handler: None,
+    test_trigger_open_url: None,
+    // Single instance (API >= 36): not supported by winit backends.
+    set_second_instance_handler: None,
+    // Passkeys (API >= 37): not supported by winit backends.
+    passkey_capabilities: None,
+    passkey_request: None,
+    // Device pixel ratio (API >= 38): filled by fill_common_api.
+    get_window_scale_factor: None,
+    // Content-view origin (API >= 38): filled by fill_common_api.
+    get_window_inner_position: None,
+    // Outer window size (API >= 38): filled by fill_common_api.
+    get_window_outer_size: None,
+    // Test input injection (API >= 38): filled by fill_common_api.
+    test_inject_input: None,
+    // Window state / constraints / screens / normal bounds / keep-alive
+    // (API >= 38): filled by fill_common_api. No display-changed event,
+    // title bar style or backdrop API in winit.
+    set_window_state: None,
+    get_window_state: None,
+    set_window_state_handler: None,
+    set_window_size_constraints: None,
+    get_window_size_constraints: None,
+    get_screens: None,
+    get_window_screen: None,
+    set_display_changed_handler: None,
+    window_capabilities: None,
+    set_window_titlebar_style: None,
+    set_window_traffic_light_position: None,
+    set_window_backdrop: None,
+    get_window_normal_bounds: None,
+    set_quit_on_last_window_closed: None,
+    // Drag and drop, file dialogs, rich clipboard (API >= 39): file drops and
+    // the clipboard capability bits are filled by fill_common_api; winit has
+    // no drag-out, dialog or rich-clipboard API.
+    set_file_drop_handler: None,
+    start_file_drag: None,
+    test_trigger_file_drop: None,
+    show_file_dialog: None,
+    cancel_file_dialog: None,
+    test_file_dialog_respond: None,
+    clipboard_capabilities: None,
+    read_clipboard_html: None,
+    write_clipboard_html: None,
+    read_clipboard_image: None,
+    write_clipboard_image: None,
+    read_clipboard_formats: None,
+    set_clipboard_change_handler: None,
+    buffer_free: None,
+    // API 40: Winit has no global shortcuts, launch-at-login or DevTools
+    // (no web engine); every entry stays NULL, which the laufey crate
+    // reports as unsupported.
+    system_capabilities: None,
+    set_shortcut_handler: None,
+    register_shortcut: None,
+    unregister_shortcut: None,
+    unregister_all_shortcuts: None,
+    list_shortcuts: None,
+    canonicalize_accelerator: None,
+    test_trigger_shortcut: None,
+    get_launch_at_login: None,
+    set_launch_at_login: None,
+    close_devtools: None,
+    is_devtools_open: None,
+    is_devtools_enabled: None,
+    // API 41: Winit has no context-menu close event, menu accelerators or
+    // notification scheduling / responses; every entry stays NULL, which the
+    // laufey crate reports as unsupported.
+    menu_capabilities: None,
+    show_context_menu_ex: None,
+    test_dismiss_context_menu: None,
+    test_trigger_menu_accelerator: None,
+    notification_capabilities: None,
+    set_notification_response_handler: None,
+    list_scheduled_notifications: None,
+    cancel_notification: None,
+    test_notification_respond: None,
+    // API 42: UI-thread tasks are filled in by fill_common_api; Winit has
+    // no web content, so no auth session (the laufey crate reports
+    // not_supported).
+    dispatch_ui_task: None,
+    is_ui_thread: None,
+    auth_session_capabilities: None,
+    auth_session_start: None,
+    test_cancel_auth_session: None,
+    // API 43: no session can run, so cancelling one answers false.
+    auth_session_cancel: Some(auth_session_cancel_none),
+    // API 44: no web engine, so no call ever arrives.
+    set_js_call_handler_ex: Some(set_js_call_handler_ex),
+    // API 45: filled in by fill_common_api (freed with its string_free).
+    platform_features: None,
+    tray_unavailable_reason: None,
+    set_platform_features_changed_handler: None,
+    // API 46: filled in by fill_common_api.
+    exit_app: None,
+    // API 47: filled in by fill_common_api on Linux; not reported on macOS
+    // and Windows (title_bar.rs).
+    title_bar_preferences: None,
+    set_title_bar_preferences_changed_handler: None,
+    // API 47: no secure store on Winit.
+    secret_lookup: None,
+    secret_store: None,
+    secret_delete: None,
   }
 }
 
@@ -1407,7 +2012,7 @@ unsafe fn laufey_dict_string(
   key: &str,
 ) -> Option<String> {
   let c_key = CString::new(key).ok()?;
-  let val = value_dict_get(dict, c_key.as_ptr());
+  let val = value_dict_entry_ref(dict, c_key.as_ptr());
   if val.is_null() || !value_is_string(val) {
     return None;
   }
@@ -1433,7 +2038,7 @@ pub unsafe fn parse_menu_template(
   }
   let count = value_list_size(template);
   for i in 0..count {
-    let entry = value_list_get(template, i);
+    let entry = value_list_item_ref(template, i);
     if entry.is_null() || !value_is_dict(entry) {
       continue;
     }
@@ -1451,7 +2056,7 @@ pub unsafe fn parse_menu_template(
     }
     // Check for submenu
     let c_submenu = CString::new("submenu").unwrap();
-    let submenu_val = value_dict_get(entry, c_submenu.as_ptr());
+    let submenu_val = value_dict_entry_ref(entry, c_submenu.as_ptr());
     if !submenu_val.is_null() && value_is_list(submenu_val) {
       let label = laufey_dict_string(entry, "label").unwrap_or_default();
       let children = parse_menu_template(submenu_val);
@@ -1466,7 +2071,7 @@ pub unsafe fn parse_menu_template(
     let id = laufey_dict_string(entry, "id").unwrap_or_else(|| label.clone());
     let accelerator = laufey_dict_string(entry, "accelerator");
     let c_enabled = CString::new("enabled").unwrap();
-    let enabled_val = value_dict_get(entry, c_enabled.as_ptr());
+    let enabled_val = value_dict_entry_ref(entry, c_enabled.as_ptr());
     let enabled = if enabled_val.is_null() || !value_is_bool(enabled_val) {
       true
     } else {
@@ -1695,6 +2300,10 @@ pub fn poll_menu_events() {
   while let Ok(event) = MenuEvent::receiver().try_recv() {
     dispatch_menu_click_by_id(&event.id().0);
   }
+  // Linux: a tray menu's events, from the GTK thread (tray.rs).
+  for event in tray::take_forwarded_menu_events() {
+    dispatch_menu_click_by_id(&event.id().0);
+  }
 }
 
 /// Invoke the registered `on_click` handler for `item_id` (app menu, tray menu,
@@ -1728,12 +2337,30 @@ pub fn dispatch_menu_click_by_id(item_id: &str) -> bool {
 pub struct WindowState {
   pub pending_title: Mutex<Option<String>>,
   pub pending_size: Mutex<Option<(i32, i32)>>,
-  /// Authoritative current window size in physical pixels. Unlike
+  /// Authoritative current window size in logical (DIP) pixels. Unlike
   /// `pending_size` (a one-shot *requested* size that's consumed when applied),
   /// this tracks the window's real dimensions: seeded at creation from
-  /// `inner_size()` and refreshed on every resize. Backs `get_window_size` so
-  /// it never reports 0x0 (which produced a 0x0 wgpu surface).
+  /// `inner_size()` converted by `scale_factor`, and refreshed on every resize.
+  /// Backs `get_window_size` so it never reports 0x0 (which produced a 0x0 wgpu
+  /// surface) and matches CEF / WebView / `set_size`.
   pub current_size: Mutex<Option<(i32, i32)>>,
+  /// Chrome-inclusive size in the same DIP space, seeded from `outer_size()`
+  /// and refreshed on resize. Backs `get_window_outer_size`.
+  pub current_outer_size: Mutex<Option<(i32, i32)>>,
+  /// `window.scale_factor()`, seeded at create and refreshed on
+  /// `ScaleFactorChanged`. Backs `get_window_scale_factor`.
+  pub current_scale: Mutex<f64>,
+  /// Content-view top-left in screen DIP. `getPosition` is the frame;
+  /// this plus `clientX`/`clientY` is `MouseEvent.screenX`/`screenY`.
+  pub current_inner_position: Mutex<Option<(i32, i32)>>,
+  /// Authoritative frame top-left in screen DIP, seeded at create and
+  /// refreshed on `Moved`. Backs `get_window_position`.
+  ///
+  /// Distinct from `pending_position`, which is a one-shot *requested*
+  /// position consumed when applied — reading that back reported (0, 0) once
+  /// the request had been handled, and reported the request rather than the
+  /// real origin where the OS placed the window somewhere else.
+  pub current_position: Mutex<Option<(i32, i32)>>,
   pub pending_position: Mutex<Option<(i32, i32)>>,
   pub pending_resizable: Mutex<Option<bool>>,
   pub pending_always_on_top: Mutex<Option<bool>>,
@@ -1745,9 +2372,29 @@ pub struct WindowState {
   pub pending_app_menu: Mutex<Option<PendingMenu>>,
   pub pending_context_menu: Mutex<Option<PendingContextMenu>>,
   pub cursor_position: Mutex<(f64, f64)>,
+  /// False until the first `CursorMoved` (or a later move after `CursorLeft`).
+  /// `CursorEntered` often arrives before any move, so the last position is
+  /// still `(0, 0)` — we wait for a real coordinate before firing enter.
+  pub cursor_seen: Mutex<bool>,
+  pub pending_enter: Mutex<bool>,
   pub last_press_time: Mutex<Option<std::time::Instant>>,
   pub last_press_button: Mutex<Option<winit::event::MouseButton>>,
+  pub last_press_position: Mutex<Option<(f64, f64)>>,
   pub click_count: Mutex<i32>,
+  /// Last modifiers applied by `test_inject_input`. Real
+  /// `ModifiersChanged` lives on the winit window map; the hook keeps its
+  /// own so a MODIFIERS event can emit the same edges.
+  pub inject_modifiers: Mutex<winit::event::Modifiers>,
+  /// False until the creation-time `Resized` burst has been drained.
+  ///
+  /// Creating a window makes the OS emit several `Resized` events describing
+  /// intermediate sizes (on Windows: a default size, then the DIP-adjusted
+  /// one, then the requested one). They are all *different*, so the
+  /// same-size check cannot collapse them and the app would see `resize` fire
+  /// for sizes it never asked for. Nothing is dispatched while this is false;
+  /// `settle_creation_geometry` re-syncs from the real window and arms it
+  /// once the event loop first goes idle.
+  pub resize_reporting_armed: Mutex<bool>,
 }
 
 impl WindowState {
@@ -1756,6 +2403,10 @@ impl WindowState {
       pending_title: Mutex::new(None),
       pending_size: Mutex::new(None),
       current_size: Mutex::new(None),
+      current_outer_size: Mutex::new(None),
+      current_scale: Mutex::new(primary_scale_hint()),
+      current_inner_position: Mutex::new(None),
+      current_position: Mutex::new(None),
       pending_position: Mutex::new(None),
       pending_resizable: Mutex::new(None),
       pending_always_on_top: Mutex::new(None),
@@ -1765,9 +2416,14 @@ impl WindowState {
       pending_app_menu: Mutex::new(None),
       pending_context_menu: Mutex::new(None),
       cursor_position: Mutex::new((0.0, 0.0)),
+      cursor_seen: Mutex::new(false),
+      pending_enter: Mutex::new(false),
       last_press_time: Mutex::new(None),
       last_press_button: Mutex::new(None),
+      last_press_position: Mutex::new(None),
       click_count: Mutex::new(0),
+      inject_modifiers: Mutex::new(winit::event::Modifiers::default()),
+      resize_reporting_armed: Mutex::new(false),
     }
   }
 }
@@ -1775,6 +2431,32 @@ impl WindowState {
 impl Default for WindowState {
   fn default() -> Self {
     Self::new()
+  }
+}
+
+impl WindowState {
+  /// Store a cursor position. Returns true if a deferred `mouseenter` should
+  /// fire before the matching `mousemove`.
+  pub fn note_cursor_move(&self, x: f64, y: f64) -> bool {
+    *self.cursor_position.lock().unwrap() = (x, y);
+    *self.cursor_seen.lock().unwrap() = true;
+    std::mem::replace(&mut *self.pending_enter.lock().unwrap(), false)
+  }
+
+  /// Returns true if enter can be dispatched now. Otherwise the next move
+  /// flushes it once a real coordinate exists.
+  pub fn note_cursor_entered(&self) -> bool {
+    if *self.cursor_seen.lock().unwrap() {
+      true
+    } else {
+      *self.pending_enter.lock().unwrap() = true;
+      false
+    }
+  }
+
+  pub fn note_cursor_left(&self) {
+    *self.pending_enter.lock().unwrap() = false;
+    *self.cursor_seen.lock().unwrap() = false;
   }
 }
 
@@ -1898,6 +2580,14 @@ pub enum CommonEvent {
   ShowContextMenu {
     window_id: u32,
   },
+  /// Apply the action queued by `window_api::queue_action` (API 38).
+  SetWindowState {
+    window_id: u32,
+  },
+  /// Apply the size constraints stored by `window_api::set_constraints`.
+  SetSizeConstraints {
+    window_id: u32,
+  },
   Quit,
   UiTask {
     task: unsafe extern "C" fn(*mut c_void),
@@ -2000,6 +2690,7 @@ macro_rules! define_common_backend_fns {
     }
 
     unsafe extern "C" fn backend_quit(_data: *mut ::std::ffi::c_void) {
+      $crate::window_api::mark_quitting();
       if let Some(state) = <$B as $crate::BackendAccess>::get() {
         let _ = state.proxy().send_event(
           <$B as $crate::BackendAccess>::common_event(
@@ -2009,12 +2700,28 @@ macro_rules! define_common_backend_fns {
       }
     }
 
+    // exit_app (API 46): quit() with an exit code, which the host's main
+    // ends the process with once the loop is over (see shutdown_runtime).
+    unsafe extern "C" fn backend_exit_app(
+      data: *mut ::std::ffi::c_void,
+      exit_code: ::std::ffi::c_int,
+    ) {
+      $crate::window_api::mark_exit_requested(exit_code);
+      unsafe { backend_quit(data) };
+    }
+
     unsafe extern "C" fn backend_set_window_size(
       _data: *mut ::std::ffi::c_void,
       window_id: u32,
       width: ::std::ffi::c_int,
       height: ::std::ffi::c_int,
     ) {
+      // Programmatic resizes are clamped to the size constraints (API 38).
+      let (width, height) = $crate::window_api::clamp(
+        $crate::window_api::get_constraints(window_id),
+        width,
+        height,
+      );
       if let Some(state) = <$B as $crate::BackendAccess>::get() {
         state.common().with_window(window_id, |ws| {
           *ws.pending_size.lock().unwrap() = Some((width, height));
@@ -2065,6 +2772,101 @@ macro_rules! define_common_backend_fns {
       }
     }
 
+    unsafe extern "C" fn backend_get_window_outer_size(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+      width: *mut ::std::ffi::c_int,
+      height: *mut ::std::ffi::c_int,
+    ) {
+      let mut found = false;
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        if let Some(()) = state.common().with_window(window_id, |ws| {
+          let size = (*ws.current_outer_size.lock().unwrap()).or_else(|| {
+            let inner = (*ws.current_size.lock().unwrap())
+              .or(*ws.pending_size.lock().unwrap())?;
+            let (dw, dh) =
+              $crate::frame_extent_hint(*ws.pending_flags.lock().unwrap());
+            Some((inner.0 + dw, inner.1 + dh))
+          });
+          if let Some((w, h)) = size {
+            if !width.is_null() {
+              *width = w;
+            }
+            if !height.is_null() {
+              *height = h;
+            }
+          }
+        }) {
+          found = true;
+        }
+      }
+      if !found {
+        if !width.is_null() {
+          *width = 0;
+        }
+        if !height.is_null() {
+          *height = 0;
+        }
+      }
+    }
+
+    unsafe extern "C" fn backend_get_window_scale_factor(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+    ) -> f64 {
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        if let Some(scale) = state
+          .common()
+          .with_window(window_id, |ws| *ws.current_scale.lock().unwrap())
+        {
+          if scale > 0.0 {
+            return scale;
+          }
+        }
+      }
+      1.0
+    }
+
+    unsafe extern "C" fn backend_get_window_inner_position(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+      x: *mut ::std::ffi::c_int,
+      y: *mut ::std::ffi::c_int,
+    ) {
+      let mut px = 0;
+      let mut py = 0;
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        let _ = state.common().with_window(window_id, |ws| {
+          if let Some((ix, iy)) = *ws.current_inner_position.lock().unwrap() {
+            px = ix;
+            py = iy;
+          } else if let Some((ox, oy)) = (*ws.current_position.lock().unwrap())
+            .or(*ws.pending_position.lock().unwrap())
+          {
+            // No content origin to read: either the window does not exist
+            // yet, or the platform doesn't report one — winit answers
+            // `NotSupportedError` on Wayland and on X11 under some
+            // compositors. Offset the frame origin by what the chrome
+            // measures rather than reporting a point on the title bar.
+            //
+            // `current_position` has to come first: `pending_position` is a
+            // request consumed once applied, so on those platforms this fell
+            // through to nothing and reported (0, 0) after the first move.
+            let (dx, dy) =
+              $crate::frame_offset_hint(*ws.pending_flags.lock().unwrap());
+            px = ox + dx;
+            py = oy + dy;
+          }
+        });
+      }
+      if !x.is_null() {
+        *x = px;
+      }
+      if !y.is_null() {
+        *y = py;
+      }
+    }
+
     unsafe extern "C" fn backend_set_window_position(
       _data: *mut ::std::ffi::c_void,
       window_id: u32,
@@ -2092,7 +2894,11 @@ macro_rules! define_common_backend_fns {
       let mut found = false;
       if let Some(state) = <$B as $crate::BackendAccess>::get() {
         if let Some(()) = state.common().with_window(window_id, |ws| {
-          if let Some((px, py)) = *ws.pending_position.lock().unwrap() {
+          // Prefer the real origin; fall back to a request that has not been
+          // applied yet, which is all there is before the window exists.
+          let pos = (*ws.current_position.lock().unwrap())
+            .or(*ws.pending_position.lock().unwrap());
+          if let Some((px, py)) = pos {
             if !x.is_null() {
               *x = px;
             }
@@ -2285,6 +3091,36 @@ macro_rules! define_common_backend_fns {
       }
     }
 
+    unsafe extern "C" fn backend_dispatch_ui_task(
+      _data: *mut ::std::ffi::c_void,
+      task: Option<$crate::ui_tasks::UiTaskFn>,
+      task_data: *mut ::std::ffi::c_void,
+    ) {
+      let Some(task) = task else {
+        return;
+      };
+      $crate::ui_tasks::dispatch(task, task_data as usize, |run, data| {
+        match <$B as $crate::BackendAccess>::get() {
+          Some(state) => state
+            .proxy()
+            .send_event(<$B as $crate::BackendAccess>::common_event(
+              $crate::CommonEvent::UiTask {
+                task: run,
+                data: data as usize,
+              },
+            ))
+            .is_ok(),
+          None => false,
+        }
+      });
+    }
+
+    unsafe extern "C" fn backend_is_ui_thread(
+      _data: *mut ::std::ffi::c_void,
+    ) -> bool {
+      $crate::ui_tasks::is_ui_thread()
+    }
+
     unsafe extern "C" fn backend_set_keyboard_event_handler(
       _data: *mut ::std::ffi::c_void,
       handler: Option<$crate::LaufeyKeyboardEventFn>,
@@ -2452,12 +3288,23 @@ macro_rules! define_common_backend_fns {
       // rfd) themselves run a nested event loop, so they don't need help
       // from the winit event loop to keep other windows responsive — call
       // them directly.
-      let (confirmed, input) = $crate::show_native_dialog(
-        dialog_type,
-        &title_str,
-        &message_str,
-        &default_str,
-      );
+      // No panic may cross this extern "C" boundary: one in a dialog
+      // provider reads as nothing shown.
+      let outcome = ::std::panic::catch_unwind(|| {
+        $crate::show_native_dialog(
+          dialog_type,
+          &title_str,
+          &message_str,
+          &default_str,
+        )
+      })
+      .unwrap_or($crate::DialogOutcome::Unsupported);
+      let (status, input) = match outcome {
+        $crate::DialogOutcome::Confirmed(input) => (1, input),
+        $crate::DialogOutcome::Cancelled => (0, None),
+        // API 45: nothing was shown (no provider here), not a cancel.
+        $crate::DialogOutcome::Unsupported => (-1, None),
+      };
       if !out_input_value.is_null() {
         if let Some(s) = input {
           if let Ok(c_str) = ::std::ffi::CString::new(s) {
@@ -2467,11 +3314,55 @@ macro_rules! define_common_backend_fns {
           }
         }
       }
-      if confirmed {
-        1
-      } else {
-        0
+      status
+    }
+
+    unsafe extern "C" fn backend_platform_features(
+      _data: *mut ::std::ffi::c_void,
+    ) -> *mut ::std::ffi::c_char {
+      // Freed by the runtime via the backend's `string_free`.
+      ::std::ffi::CString::new($crate::platform::probe().to_json())
+        .map(|c| c.into_raw())
+        .unwrap_or(::std::ptr::null_mut())
+    }
+
+    unsafe extern "C" fn backend_tray_unavailable_reason(
+      _data: *mut ::std::ffi::c_void,
+    ) -> *mut ::std::ffi::c_char {
+      // The tray part of the probe only (never the portal).
+      match $crate::platform::tray_unavailable_reason() {
+        Some(reason) => ::std::ffi::CString::new(reason)
+          .map(|c| c.into_raw())
+          .unwrap_or(::std::ptr::null_mut()),
+        None => ::std::ptr::null_mut(),
       }
+    }
+
+    unsafe extern "C" fn backend_set_platform_features_changed_handler(
+      _data: *mut ::std::ffi::c_void,
+      handler: Option<unsafe extern "C" fn(*mut ::std::ffi::c_void)>,
+      user_data: *mut ::std::ffi::c_void,
+    ) {
+      $crate::platform::set_changed_handler(handler, user_data);
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" fn backend_title_bar_preferences(
+      _data: *mut ::std::ffi::c_void,
+    ) -> *mut ::std::ffi::c_char {
+      // Freed by the runtime via the backend's `string_free`.
+      ::std::ffi::CString::new($crate::title_bar::probe().to_json())
+        .map(|c| c.into_raw())
+        .unwrap_or(::std::ptr::null_mut())
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" fn backend_set_title_bar_preferences_changed_handler(
+      _data: *mut ::std::ffi::c_void,
+      handler: Option<unsafe extern "C" fn(*mut ::std::ffi::c_void)>,
+      user_data: *mut ::std::ffi::c_void,
+    ) {
+      $crate::title_bar::set_changed_handler(handler, user_data);
     }
 
     unsafe extern "C" fn backend_string_free(
@@ -2524,6 +3415,193 @@ macro_rules! define_common_backend_fns {
         .to_string_lossy()
         .into_owned();
       $crate::dispatch_menu_click_by_id(&id)
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" fn backend_set_open_url_handler(
+      _data: *mut ::std::ffi::c_void,
+      handler: Option<$crate::open_url::LaufeyOpenUrlFn>,
+      user_data: *mut ::std::ffi::c_void,
+    ) {
+      $crate::open_url::set_handler(handler.map(|h| (h, user_data as usize)));
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" fn backend_test_trigger_open_url(
+      _data: *mut ::std::ffi::c_void,
+      url: *const ::std::ffi::c_char,
+    ) -> bool {
+      if url.is_null() {
+        return false;
+      }
+      let url = unsafe { ::std::ffi::CStr::from_ptr(url) }
+        .to_string_lossy()
+        .into_owned();
+      $crate::open_url::test_trigger(&url)
+    }
+
+    unsafe extern "C" fn backend_test_inject_input(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+      event: *const $crate::LaufeyTestInput,
+    ) -> bool {
+      if event.is_null() {
+        return false;
+      }
+      let event = unsafe { &*event };
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        state
+          .common()
+          .with_window(window_id, |ws| {
+            $crate::inject_test_input(
+              &state.common().handlers,
+              ws,
+              window_id,
+              event,
+            )
+          })
+          .unwrap_or(false)
+      } else {
+        false
+      }
+    }
+
+    // --- Window state, constraints, screens (API >= 38) ---
+
+    unsafe extern "C" fn backend_set_window_state(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+      action: ::std::ffi::c_int,
+    ) {
+      $crate::window_api::queue_action(window_id, action);
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        let _ = state.proxy().send_event(
+          <$B as $crate::BackendAccess>::common_event(
+            $crate::CommonEvent::SetWindowState { window_id },
+          ),
+        );
+      }
+    }
+
+    unsafe extern "C" fn backend_get_window_state(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+    ) -> u32 {
+      $crate::window_api::get_state(window_id)
+    }
+
+    unsafe extern "C" fn backend_set_window_state_handler(
+      _data: *mut ::std::ffi::c_void,
+      handler: Option<$crate::LaufeyWindowStateFn>,
+      user_data: *mut ::std::ffi::c_void,
+    ) {
+      $crate::window_api::set_state_handler(
+        handler.map(|h| (h, user_data as usize)),
+      );
+    }
+
+    unsafe extern "C" fn backend_set_window_size_constraints(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+      min_width: ::std::ffi::c_int,
+      min_height: ::std::ffi::c_int,
+      max_width: ::std::ffi::c_int,
+      max_height: ::std::ffi::c_int,
+    ) {
+      $crate::window_api::set_constraints(
+        window_id,
+        [min_width, min_height, max_width, max_height],
+      );
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        let _ = state.proxy().send_event(
+          <$B as $crate::BackendAccess>::common_event(
+            $crate::CommonEvent::SetSizeConstraints { window_id },
+          ),
+        );
+      }
+    }
+
+    unsafe extern "C" fn backend_get_window_size_constraints(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+      min_width: *mut ::std::ffi::c_int,
+      min_height: *mut ::std::ffi::c_int,
+      max_width: *mut ::std::ffi::c_int,
+      max_height: *mut ::std::ffi::c_int,
+    ) {
+      let c = $crate::window_api::get_constraints(window_id);
+      for (ptr, value) in [
+        (min_width, c[0]),
+        (min_height, c[1]),
+        (max_width, c[2]),
+        (max_height, c[3]),
+      ] {
+        if !ptr.is_null() {
+          *ptr = value;
+        }
+      }
+    }
+
+    unsafe extern "C" fn backend_get_screens(
+      _data: *mut ::std::ffi::c_void,
+      out: *mut $crate::LaufeyScreen,
+      capacity: usize,
+    ) -> usize {
+      let screens = $crate::window_api::screens();
+      if !out.is_null() {
+        for (i, s) in screens.iter().take(capacity).enumerate() {
+          *out.add(i) = *s;
+        }
+      }
+      screens.len()
+    }
+
+    unsafe extern "C" fn backend_get_window_screen(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+    ) -> i64 {
+      $crate::window_api::window_screen(window_id)
+    }
+
+    unsafe extern "C" fn backend_window_capabilities(
+      _data: *mut ::std::ffi::c_void,
+    ) -> u32 {
+      $crate::window_api::capabilities() | $crate::file_drop::CAPABILITIES
+    }
+
+    unsafe extern "C" fn backend_get_window_normal_bounds(
+      _data: *mut ::std::ffi::c_void,
+      window_id: u32,
+      x: *mut ::std::ffi::c_int,
+      y: *mut ::std::ffi::c_int,
+      width: *mut ::std::ffi::c_int,
+      height: *mut ::std::ffi::c_int,
+    ) -> bool {
+      let Some(state) = <$B as $crate::BackendAccess>::get() else {
+        return false;
+      };
+      let Some(current) = state.common().with_window(window_id, |ws| {
+        let (px, py) = (*ws.current_position.lock().unwrap()).unwrap_or((0, 0));
+        let (w, h) = (*ws.current_size.lock().unwrap()).unwrap_or((0, 0));
+        (px, py, w, h)
+      }) else {
+        return false;
+      };
+      let (bx, by, bw, bh) =
+        $crate::window_api::normal_bounds(window_id, current);
+      for (ptr, value) in [(x, bx), (y, by), (width, bw), (height, bh)] {
+        if !ptr.is_null() {
+          *ptr = value;
+        }
+      }
+      true
+    }
+
+    unsafe extern "C" fn backend_set_quit_on_last_window_closed(
+      _data: *mut ::std::ffi::c_void,
+      quit: bool,
+    ) {
+      $crate::window_api::set_quit_on_last_window_closed(quit);
     }
 
     unsafe extern "C" fn backend_set_application_menu(
@@ -2675,9 +3753,27 @@ macro_rules! define_common_backend_fns {
       }
     }
 
+    // A tray menu's click wakes the loop (Linux: it arrives on the GTK
+    // thread). Installed at backend init by `fill_common_api`.
+    fn backend_wake_for_tray() {
+      if let Some(state) = <$B as $crate::BackendAccess>::get() {
+        let _ = state.proxy().send_event(
+          <$B as $crate::BackendAccess>::common_event(
+            $crate::CommonEvent::TrayTask,
+          ),
+        );
+      }
+    }
+
     unsafe extern "C" fn backend_create_tray_icon(
       _data: *mut ::std::ffi::c_void,
     ) -> u32 {
+      // No tray host (stock GNOME), or (Linux) no GTK to draw it with: an
+      // icon no one could see. Refuse it; platform_features reports why.
+      if let Some(reason) = $crate::platform::tray_unavailable_reason() {
+        $crate::platform::log_tray_refused(&reason);
+        return 0;
+      }
       let tray_id = $crate::tray::allocate_tray_id();
       $crate::tray::queue_op($crate::tray::TrayOp::Create { tray_id });
       if let Some(state) = <$B as $crate::BackendAccess>::get() {
@@ -2898,13 +3994,19 @@ macro_rules! define_common_backend_fns {
 #[macro_export]
 macro_rules! fill_common_api {
   ($api:expr) => {
+    // The tray's event routing, before any menu exists (tray.rs).
+    $crate::tray::init(backend_wake_for_tray);
     $api.create_window = Some(backend_create_window);
     $api.create_window_ex = Some(backend_create_window_ex);
     $api.close_window = Some(backend_close_window);
     $api.set_title = Some(backend_set_title);
     $api.quit = Some(backend_quit);
+    $api.exit_app = Some(backend_exit_app);
     $api.set_window_size = Some(backend_set_window_size);
     $api.get_window_size = Some(backend_get_window_size);
+    $api.get_window_outer_size = Some(backend_get_window_outer_size);
+    $api.get_window_scale_factor = Some(backend_get_window_scale_factor);
+    $api.get_window_inner_position = Some(backend_get_window_inner_position);
     $api.set_window_position = Some(backend_set_window_position);
     $api.get_window_position = Some(backend_get_window_position);
     $api.set_resizable = Some(backend_set_resizable);
@@ -2918,6 +4020,8 @@ macro_rules! fill_common_api {
     $api.hide = Some(backend_hide);
     $api.focus = Some(backend_focus);
     $api.post_ui_task = Some(backend_post_ui_task);
+    $api.dispatch_ui_task = Some(backend_dispatch_ui_task);
+    $api.is_ui_thread = Some(backend_is_ui_thread);
     $api.get_window_handle = Some($crate::backend_get_window_handle);
     $api.get_display_handle = Some($crate::backend_get_display_handle);
     $api.get_window_handle_type = Some($crate::backend_get_window_handle_type);
@@ -2934,6 +4038,16 @@ macro_rules! fill_common_api {
       Some(backend_set_close_requested_handler);
     $api.show_dialog = Some(backend_show_dialog);
     $api.string_free = Some(backend_string_free);
+    $api.platform_features = Some(backend_platform_features);
+    $api.tray_unavailable_reason = Some(backend_tray_unavailable_reason);
+    $api.set_platform_features_changed_handler =
+      Some(backend_set_platform_features_changed_handler);
+    #[cfg(target_os = "linux")]
+    {
+      $api.title_bar_preferences = Some(backend_title_bar_preferences);
+      $api.set_title_bar_preferences_changed_handler =
+        Some(backend_set_title_bar_preferences_changed_handler);
+    }
     $api.set_application_menu = Some(backend_set_application_menu);
     $api.show_context_menu = Some(backend_show_context_menu);
     $api.set_dock_badge = Some(backend_set_dock_badge);
@@ -2960,6 +4074,36 @@ macro_rules! fill_common_api {
     $api.test_click_menu_item = Some(backend_test_click_menu_item);
     $api.test_trigger_close_requested =
       Some(backend_test_trigger_close_requested);
+    // Deep links are macOS-only (see open_url.rs). Leaving the pointers None
+    // elsewhere lets an embedder detect the absence instead of registering a
+    // handler that silently never fires.
+    #[cfg(target_os = "macos")]
+    {
+      $api.set_open_url_handler = Some(backend_set_open_url_handler);
+      $api.test_trigger_open_url = Some(backend_test_trigger_open_url);
+    }
+    $api.test_inject_input = Some(backend_test_inject_input);
+    // Window state / constraints / screens / normal bounds / keep-alive
+    // (API >= 38). No display events, title bar styles or backdrops.
+    $api.set_window_state = Some(backend_set_window_state);
+    $api.get_window_state = Some(backend_get_window_state);
+    $api.set_window_state_handler = Some(backend_set_window_state_handler);
+    $api.set_window_size_constraints =
+      Some(backend_set_window_size_constraints);
+    $api.get_window_size_constraints =
+      Some(backend_get_window_size_constraints);
+    $api.get_screens = Some(backend_get_screens);
+    $api.get_window_screen = Some(backend_get_window_screen);
+    $api.window_capabilities = Some(backend_window_capabilities);
+    $api.get_window_normal_bounds = Some(backend_get_window_normal_bounds);
+    $api.set_quit_on_last_window_closed =
+      Some(backend_set_quit_on_last_window_closed);
+    // File drops and the clipboard capability bits (API >= 39).
+    $api.set_file_drop_handler = Some($crate::file_drop::set_file_drop_handler);
+    $api.test_trigger_file_drop =
+      Some($crate::file_drop::test_trigger_file_drop);
+    $api.clipboard_capabilities =
+      Some($crate::file_drop::clipboard_capabilities);
   };
 }
 
@@ -2999,6 +4143,10 @@ pub fn handle_common_event<B: BackendAccess>(
         state.common().with_window(window_id, |ws| {
           if let Some((x, y)) = ws.pending_position.lock().unwrap().take() {
             window.set_outer_position(LogicalPosition::new(x, y));
+            // Reflect the move now rather than waiting for `Moved`, so a read
+            // straight after `set_position` doesn't report the old origin.
+            // `Moved` corrects this if the OS placed it elsewhere.
+            *ws.current_position.lock().unwrap() = Some((x, y));
           }
         });
       }
@@ -3154,6 +4302,20 @@ pub fn handle_common_event<B: BackendAccess>(
       }
       true
     }
+    CommonEvent::SetWindowState { window_id: eid } if *eid == window_id => {
+      if let Some(action) = window_api::take_action(window_id) {
+        window_api::apply_action(window, action);
+      }
+      window_api::report(window_id, window);
+      true
+    }
+    CommonEvent::SetSizeConstraints { window_id: eid } if *eid == window_id => {
+      window_api::apply_constraints(
+        window,
+        window_api::get_constraints(window_id),
+      );
+      true
+    }
     CommonEvent::UiTask { task, data } => {
       unsafe { task(*data as *mut c_void) };
       true
@@ -3161,6 +4323,239 @@ pub fn handle_common_event<B: BackendAccess>(
     CommonEvent::Quit => false, // caller handles exit
     _ => false,
   }
+}
+
+/// Physical → DIP integers. CEF / WebView report points; `set_size` already
+/// takes `LogicalSize`.
+pub fn physical_size_to_logical_i32(
+  width: u32,
+  height: u32,
+  scale_factor: f64,
+) -> (i32, i32) {
+  let scale = if scale_factor > 0.0 {
+    scale_factor
+  } else {
+    1.0
+  };
+  let size = PhysicalSize::new(width, height).to_logical::<f64>(scale);
+  (size.width.round() as i32, size.height.round() as i32)
+}
+
+pub fn physical_pos_to_logical_i32(
+  x: i32,
+  y: i32,
+  scale_factor: f64,
+) -> (i32, i32) {
+  let scale = if scale_factor > 0.0 {
+    scale_factor
+  } else {
+    1.0
+  };
+  let pos = PhysicalPosition::new(x, y).to_logical::<f64>(scale);
+  (pos.x.round() as i32, pos.y.round() as i32)
+}
+
+/// Best-effort scale before the winit `Window` exists. JS may read
+/// `devicePixelRatio` from the constructor, which runs before `CreateWindow`
+/// is processed.
+#[cfg(target_os = "macos")]
+pub fn primary_scale_hint() -> f64 {
+  use objc2::msg_send;
+  use objc2::runtime::{AnyClass, AnyObject};
+  let Some(cls) = AnyClass::get(c"NSScreen") else {
+    return 1.0;
+  };
+  let screen: Option<&AnyObject> = unsafe { msg_send![cls, mainScreen] };
+  let Some(screen) = screen else {
+    return 1.0;
+  };
+  let scale: f64 = unsafe { msg_send![screen, backingScaleFactor] };
+  if scale > 0.0 {
+    scale
+  } else {
+    1.0
+  }
+}
+
+#[cfg(target_os = "windows")]
+pub fn primary_scale_hint() -> f64 {
+  let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() };
+  if dpi > 0 {
+    dpi as f64 / 96.0
+  } else {
+    1.0
+  }
+}
+
+#[cfg(target_os = "linux")]
+pub fn primary_scale_hint() -> f64 {
+  std::env::var("GDK_SCALE")
+    .ok()
+    .and_then(|s| s.parse().ok())
+    .filter(|s: &f64| *s > 0.0)
+    .unwrap_or(1.0)
+}
+
+#[cfg(not(any(
+  target_os = "macos",
+  target_os = "windows",
+  target_os = "linux"
+)))]
+pub fn primary_scale_hint() -> f64 {
+  1.0
+}
+
+/// Best-effort title-bar / border offset before the winit `Window` exists, in
+/// logical pixels.
+///
+/// `getInnerPosition()` is the content-view origin, but the window is created
+/// asynchronously and JS can read it straight after the constructor. Falling
+/// back to the frame origin reported a point on the title bar; ask the OS what
+/// the chrome will measure instead. `flags` are the creation-time
+/// `LAUFEY_WINDOW_FLAG_*` bits — a frameless window has no chrome to offset.
+#[cfg(target_os = "macos")]
+pub fn frame_offset_hint(flags: u32) -> (i32, i32) {
+  if flags & LAUFEY_WINDOW_FLAG_FRAMELESS != 0 {
+    return (0, 0);
+  }
+  use objc2_app_kit::{NSWindow, NSWindowStyleMask};
+  use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
+  let mtm = unsafe { MainThreadMarker::new_unchecked() };
+  let style = NSWindowStyleMask::Titled
+    | NSWindowStyleMask::Closable
+    | NSWindowStyleMask::Miniaturizable
+    | NSWindowStyleMask::Resizable;
+  let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 100.0));
+  let content = NSWindow::contentRectForFrameRect_styleMask(frame, style, mtm);
+  let dx = (content.origin.x - frame.origin.x).round() as i32;
+  let dy = (frame.size.height - content.size.height).round() as i32;
+  (dx.max(0), dy.max(0))
+}
+
+#[cfg(target_os = "windows")]
+pub fn frame_offset_hint(flags: u32) -> (i32, i32) {
+  if flags & LAUFEY_WINDOW_FLAG_FRAMELESS != 0 {
+    return (0, 0);
+  }
+  use windows_sys::Win32::Foundation::RECT;
+  use windows_sys::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForSystem,
+  };
+  use windows_sys::Win32::UI::WindowsAndMessaging::{
+    WS_EX_WINDOWEDGE, WS_OVERLAPPEDWINDOW,
+  };
+  let dpi = unsafe { GetDpiForSystem() };
+  if dpi == 0 {
+    return (0, 0);
+  }
+  // Adjusting an empty client rect leaves the chrome thickness in the
+  // (now negative) left/top corner.
+  let mut rect = RECT {
+    left: 0,
+    top: 0,
+    right: 0,
+    bottom: 0,
+  };
+  let ok = unsafe {
+    AdjustWindowRectExForDpi(
+      &mut rect,
+      WS_OVERLAPPEDWINDOW,
+      0,
+      WS_EX_WINDOWEDGE,
+      dpi,
+    )
+  };
+  if ok == 0 {
+    return (0, 0);
+  }
+  let scale = dpi as f64 / 96.0;
+  physical_pos_to_logical_i32(-rect.left, -rect.top, scale)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn frame_offset_hint(_flags: u32) -> (i32, i32) {
+  // The frame offset is the compositor's business.
+  (0, 0)
+}
+
+/// Extra DIP to add to the content size to get the chrome-inclusive size
+/// before the winit `Window` exists.
+#[cfg(target_os = "macos")]
+pub fn frame_extent_hint(flags: u32) -> (i32, i32) {
+  if flags & LAUFEY_WINDOW_FLAG_FRAMELESS != 0 {
+    return (0, 0);
+  }
+  use objc2_app_kit::{NSWindow, NSWindowStyleMask};
+  use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
+  let mtm = unsafe { MainThreadMarker::new_unchecked() };
+  let style = NSWindowStyleMask::Titled
+    | NSWindowStyleMask::Closable
+    | NSWindowStyleMask::Miniaturizable
+    | NSWindowStyleMask::Resizable;
+  let content = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 100.0));
+  let frame = NSWindow::frameRectForContentRect_styleMask(content, style, mtm);
+  let dw = (frame.size.width - content.size.width).round() as i32;
+  let dh = (frame.size.height - content.size.height).round() as i32;
+  (dw.max(0), dh.max(0))
+}
+
+#[cfg(target_os = "windows")]
+pub fn frame_extent_hint(flags: u32) -> (i32, i32) {
+  if flags & LAUFEY_WINDOW_FLAG_FRAMELESS != 0 {
+    return (0, 0);
+  }
+  use windows_sys::Win32::Foundation::RECT;
+  use windows_sys::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForSystem,
+  };
+  use windows_sys::Win32::UI::WindowsAndMessaging::{
+    WS_EX_WINDOWEDGE, WS_OVERLAPPEDWINDOW,
+  };
+  let dpi = unsafe { GetDpiForSystem() };
+  if dpi == 0 {
+    return (0, 0);
+  }
+  let mut rect = RECT {
+    left: 0,
+    top: 0,
+    right: 0,
+    bottom: 0,
+  };
+  let ok = unsafe {
+    AdjustWindowRectExForDpi(
+      &mut rect,
+      WS_OVERLAPPEDWINDOW,
+      0,
+      WS_EX_WINDOWEDGE,
+      dpi,
+    )
+  };
+  if ok == 0 {
+    return (0, 0);
+  }
+  let scale = dpi as f64 / 96.0;
+  let extra_w = (rect.right - rect.left).max(0) as u32;
+  let extra_h = (rect.bottom - rect.top).max(0) as u32;
+  physical_size_to_logical_i32(extra_w, extra_h, scale)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn frame_extent_hint(_flags: u32) -> (i32, i32) {
+  (0, 0)
+}
+
+pub fn physical_pos_to_logical_f64(
+  x: f64,
+  y: f64,
+  scale_factor: f64,
+) -> (f64, f64) {
+  let scale = if scale_factor > 0.0 {
+    scale_factor
+  } else {
+    1.0
+  };
+  let pos = PhysicalPosition::new(x, y).to_logical::<f64>(scale);
+  (pos.x, pos.y)
 }
 
 /// Apply pending state to window attributes before creation.
@@ -3207,10 +4602,33 @@ pub fn apply_pending_post_create(ws: &WindowState, window: &Window) {
   // to arrive — reliable on X11, racy on Wayland — which left
   // `getNativeWindow()` handing wgpu a 0x0 surface ("surface is not configured
   // for presentation").
+  let scale = window.scale_factor();
   let size = window.inner_size();
   if size.width > 0 && size.height > 0 {
-    *ws.current_size.lock().unwrap() =
-      Some((size.width as i32, size.height as i32));
+    let (w, h) = physical_size_to_logical_i32(size.width, size.height, scale);
+    *ws.current_size.lock().unwrap() = Some((w, h));
+    *ws.current_scale.lock().unwrap() = scale;
+  }
+  if let Ok(inner) = window.inner_position() {
+    *ws.current_inner_position.lock().unwrap() =
+      Some(physical_pos_to_logical_i32(inner.x, inner.y, scale));
+  }
+  // Same for the frame origin. `get_window_position` reads `pending_position`,
+  // which is only ever a *requested* position, so a window the OS placed
+  // itself reported (0, 0) until the first `Moved` arrived; and where the OS
+  // adjusted a requested position, it reported the request rather than where
+  // the window actually is.
+  // Same for the frame origin, so `get_window_position` has an authoritative
+  // value that does not depend on a request having been made.
+  if let Ok(outer) = window.outer_position() {
+    *ws.current_position.lock().unwrap() =
+      Some(physical_pos_to_logical_i32(outer.x, outer.y, scale));
+  }
+  let outer_size = window.outer_size();
+  if outer_size.width > 0 && outer_size.height > 0 {
+    *ws.current_outer_size.lock().unwrap() = Some(
+      physical_size_to_logical_i32(outer_size.width, outer_size.height, scale),
+    );
   }
 
   if let Some(true) = *ws.pending_always_on_top.lock().unwrap() {
@@ -3226,6 +4644,62 @@ pub fn apply_pending_post_create(ws: &WindowState, window: &Window) {
   }
 }
 
+/// Close out the creation-time `Resized` burst, called once the event loop
+/// first goes idle after the window was built.
+///
+/// Re-syncs the cached geometry from the real window and arms resize
+/// reporting. Re-syncing matters as much as arming: a stale `Resized` that
+/// slips past the first idle then carries a size equal to the one already
+/// cached, so the same-size check in the `Resized` handler drops it instead of
+/// reporting a size the window no longer has.
+///
+/// Returns true the first time it arms (so callers can skip repeat work).
+pub fn settle_creation_geometry(ws: &WindowState, window: &Window) -> bool {
+  let scale = window.scale_factor();
+  let size = window.inner_size();
+  let size = (size.width > 0 && size.height > 0)
+    .then(|| physical_size_to_logical_i32(size.width, size.height, scale));
+  let inner = window
+    .inner_position()
+    .ok()
+    .map(|p| physical_pos_to_logical_i32(p.x, p.y, scale));
+  let armed = arm_resize_reporting(ws, size, scale, inner);
+  let outer = window.outer_size();
+  if outer.width > 0 && outer.height > 0 {
+    *ws.current_outer_size.lock().unwrap() = Some(
+      physical_size_to_logical_i32(outer.width, outer.height, scale),
+    );
+  }
+  armed
+}
+
+/// The state machine behind [`settle_creation_geometry`], split out so the
+/// arm-once semantics are testable without a real `Window` (creating one
+/// needs a display server).
+///
+/// `size` and `inner` are already in logical pixels, and are skipped when the
+/// platform could not supply them.
+pub fn arm_resize_reporting(
+  ws: &WindowState,
+  size: Option<(i32, i32)>,
+  scale: f64,
+  inner: Option<(i32, i32)>,
+) -> bool {
+  let mut armed = ws.resize_reporting_armed.lock().unwrap();
+  if *armed {
+    return false;
+  }
+  if let Some(size) = size {
+    *ws.current_size.lock().unwrap() = Some(size);
+    *ws.current_scale.lock().unwrap() = scale;
+  }
+  if let Some(inner) = inner {
+    *ws.current_inner_position.lock().unwrap() = Some(inner);
+  }
+  *armed = true;
+  true
+}
+
 // --- Native dialog implementation ---
 
 pub fn show_native_dialog(
@@ -3233,7 +4707,21 @@ pub fn show_native_dialog(
   title: &str,
   message: &str,
   default_value: &str,
-) -> (bool, Option<String>) {
+) -> DialogOutcome {
+  // Linux: every dialog from the first provider the session has (kdialog,
+  // zenity, then GTK in process); src/prompt.rs. rfd's Linux message box
+  // is zenity alone.
+  #[cfg(target_os = "linux")]
+  {
+    let kind = match dialog_type {
+      LAUFEY_DIALOG_ALERT => prompt::Kind::Alert,
+      LAUFEY_DIALOG_CONFIRM => prompt::Kind::Confirm,
+      LAUFEY_DIALOG_PROMPT => prompt::Kind::Prompt,
+      _ => return DialogOutcome::Cancelled,
+    };
+    prompt::show_dialog(kind, title, message, default_value)
+  }
+  #[cfg(not(target_os = "linux"))]
   match dialog_type {
     LAUFEY_DIALOG_ALERT => {
       rfd::MessageDialog::new()
@@ -3241,7 +4729,7 @@ pub fn show_native_dialog(
         .set_description(message)
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
-      (true, None)
+      DialogOutcome::Confirmed(None)
     }
     LAUFEY_DIALOG_CONFIRM => {
       let result = rfd::MessageDialog::new()
@@ -3249,112 +4737,30 @@ pub fn show_native_dialog(
         .set_description(message)
         .set_buttons(rfd::MessageButtons::OkCancel)
         .show();
-      (result == rfd::MessageDialogResult::Ok, None)
-    }
-    LAUFEY_DIALOG_PROMPT => show_prompt_dialog(title, message, default_value),
-    _ => (false, None),
-  }
-}
-
-#[cfg(target_os = "macos")]
-fn show_prompt_dialog(
-  title: &str,
-  message: &str,
-  default_value: &str,
-) -> (bool, Option<String>) {
-  let script = format!(
-    "set result to display dialog \"{}\" default answer \"{}\" with title \"{}\" buttons {{\"Cancel\", \"OK\"}} default button \"OK\"\nreturn text returned of result",
-    message.replace('\\', "\\\\").replace('"', "\\\""),
-    default_value.replace('\\', "\\\\").replace('"', "\\\""),
-    title.replace('\\', "\\\\").replace('"', "\\\""),
-  );
-  match std::process::Command::new("osascript")
-    .arg("-e")
-    .arg(&script)
-    .output()
-  {
-    Ok(output) if output.status.success() => {
-      let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-      (true, Some(text))
-    }
-    _ => (false, None),
-  }
-}
-
-#[cfg(target_os = "windows")]
-fn show_prompt_dialog(
-  title: &str,
-  message: &str,
-  default_value: &str,
-) -> (bool, Option<String>) {
-  let script = format!(
-    r#"Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::InputBox('{}', '{}', '{}')"#,
-    message.replace('\'', "''"),
-    title.replace('\'', "''"),
-    default_value.replace('\'', "''"),
-  );
-  match std::process::Command::new("powershell")
-    .args(["-Command", &script])
-    .output()
-  {
-    Ok(output) if output.status.success() => {
-      let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-      if text.is_empty() {
-        (false, None)
+      if result == rfd::MessageDialogResult::Ok {
+        DialogOutcome::Confirmed(None)
       } else {
-        (true, Some(text))
+        DialogOutcome::Cancelled
       }
     }
-    _ => (false, None),
-  }
-}
-
-#[cfg(target_os = "linux")]
-fn show_prompt_dialog(
-  title: &str,
-  message: &str,
-  default_value: &str,
-) -> (bool, Option<String>) {
-  match std::process::Command::new("zenity")
-    .args([
-      "--entry",
-      "--title",
-      title,
-      "--text",
-      message,
-      "--entry-text",
-      default_value,
-    ])
-    .output()
-  {
-    Ok(output) if output.status.success() => {
-      let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-      (true, Some(text))
+    LAUFEY_DIALOG_PROMPT => {
+      prompt::show_prompt_dialog(title, message, default_value)
     }
-    _ => (false, None),
+    _ => DialogOutcome::Cancelled,
   }
 }
 
-#[cfg(not(any(
-  target_os = "macos",
-  target_os = "windows",
-  target_os = "linux"
-)))]
-fn show_prompt_dialog(
-  _title: &str,
-  _message: &str,
-  default_value: &str,
-) -> (bool, Option<String>) {
-  (true, Some(default_value.to_string()))
-}
+// The dialogs: src/prompt.rs (no page text ever reaches a shell or a
+// script's source).
+pub use prompt::DialogOutcome;
 
 // --- Native clipboard implementation ---
 //
 // The winit/servo backends have no web engine, so clipboard access goes
-// through each platform's standard command-line clipboard tools, mirroring the
-// subprocess approach used for native dialogs above. These tools
+// through each platform's standard command-line clipboard tools. These tools
 // (pbcopy/pbpaste, clip/PowerShell, wl-clipboard/xclip) ship with — or are
-// conventional on — a default desktop install of each platform.
+// conventional on — a default desktop install of each platform. Each is run
+// with fixed arguments; the clipboard text only ever travels on stdin/stdout.
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn pipe_to_command(
@@ -3480,6 +4886,26 @@ pub const LAUFEY_MOUSE_BUTTON_FORWARD: c_int = 4;
 pub const LAUFEY_MOUSE_PRESSED: c_int = 0;
 pub const LAUFEY_MOUSE_RELEASED: c_int = 1;
 
+/// Convert a LAUFEY modifier bitmask to winit's `ModifiersState`.
+pub fn laufey_to_modifiers_state(
+  flags: u32,
+) -> winit::keyboard::ModifiersState {
+  let mut s = winit::keyboard::ModifiersState::empty();
+  if flags & LAUFEY_MOD_SHIFT != 0 {
+    s |= winit::keyboard::ModifiersState::SHIFT;
+  }
+  if flags & LAUFEY_MOD_CONTROL != 0 {
+    s |= winit::keyboard::ModifiersState::CONTROL;
+  }
+  if flags & LAUFEY_MOD_ALT != 0 {
+    s |= winit::keyboard::ModifiersState::ALT;
+  }
+  if flags & LAUFEY_MOD_META != 0 {
+    s |= winit::keyboard::ModifiersState::SUPER;
+  }
+  s
+}
+
 /// Convert winit modifier state to LAUFEY modifier bitmask.
 pub fn modifiers_to_laufey(mods: winit::keyboard::ModifiersState) -> u32 {
   let mut flags = 0u32;
@@ -3498,13 +4924,19 @@ pub fn modifiers_to_laufey(mods: winit::keyboard::ModifiersState) -> u32 {
   flags
 }
 
-/// Convert a winit logical key to its W3C UI Events `key` string representation.
+/// Convert a winit logical key to its W3C UI Events `key` string.
 pub fn winit_key_to_string(key: &winit::keyboard::Key) -> String {
+  use winit::keyboard::{Key, NamedKey};
   match key {
-    winit::keyboard::Key::Character(c) => c.to_string(),
-    winit::keyboard::Key::Named(named) => format!("{named:?}"),
-    winit::keyboard::Key::Unidentified(_) => "Unidentified".to_string(),
-    winit::keyboard::Key::Dead(c) => {
+    Key::Character(c) => c.to_string(),
+    // Debug is `Super` / `Space`; the Web `key` values are `Meta` and U+0020.
+    Key::Named(NamedKey::Super) | Key::Named(NamedKey::Meta) => {
+      "Meta".to_string()
+    }
+    Key::Named(NamedKey::Space) => " ".to_string(),
+    Key::Named(named) => format!("{named:?}"),
+    Key::Unidentified(_) => "Unidentified".to_string(),
+    Key::Dead(c) => {
       if let Some(ch) = c {
         format!("Dead({ch})")
       } else {
@@ -3514,11 +4946,149 @@ pub fn winit_key_to_string(key: &winit::keyboard::Key) -> String {
   }
 }
 
-/// Convert a winit physical key to its W3C UI Events `code` string representation.
+/// Convert a winit physical key to its W3C UI Events `code` string.
 pub fn winit_code_to_string(physical: &winit::keyboard::PhysicalKey) -> String {
+  use winit::keyboard::{KeyCode, PhysicalKey};
   match physical {
-    winit::keyboard::PhysicalKey::Code(code) => format!("{code:?}"),
-    winit::keyboard::PhysicalKey::Unidentified(_) => "Unidentified".to_string(),
+    PhysicalKey::Code(KeyCode::SuperLeft) => "MetaLeft".to_string(),
+    PhysicalKey::Code(KeyCode::SuperRight) => "MetaRight".to_string(),
+    PhysicalKey::Code(code) => format!("{code:?}"),
+    PhysicalKey::Unidentified(_) => "Unidentified".to_string(),
+  }
+}
+
+pub fn is_modifier_named_key(key: &winit::keyboard::Key) -> bool {
+  use winit::keyboard::{Key, NamedKey};
+  matches!(
+    key,
+    Key::Named(
+      NamedKey::Shift
+        | NamedKey::Control
+        | NamedKey::Alt
+        | NamedKey::AltGraph
+        | NamedKey::Super
+        | NamedKey::Meta
+        | NamedKey::Hyper
+    )
+  )
+}
+
+/// Modifier bits that changed between two `ModifiersChanged` events.
+/// macOS winit often has no `KeyboardInput` for Shift / Control / Alt / Meta;
+/// CEF and WebView still emit `keydown` / `keyup`.
+pub fn modifier_key_edges(
+  prev: &winit::event::Modifiers,
+  next: &winit::event::Modifiers,
+) -> Vec<(bool, &'static str, &'static str)> {
+  use winit::keyboard::ModifiersKeyState::Pressed;
+  let mut out = Vec::new();
+  let push = |out: &mut Vec<_>,
+              was: bool,
+              now: bool,
+              prev_l: winit::keyboard::ModifiersKeyState,
+              prev_r: winit::keyboard::ModifiersKeyState,
+              next_l: winit::keyboard::ModifiersKeyState,
+              next_r: winit::keyboard::ModifiersKeyState,
+              key: &'static str,
+              left: &'static str,
+              right: &'static str| {
+    if was == now {
+      return;
+    }
+    let code = if now {
+      if next_r == Pressed && next_l != Pressed {
+        right
+      } else {
+        left
+      }
+    } else if prev_r == Pressed && prev_l != Pressed {
+      right
+    } else {
+      left
+    };
+    out.push((now, key, code));
+  };
+  push(
+    &mut out,
+    prev.state().shift_key(),
+    next.state().shift_key(),
+    prev.lshift_state(),
+    prev.rshift_state(),
+    next.lshift_state(),
+    next.rshift_state(),
+    "Shift",
+    "ShiftLeft",
+    "ShiftRight",
+  );
+  push(
+    &mut out,
+    prev.state().control_key(),
+    next.state().control_key(),
+    prev.lcontrol_state(),
+    prev.rcontrol_state(),
+    next.lcontrol_state(),
+    next.rcontrol_state(),
+    "Control",
+    "ControlLeft",
+    "ControlRight",
+  );
+  push(
+    &mut out,
+    prev.state().alt_key(),
+    next.state().alt_key(),
+    prev.lalt_state(),
+    prev.ralt_state(),
+    next.lalt_state(),
+    next.ralt_state(),
+    "Alt",
+    "AltLeft",
+    "AltRight",
+  );
+  push(
+    &mut out,
+    prev.state().super_key(),
+    next.state().super_key(),
+    prev.lsuper_state(),
+    prev.rsuper_state(),
+    next.lsuper_state(),
+    next.rsuper_state(),
+    "Meta",
+    "MetaLeft",
+    "MetaRight",
+  );
+  out
+}
+
+pub fn dispatch_raw_keyboard_event(
+  handlers: &EventHandlers,
+  window_id: u32,
+  pressed: bool,
+  key: &str,
+  code: &str,
+  modifiers: winit::keyboard::ModifiersState,
+  repeat: bool,
+) {
+  let handler = handlers.keyboard_handler.lock().unwrap();
+  if let Some((cb, user_data)) = *handler {
+    let state = if pressed {
+      LAUFEY_KEY_PRESSED
+    } else {
+      LAUFEY_KEY_RELEASED
+    };
+    let mods = modifiers_to_laufey(modifiers);
+    let c_key = std::ffi::CString::new(key).unwrap_or_default();
+    let c_code = std::ffi::CString::new(code).unwrap_or_default();
+    unsafe {
+      cb(
+        user_data as *mut c_void,
+        window_id,
+        state,
+        c_key.as_ptr(),
+        c_code.as_ptr(),
+        mods,
+        repeat,
+      );
+    }
   }
 }
 
@@ -3529,31 +5099,17 @@ pub fn dispatch_keyboard_event(
   key_event: &winit::event::KeyEvent,
   modifiers: winit::keyboard::ModifiersState,
 ) {
-  let handler = handlers.keyboard_handler.lock().unwrap();
-  if let Some((cb, user_data)) = *handler {
-    let state = match key_event.state {
-      winit::event::ElementState::Pressed => LAUFEY_KEY_PRESSED,
-      winit::event::ElementState::Released => LAUFEY_KEY_RELEASED,
-    };
-    let key_str = winit_key_to_string(&key_event.logical_key);
-    let code_str = winit_code_to_string(&key_event.physical_key);
-    let mods = modifiers_to_laufey(modifiers);
-
-    let c_key = std::ffi::CString::new(key_str).unwrap_or_default();
-    let c_code = std::ffi::CString::new(code_str).unwrap_or_default();
-
-    unsafe {
-      cb(
-        user_data as *mut c_void,
-        window_id,
-        state,
-        c_key.as_ptr(),
-        c_code.as_ptr(),
-        mods,
-        key_event.repeat,
-      );
-    }
-  }
+  let key_str = winit_key_to_string(&key_event.logical_key);
+  let code_str = winit_code_to_string(&key_event.physical_key);
+  dispatch_raw_keyboard_event(
+    handlers,
+    window_id,
+    key_event.state == winit::event::ElementState::Pressed,
+    &key_str,
+    &code_str,
+    modifiers,
+    key_event.repeat,
+  );
 }
 
 /// Convert a winit mouse button to a LAUFEY mouse button constant.
@@ -3569,9 +5125,99 @@ pub fn winit_button_to_laufey(button: winit::event::MouseButton) -> c_int {
 }
 
 /// Dispatch a mouse click event to the registered handler.
-/// Double-click interval (500ms is the standard across most platforms).
+/// Same rule as CEF's Linux tracker: increment while the same button lands
+/// nearby within 500ms. The previous `count < 2` / reset-to-1 split ignored
+/// pointer travel and collapsed a triple-click back to 1.
 const DOUBLE_CLICK_INTERVAL: std::time::Duration =
   std::time::Duration::from_millis(500);
+const MULTI_CLICK_DISTANCE: f64 = 4.0;
+
+#[allow(clippy::too_many_arguments)]
+pub fn next_click_count(
+  prev_button: Option<winit::event::MouseButton>,
+  prev_pos: Option<(f64, f64)>,
+  prev_time: Option<std::time::Instant>,
+  prev_count: i32,
+  button: winit::event::MouseButton,
+  x: f64,
+  y: f64,
+  now: std::time::Instant,
+) -> i32 {
+  let close = prev_pos
+    .map(|(px, py)| {
+      let dx = x - px;
+      let dy = y - py;
+      dx * dx + dy * dy <= MULTI_CLICK_DISTANCE * MULTI_CLICK_DISTANCE
+    })
+    .unwrap_or(false);
+  if prev_button == Some(button)
+    && prev_time.is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK_INTERVAL)
+    && close
+  {
+    prev_count + 1
+  } else {
+    1
+  }
+}
+
+/// Re-read the pointer from the OS into `cursor_position`, in logical pixels.
+///
+/// winit's `MouseInput` carries no coordinates, so button events are reported
+/// at the last position `CursorMoved` cached. On Windows that is not
+/// reliable: `WM_*BUTTONDOWN` is a genuine queued message while `WM_MOUSEMOVE`
+/// is synthesized from the current pointer only when the queue holds nothing
+/// else, so a press can be dequeued *before* the move that preceded it and
+/// gets reported one position stale. Win32 button messages carry their own
+/// coordinates and browsers use those; the closest equivalent here is to ask
+/// the OS where the pointer is before dispatching.
+///
+/// No-op off Windows, where `CursorMoved` already arrives in order.
+#[cfg(target_os = "macos")]
+pub fn refresh_cursor_position(
+  _ws: &WindowState,
+  _window: &Window,
+  _scale_factor: f64,
+) {
+}
+
+#[cfg(target_os = "windows")]
+pub fn refresh_cursor_position(
+  ws: &WindowState,
+  window: &Window,
+  scale_factor: f64,
+) {
+  use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+  use windows_sys::Win32::Foundation::POINT;
+  use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+  use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+  let Ok(handle) = window.window_handle() else {
+    return;
+  };
+  let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+    return;
+  };
+  let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+  let mut pt = POINT { x: 0, y: 0 };
+  unsafe {
+    if GetCursorPos(&mut pt) == 0 || ScreenToClient(hwnd, &mut pt) == 0 {
+      return;
+    }
+  }
+  // Client coordinates, so this is already relative to the content view;
+  // a drag past the edge legitimately reports negatives.
+  *ws.cursor_position.lock().unwrap() =
+    physical_pos_to_logical_f64(pt.x as f64, pt.y as f64, scale_factor);
+  *ws.cursor_seen.lock().unwrap() = true;
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn refresh_cursor_position(
+  _ws: &WindowState,
+  _window: &Window,
+  _scale_factor: f64,
+) {
+}
 
 pub fn dispatch_mouse_click_event(
   handlers: &EventHandlers,
@@ -3598,19 +5244,14 @@ pub fn dispatch_mouse_click_event(
       let now = std::time::Instant::now();
       let mut last_time = ws.last_press_time.lock().unwrap();
       let mut last_btn = ws.last_press_button.lock().unwrap();
+      let mut last_pos = ws.last_press_position.lock().unwrap();
       let mut count = ws.click_count.lock().unwrap();
-
-      if *last_btn == Some(button)
-        && *count < 2
-        && last_time
-          .is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK_INTERVAL)
-      {
-        *count = 2;
-      } else if *count >= 2 || *last_btn != Some(button) {
-        *count = 1;
-      }
+      *count = next_click_count(
+        *last_btn, *last_pos, *last_time, *count, button, x, y, now,
+      );
       *last_time = Some(now);
       *last_btn = Some(button);
+      *last_pos = Some((x, y));
       *count
     } else {
       *ws.click_count.lock().unwrap()
@@ -3647,23 +5288,38 @@ pub fn dispatch_mouse_move_event(
   }
 }
 
+/// Map a winit scroll delta to DOM `WheelEvent` units.
+///
+/// winit / Cocoa report positive Y for scroll *up*. The Web `WheelEvent`
+/// contract (and GTK's webview backend here) uses positive Y for scroll
+/// *down*. Flip Y only; X already matches (positive = right).
+pub fn winit_scroll_to_dom(
+  delta: winit::event::MouseScrollDelta,
+  scale_factor: f64,
+) -> (f64, f64, i32) {
+  match delta {
+    winit::event::MouseScrollDelta::LineDelta(dx, dy) => {
+      (dx as f64, -(dy as f64), LAUFEY_WHEEL_DELTA_LINE)
+    }
+    winit::event::MouseScrollDelta::PixelDelta(d) => {
+      let (dx, dy) = physical_pos_to_logical_f64(d.x, d.y, scale_factor);
+      (dx, -dy, LAUFEY_WHEEL_DELTA_PIXEL)
+    }
+  }
+}
+
 pub fn dispatch_wheel_event(
   handlers: &EventHandlers,
   ws: &WindowState,
   window_id: u32,
   delta: winit::event::MouseScrollDelta,
   modifiers: winit::keyboard::ModifiersState,
+  scale_factor: f64,
 ) {
   let handler = handlers.wheel_handler.lock().unwrap();
   if let Some((cb, user_data)) = *handler {
-    let (delta_x, delta_y, delta_mode) = match delta {
-      winit::event::MouseScrollDelta::LineDelta(dx, dy) => {
-        (dx as f64, dy as f64, LAUFEY_WHEEL_DELTA_LINE)
-      }
-      winit::event::MouseScrollDelta::PixelDelta(d) => {
-        (d.x, d.y, LAUFEY_WHEEL_DELTA_PIXEL)
-      }
-    };
+    let (delta_x, delta_y, delta_mode) =
+      winit_scroll_to_dom(delta, scale_factor);
     let (x, y) = *ws.cursor_position.lock().unwrap();
     let mods = modifiers_to_laufey(modifiers);
     unsafe {
@@ -3678,6 +5334,136 @@ pub fn dispatch_wheel_event(
         delta_mode,
       );
     }
+  }
+}
+
+fn c_str_or_empty(p: *const c_char) -> String {
+  if p.is_null() {
+    String::new()
+  } else {
+    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+  }
+}
+
+fn is_modifier_key_name(key: &str) -> bool {
+  matches!(key, "Shift" | "Control" | "Alt" | "AltGraph" | "Meta")
+}
+
+fn laufey_button_to_winit(button: c_int) -> Option<winit::event::MouseButton> {
+  match button {
+    LAUFEY_MOUSE_BUTTON_LEFT => Some(winit::event::MouseButton::Left),
+    LAUFEY_MOUSE_BUTTON_RIGHT => Some(winit::event::MouseButton::Right),
+    LAUFEY_MOUSE_BUTTON_MIDDLE => Some(winit::event::MouseButton::Middle),
+    LAUFEY_MOUSE_BUTTON_BACK => Some(winit::event::MouseButton::Back),
+    LAUFEY_MOUSE_BUTTON_FORWARD => Some(winit::event::MouseButton::Forward),
+    _ => None,
+  }
+}
+
+/// Drive the same dispatch a real `WindowEvent` uses. Wheel deltas in
+/// `event` are DOM-signed; they are inverted into winit's incoming space
+/// so `winit_scroll_to_dom` is actually exercised.
+pub fn inject_test_input(
+  handlers: &EventHandlers,
+  ws: &WindowState,
+  window_id: u32,
+  event: &LaufeyTestInput,
+) -> bool {
+  let mods = laufey_to_modifiers_state(event.modifiers);
+  match event.kind {
+    LAUFEY_TEST_INPUT_KEY => {
+      let key = c_str_or_empty(event.key);
+      if is_modifier_key_name(&key) {
+        // Real KeyboardInput for these is skipped; use MODIFIERS.
+        return false;
+      }
+      let code = c_str_or_empty(event.code);
+      dispatch_raw_keyboard_event(
+        handlers,
+        window_id,
+        event.pressed,
+        &key,
+        &code,
+        mods,
+        event.repeat,
+      );
+      true
+    }
+    LAUFEY_TEST_INPUT_MOUSE_MOVE => {
+      let flush_enter = ws.note_cursor_move(event.x, event.y);
+      if flush_enter {
+        dispatch_cursor_enter_leave_event(handlers, ws, window_id, true, mods);
+      }
+      dispatch_mouse_move_event(handlers, window_id, event.x, event.y, mods);
+      true
+    }
+    LAUFEY_TEST_INPUT_MOUSE_BUTTON => {
+      let Some(button) = laufey_button_to_winit(event.button) else {
+        return false;
+      };
+      let state = if event.pressed {
+        winit::event::ElementState::Pressed
+      } else {
+        winit::event::ElementState::Released
+      };
+      dispatch_mouse_click_event(handlers, ws, window_id, state, button, mods);
+      true
+    }
+    LAUFEY_TEST_INPUT_WHEEL => {
+      let scale = {
+        let s = *ws.current_scale.lock().unwrap();
+        if s > 0.0 {
+          s
+        } else {
+          1.0
+        }
+      };
+      // Invert the DOM sign so the real mapping brings it back.
+      let delta = if event.delta_mode == LAUFEY_WHEEL_DELTA_PIXEL {
+        winit::event::MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+          event.delta_x * scale,
+          -event.delta_y * scale,
+        ))
+      } else {
+        winit::event::MouseScrollDelta::LineDelta(
+          event.delta_x as f32,
+          -event.delta_y as f32,
+        )
+      };
+      dispatch_wheel_event(handlers, ws, window_id, delta, mods, scale);
+      true
+    }
+    LAUFEY_TEST_INPUT_CURSOR_ENTER => {
+      if ws.note_cursor_entered() {
+        dispatch_cursor_enter_leave_event(handlers, ws, window_id, true, mods);
+      }
+      true
+    }
+    LAUFEY_TEST_INPUT_CURSOR_LEAVE => {
+      ws.note_cursor_left();
+      dispatch_cursor_enter_leave_event(handlers, ws, window_id, false, mods);
+      true
+    }
+    LAUFEY_TEST_INPUT_MODIFIERS => {
+      let next = winit::event::Modifiers::from(mods);
+      let prev = {
+        let mut slot = ws.inject_modifiers.lock().unwrap();
+        std::mem::replace(&mut *slot, next)
+      };
+      for (pressed, key, code) in modifier_key_edges(&prev, &next) {
+        dispatch_raw_keyboard_event(
+          handlers,
+          window_id,
+          pressed,
+          key,
+          code,
+          next.state(),
+          false,
+        );
+      }
+      true
+    }
+    _ => false,
   }
 }
 
@@ -3845,12 +5631,62 @@ pub fn find_runtime_library() -> Option<PathBuf> {
   None
 }
 
+static RUNTIME_SHUTDOWN: std::sync::OnceLock<RuntimeShutdownFn> =
+  std::sync::OnceLock::new();
+static RUNTIME_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
+
+/// Call the runtime's `laufey_runtime_shutdown` and wait (up to `timeout`)
+/// for its thread to finish, as the CEF and WebView backends do once their
+/// event loop has ended (`RuntimeLoader::Shutdown`). A runtime that ignores
+/// the signal is abandoned after the timeout rather than hanging the exit.
+pub fn shutdown_runtime(timeout: std::time::Duration) {
+  // UI tasks still queued can never run now: answer them, so a runtime
+  // thread waiting on one is released before we wait for it.
+  ui_tasks::close();
+  if let Some(f) = RUNTIME_SHUTDOWN.get() {
+    unsafe { f() };
+  }
+  let Some(handle) = RUNTIME_THREAD.lock().unwrap().take() else {
+    return;
+  };
+  // After exit_app the runtime's thread may never return (an exit() that
+  // blocks for good, as Deno.exit()): give it only a moment.
+  let timeout = if window_api::requested_exit_code().is_some() {
+    timeout.min(std::time::Duration::from_millis(200))
+  } else {
+    timeout
+  };
+  let (tx, rx) = std::sync::mpsc::channel();
+  thread::spawn(move || {
+    let _ = handle.join();
+    let _ = tx.send(());
+  });
+  let _ = rx.recv_timeout(timeout);
+}
+
+/// The vtable handed to the runtime, moved to a static home: the runtime
+/// keeps the pointer `laufey_runtime_init` receives for the rest of the
+/// process (laufey.h), so it must outlive every frame — the runtime thread's
+/// included, which ends before other threads stop calling through it.
+fn into_static_api(api: LaufeyBackendApi) -> &'static LaufeyBackendApi {
+  Box::leak(Box::new(api))
+}
+
 pub fn load_and_start_runtime(api: LaufeyBackendApi) {
+  let api = into_static_api(api);
+  // This thread runs the event loop: dispatch_ui_task's UI thread.
+  ui_tasks::bind_current_thread();
+  // Install `application:openURLs:` before the runtime comes up: AppKit only
+  // routes a launch URL to a delegate that already responds to the selector,
+  // and the runtime that registers the handler starts on the thread below.
+  #[cfg(target_os = "macos")]
+  open_url::install_delegate_methods();
+
   let runtime_path = find_runtime_library();
   match runtime_path {
     Some(path) => {
       println!("Loading runtime from: {}", path.display());
-      thread::spawn(move || unsafe {
+      let handle = thread::spawn(move || unsafe {
         let lib = match Library::new(&path) {
           Ok(l) => l,
           Err(e) => {
@@ -3877,10 +5713,16 @@ pub fn load_and_start_runtime(api: LaufeyBackendApi) {
             }
           };
 
-        let result = init(&api);
+        let result = init(api);
         if result != 0 {
           eprintln!("Runtime init failed with code: {}", result);
           return;
+        }
+        // Kept for shutdown_runtime() once the event loop has ended.
+        if let Ok(f) =
+          lib.get::<RuntimeShutdownFn>(b"laufey_runtime_shutdown\0")
+        {
+          let _ = RUNTIME_SHUTDOWN.set(*f);
         }
 
         println!("Runtime initialized, starting...");
@@ -3891,10 +5733,389 @@ pub fn load_and_start_runtime(api: LaufeyBackendApi) {
 
         std::mem::forget(lib);
       });
+      *RUNTIME_THREAD.lock().unwrap() = Some(handle);
     }
     None => {
-      println!("No runtime library found. Set LAUFEY_RUNTIME_PATH or place libruntime in current directory.");
+      println!(
+        "No runtime library found. Set LAUFEY_RUNTIME_PATH or place libruntime in current directory."
+      );
       println!("Starting without runtime integration...");
     }
+  }
+}
+
+#[cfg(test)]
+mod value_ownership_tests {
+  use super::*;
+
+  // value_list_get / value_dict_get hand out a new value the caller owns
+  // (laufey.h), as the CEF and WebView backends do: freeing it must leave
+  // the container intact (it was a borrowed pointer into it before, so the
+  // runtime's free was a double free here and a leak on the other backends).
+  #[test]
+  fn list_and_dict_get_return_owned_copies() {
+    unsafe {
+      let null = std::ptr::null_mut();
+      let list = value_list(null);
+      value_list_append(list, value_string(null, c"item".as_ptr()));
+      let dict = value_dict(null);
+      value_dict_set(dict, c"k".as_ptr(), value_string(null, c"v".as_ptr()));
+      value_list_append(list, dict);
+
+      for _ in 0..2 {
+        let item = value_list_get(list, 0);
+        let mut len = 0;
+        let s = value_get_string(item, &mut len);
+        assert_eq!(CStr::from_ptr(s).to_str().unwrap(), "item");
+        value_free_string(s);
+        value_free(item);
+
+        let d = value_list_get(list, 1);
+        let v = value_dict_get(d, c"k".as_ptr());
+        let s = value_get_string(v, &mut len);
+        assert_eq!(CStr::from_ptr(s).to_str().unwrap(), "v");
+        value_free_string(s);
+        value_free(v);
+        value_free(d);
+      }
+      assert!(value_list_get(list, 5).is_null());
+      assert!(value_dict_get(dict, c"missing".as_ptr()).is_null());
+      value_free(list);
+    }
+  }
+
+  // The vtable the runtime gets lives for the rest of the process.
+  #[test]
+  fn the_runtime_vtable_outlives_its_creator() {
+    let api: &'static LaufeyBackendApi = std::thread::spawn(|| {
+      let mut api: LaufeyBackendApi = unsafe { std::mem::zeroed() };
+      api.version = 4242;
+      into_static_api(api)
+    })
+    .join()
+    .unwrap();
+    assert_eq!(api.version, 4242);
+  }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+  use super::*;
+  use std::time::{Duration, Instant};
+  use winit::event::MouseButton;
+
+  fn count(
+    prev_button: Option<MouseButton>,
+    prev_pos: Option<(f64, f64)>,
+    prev_count: i32,
+    button: MouseButton,
+    x: f64,
+    y: f64,
+    dt_ms: u64,
+  ) -> i32 {
+    let now = Instant::now();
+    let prev_time = if dt_ms == u64::MAX {
+      None
+    } else {
+      now.checked_sub(Duration::from_millis(dt_ms))
+    };
+    next_click_count(
+      prev_button,
+      prev_pos,
+      prev_time,
+      prev_count,
+      button,
+      x,
+      y,
+      now,
+    )
+  }
+
+  #[test]
+  fn first_press_is_click_count_1() {
+    assert_eq!(
+      count(None, None, 0, MouseButton::Left, 10.0, 10.0, u64::MAX),
+      1
+    );
+  }
+
+  #[test]
+  fn second_press_nearby_is_2() {
+    assert_eq!(
+      count(
+        Some(MouseButton::Left),
+        Some((10.0, 10.0)),
+        1,
+        MouseButton::Left,
+        11.0,
+        10.0,
+        100,
+      ),
+      2
+    );
+  }
+
+  #[test]
+  fn third_press_nearby_is_3() {
+    assert_eq!(
+      count(
+        Some(MouseButton::Left),
+        Some((10.0, 10.0)),
+        2,
+        MouseButton::Left,
+        10.0,
+        12.0,
+        100,
+      ),
+      3
+    );
+  }
+
+  #[test]
+  fn far_press_restarts_at_1() {
+    assert_eq!(
+      count(
+        Some(MouseButton::Left),
+        Some((10.0, 10.0)),
+        1,
+        MouseButton::Left,
+        40.0,
+        10.0,
+        100,
+      ),
+      1
+    );
+  }
+
+  #[test]
+  fn late_press_restarts_at_1() {
+    assert_eq!(
+      count(
+        Some(MouseButton::Left),
+        Some((10.0, 10.0)),
+        1,
+        MouseButton::Left,
+        10.0,
+        10.0,
+        600,
+      ),
+      1
+    );
+  }
+
+  #[test]
+  fn other_button_restarts_at_1() {
+    assert_eq!(
+      count(
+        Some(MouseButton::Left),
+        Some((10.0, 10.0)),
+        1,
+        MouseButton::Right,
+        10.0,
+        10.0,
+        100,
+      ),
+      1
+    );
+  }
+
+  #[test]
+  fn laufey_mod_bits_round_trip_to_winit() {
+    let s = laufey_to_modifiers_state(LAUFEY_MOD_SHIFT | LAUFEY_MOD_META);
+    assert!(s.shift_key() && s.super_key());
+    assert!(!s.control_key() && !s.alt_key());
+    assert_eq!(modifiers_to_laufey(s), LAUFEY_MOD_SHIFT | LAUFEY_MOD_META);
+  }
+
+  #[test]
+  fn enter_waits_for_the_first_move() {
+    let ws = WindowState::new();
+    assert!(!ws.note_cursor_entered());
+    assert!(ws.note_cursor_move(40.0, 50.0));
+    assert_eq!(*ws.cursor_position.lock().unwrap(), (40.0, 50.0));
+    assert!(!ws.note_cursor_move(41.0, 50.0));
+  }
+
+  #[test]
+  fn leave_forgets_the_last_inside_point() {
+    let ws = WindowState::new();
+    assert!(!ws.note_cursor_move(40.0, 50.0));
+    ws.note_cursor_left();
+    assert!(!ws.note_cursor_entered());
+    assert!(ws.note_cursor_move(80.0, 20.0));
+  }
+
+  #[test]
+  fn line_scroll_maps_winit_up_to_dom_negative() {
+    // winit LineDelta +Y is scroll up; DOM wants +Y for scroll down.
+    let (dx, dy, mode) = winit_scroll_to_dom(
+      winit::event::MouseScrollDelta::LineDelta(0.0, 3.0),
+      2.0,
+    );
+    assert_eq!(dx, 0.0);
+    assert_eq!(dy, -3.0);
+    assert_eq!(mode, LAUFEY_WHEEL_DELTA_LINE);
+    let (_, down, _) = winit_scroll_to_dom(
+      winit::event::MouseScrollDelta::LineDelta(0.0, -3.0),
+      2.0,
+    );
+    assert_eq!(down, 3.0);
+  }
+
+  #[test]
+  fn pixel_scroll_flips_y_only() {
+    let (dx, dy, mode) = winit_scroll_to_dom(
+      winit::event::MouseScrollDelta::PixelDelta(
+        winit::dpi::PhysicalPosition { x: 4.0, y: 8.0 },
+      ),
+      1.0,
+    );
+    assert_eq!((dx, dy), (4.0, -8.0));
+    assert_eq!(mode, LAUFEY_WHEEL_DELTA_PIXEL);
+  }
+
+  #[test]
+  fn pixel_scroll_divides_by_scale() {
+    let (dx, dy, mode) = winit_scroll_to_dom(
+      winit::event::MouseScrollDelta::PixelDelta(
+        winit::dpi::PhysicalPosition { x: 8.0, y: 16.0 },
+      ),
+      2.0,
+    );
+    assert_eq!((dx, dy), (4.0, -8.0));
+    assert_eq!(mode, LAUFEY_WHEEL_DELTA_PIXEL);
+  }
+
+  #[test]
+  fn physical_size_at_2x_is_constructor_logical() {
+    assert_eq!(physical_size_to_logical_i32(960, 640, 2.0), (480, 320));
+    assert_eq!(physical_size_to_logical_i32(960, 720, 1.5), (640, 480));
+    assert_eq!(physical_size_to_logical_i32(480, 320, 1.0), (480, 320));
+  }
+
+  #[test]
+  fn named_keys_use_w3c_key_values() {
+    use winit::keyboard::{Key, NamedKey};
+    assert_eq!(winit_key_to_string(&Key::Named(NamedKey::Super)), "Meta");
+    assert_eq!(winit_key_to_string(&Key::Named(NamedKey::Space)), " ");
+    assert_eq!(winit_key_to_string(&Key::Named(NamedKey::Shift)), "Shift");
+  }
+
+  #[test]
+  fn super_codes_use_w3c_meta() {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    assert_eq!(
+      winit_code_to_string(&PhysicalKey::Code(KeyCode::SuperLeft)),
+      "MetaLeft"
+    );
+    assert_eq!(
+      winit_code_to_string(&PhysicalKey::Code(KeyCode::ShiftLeft)),
+      "ShiftLeft"
+    );
+  }
+
+  #[test]
+  fn modifier_edges_emit_shift_down_and_up() {
+    let prev = winit::event::Modifiers::default();
+    let next: winit::event::Modifiers =
+      winit::keyboard::ModifiersState::SHIFT.into();
+    assert_eq!(
+      modifier_key_edges(&prev, &next),
+      vec![(true, "Shift", "ShiftLeft")]
+    );
+    assert_eq!(
+      modifier_key_edges(&next, &prev),
+      vec![(false, "Shift", "ShiftLeft")]
+    );
+  }
+
+  #[test]
+  fn new_window_scale_uses_primary_hint() {
+    let ws = WindowState::new();
+    assert_eq!(*ws.current_scale.lock().unwrap(), primary_scale_hint());
+    assert!(*ws.current_scale.lock().unwrap() > 0.0);
+  }
+
+  #[test]
+  fn frameless_window_has_no_frame_offset() {
+    assert_eq!(frame_offset_hint(LAUFEY_WINDOW_FLAG_FRAMELESS), (0, 0));
+  }
+
+  #[cfg(any(target_os = "windows", target_os = "macos"))]
+  #[test]
+  fn decorated_window_offsets_by_the_title_bar() {
+    // A decorated window's content starts below the caption, so the hint has
+    // to be further down than the frame origin. Both the caption height and
+    // the border width vary by DPI and theme, so only the sign is asserted.
+    let (dx, dy) = frame_offset_hint(0);
+    assert!(dy > 0, "expected a caption offset, got {dy}");
+    assert!(dx >= 0, "expected a non-negative border offset, got {dx}");
+    assert!(dy > dx, "caption should exceed the side border");
+  }
+
+  #[test]
+  fn frameless_window_has_no_frame_extent() {
+    assert_eq!(frame_extent_hint(LAUFEY_WINDOW_FLAG_FRAMELESS), (0, 0));
+  }
+
+  #[cfg(any(target_os = "windows", target_os = "macos"))]
+  #[test]
+  fn decorated_window_extent_includes_the_title_bar() {
+    let (dw, dh) = frame_extent_hint(0);
+    assert!(dh > 0, "expected a caption height, got {dh}");
+    assert!(dw >= 0, "expected a non-negative border width, got {dw}");
+    assert!(dh > dw, "caption should exceed the side borders");
+  }
+
+  #[test]
+  fn new_window_starts_with_resize_reporting_disarmed() {
+    // Otherwise the creation-time `Resized` burst reaches the app.
+    let ws = WindowState::new();
+    assert!(!*ws.resize_reporting_armed.lock().unwrap());
+  }
+
+  #[test]
+  fn arming_resyncs_geometry_and_happens_once() {
+    let ws = WindowState::new();
+    assert!(arm_resize_reporting(
+      &ws,
+      Some((600, 400)),
+      1.5,
+      Some((7, 30))
+    ));
+    assert!(*ws.resize_reporting_armed.lock().unwrap());
+    assert_eq!(*ws.current_size.lock().unwrap(), Some((600, 400)));
+    assert_eq!(*ws.current_scale.lock().unwrap(), 1.5);
+    assert_eq!(*ws.current_inner_position.lock().unwrap(), Some((7, 30)));
+
+    // `about_to_wait` runs on every loop iteration, so this is called
+    // constantly; only the first call may touch the cache. Re-syncing later
+    // would clobber a real resize with a stale value.
+    assert!(!arm_resize_reporting(
+      &ws,
+      Some((999, 999)),
+      3.0,
+      Some((9, 9))
+    ));
+    assert_eq!(*ws.current_size.lock().unwrap(), Some((600, 400)));
+    assert_eq!(*ws.current_scale.lock().unwrap(), 1.5);
+    assert_eq!(*ws.current_inner_position.lock().unwrap(), Some((7, 30)));
+  }
+
+  #[test]
+  fn arming_without_geometry_still_arms() {
+    // A platform that cannot report size or position yet (Wayland gives no
+    // window position at all) must not leave reporting disarmed forever.
+    let ws = WindowState::new();
+    assert!(arm_resize_reporting(&ws, None, 1.0, None));
+    assert!(*ws.resize_reporting_armed.lock().unwrap());
+    assert_eq!(*ws.current_size.lock().unwrap(), None);
+    assert_eq!(*ws.current_inner_position.lock().unwrap(), None);
+  }
+
+  #[test]
+  fn physical_cursor_at_2x_is_logical() {
+    assert_eq!(physical_pos_to_logical_f64(40.0, 40.0, 2.0), (20.0, 20.0));
+    assert_eq!(physical_pos_to_logical_i32(100, 200, 2.0), (50, 100));
   }
 }

@@ -1,15 +1,37 @@
 // Copyright 2025 Divy Srivastava. All rights reserved. MIT license.
 
 #include "app.h"
+#include "custom_schemes.h"
 #include "runtime_loader.h"
 #include "laufey_backend_common.h"
+#include "laufey_bridge_origin.h"
+#include "laufey_cef_network_quiet.h"
+#include "laufey_io.h"
+#include "laufey_launch_args.h"
+#include "laufey_launch_config.h"
+#include "laufey_menu.h"
 #include "laufey_external_links.h"
+#include "laufey_passkey.h"
+#include "laufey_scheme_registry.h"
+#include "laufey_auth_session.h"
+#include "laufey_single_instance.h"
+#include "laufey_window.h"
 #include "scheme_handler.h"
+#if defined(_WIN32) || defined(__linux__)
+#include "views_menu.h"
+#endif
 
+#include <algorithm>
+#include <cstdlib>
 #include <iostream>
+#include <string>
+#include <vector>
 
 #ifdef __linux__
+#include <dirent.h>
 #include <gtk/gtk.h>
+
+#include "include/cef_request_context.h"
 #endif
 
 #ifdef __APPLE__
@@ -24,7 +46,9 @@ NativeDialogResult ShowNativeJSDialog_Mac(int type, const std::string& message,
 
 #include "include/base/cef_callback.h"
 #include "include/cef_browser.h"
+#include "include/cef_command_ids.h"
 #include "include/views/cef_browser_view.h"
+#include "include/views/cef_panel.h"
 #include "include/views/cef_window.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
@@ -56,12 +80,19 @@ void LaufeyWindowDelegate::OnWindowCreated(CefRefPtr<CefWindow> window) {
       ConfigureNSWindowTransparentTitlebarForCefHandle(handle);
     }
     RegisterNSWindowForCefHandle(handle, laufey_id_);
+    laufey_common::MacObserveWindowStateChanges(NSWindowForCefHandle(handle),
+                                                laufey_id_,
+                                                CefScheduleWindowStateRecheck);
 #elif defined(_WIN32)
     if (no_activate) {
       ConfigureWin32WindowAsPanel((void*)handle);
     }
     RuntimeLoader::GetInstance()->RegisterNativeHandle((void*)(uintptr_t)handle,
                                                        laufey_id_);
+    // WM_SIZE is the one signal for a minimize / restore on Windows.
+    laufey_common::WinSubclassForStateChanges(reinterpret_cast<void*>(handle),
+                                              laufey_id_,
+                                              CefScheduleWindowStateRecheck);
 #elif defined(__linux__)
     if (no_activate) {
       ConfigureLinuxWindowAsPanel(handle);
@@ -73,7 +104,52 @@ void LaufeyWindowDelegate::OnWindowCreated(CefRefPtr<CefWindow> window) {
   }
 
   window->Show();
+#if defined(__APPLE__)
+  // Chromium's show activates the app, which macOS 14+ may decline for an
+  // app started from a terminal or a background agent; the first window
+  // must still come in front of the active app's, or Chromium reads it as
+  // occluded and the page as hidden (no requestAnimationFrame).
+  if (!no_activate && handle) {
+    if (void* nswindow = NSWindowForCefHandle(handle))
+      laufey_common::MacRevealWindowAtLaunch(nswindow);
+  }
+#endif
   InstallNativeMouseMonitor();
+  if (laufey_id_ > 0)
+    CefScheduleWindowStateRecheck(laufey_id_);
+}
+
+// The constraints are page (client) sizes, like set_window_size, which is
+// what Chromium applies the delegate's minimum / maximum to.
+CefSize LaufeyWindowDelegate::GetMinimumSize(CefRefPtr<CefView> view) {
+  laufey_common::SizeConstraints c =
+      laufey_common::GetSizeConstraints(laufey_id_);
+  if (c.min_width == 0 && c.min_height == 0)
+    return CefSize();
+  return CefSize(c.min_width, c.min_height);
+}
+
+CefSize LaufeyWindowDelegate::GetMaximumSize(CefRefPtr<CefView> view) {
+  laufey_common::SizeConstraints c =
+      laufey_common::GetSizeConstraints(laufey_id_);
+  // CefSize() (0x0) means "no maximum"; an unbounded axis next to a bounded
+  // one gets a size nothing reaches.
+  if (c.max_width == 0 && c.max_height == 0)
+    return CefSize();
+  return CefSize(c.max_width > 0 ? c.max_width : 1 << 24,
+                 c.max_height > 0 ? c.max_height : 1 << 24);
+}
+
+void LaufeyWindowDelegate::OnWindowBoundsChanged(CefRefPtr<CefWindow> window,
+                                                 const CefRect& new_bounds) {
+  if (laufey_id_ > 0)
+    CefRecheckWindowState(laufey_id_);
+}
+
+void LaufeyWindowDelegate::OnWindowFullscreenTransition(
+    CefRefPtr<CefWindow> window, bool is_completed) {
+  if (laufey_id_ > 0 && is_completed)
+    CefScheduleWindowStateRecheck(laufey_id_);
 }
 
 bool LaufeyWindowDelegate::IsFrameless(CefRefPtr<CefWindow> window) {
@@ -91,6 +167,8 @@ void LaufeyWindowDelegate::OnWindowActivationChanged(
     CefRefPtr<CefWindow> window, bool active) {
   if (laufey_id_ > 0) {
     RuntimeLoader::GetInstance()->DispatchFocusedEvent(laufey_id_, active);
+    // A window manager iconifies / restores through activation changes too.
+    CefScheduleWindowStateRecheck(laufey_id_);
   }
 }
 
@@ -112,19 +190,54 @@ void LaufeyWindowDelegate::OnWindowDestroyed(CefRefPtr<CefWindow> window) {
   // Unregister native window
   CefWindowHandle handle = window->GetWindowHandle();
   if (handle) {
+    // A passkey sheet / dialog anchored to this window ends with it
+    // (`cancelled`).
+#if defined(__APPLE__)
+    // By now the content view may be detached from its NSWindow: prefer the
+    // NSWindow registered for this laufey window.
+    void* nswindow =
+        laufey_id_ > 0
+            ? RuntimeLoader::GetInstance()->GetNSWindowForLaufeyId(laufey_id_)
+            : nullptr;
+    if (!nswindow)
+      nswindow = NSWindowForCefHandle(handle);
+    laufey_common::PasskeyWindowClosing(nswindow);
+    // So does an auth session sheet.
+    laufey_common::AuthSessionWindowClosing(nswindow);
+#elif defined(_WIN32)
+    laufey_common::PasskeyWindowClosing(reinterpret_cast<void*>(handle));
+#endif
 #ifdef __APPLE__
+    laufey_common::MacUnwatchWindowState(NSWindowForCefHandle(handle));
     UnregisterNSWindowForCefHandle(handle);
 #else
+#if defined(_WIN32)
+    laufey_common::WinUnsubclassForStateChanges(
+        reinterpret_cast<void*>(handle));
+#endif
     RuntimeLoader::GetInstance()->UnregisterNativeHandle(
         (void*)(uintptr_t)handle);
 #endif
   }
   if (laufey_id_ > 0) {
     RuntimeLoader::GetInstance()->UnregisterBrowser(laufey_id_);
+    laufey_common::ForgetWindow(laufey_id_);
+#if defined(_WIN32) || defined(__linux__)
+    laufey_cef_menu::ForgetWindow(laufey_id_);
+#endif
   }
   RemoveNativeMouseMonitor();
   browser_view_ = nullptr;
 }
+
+#if defined(_WIN32) || defined(__linux__)
+bool LaufeyWindowDelegate::OnAccelerator(CefRefPtr<CefWindow> /*window*/,
+                                         int command_id) {
+  // An app menu item's accelerator (views_menu.cc).
+  return laufey_id_ > 0 &&
+         laufey_cef_menu::OnAccelerator(laufey_id_, command_id);
+}
+#endif
 
 bool LaufeyWindowDelegate::CanClose(CefRefPtr<CefWindow> window) {
   // The close-requested negotiation lives here, not in DoClose: laufey's
@@ -172,6 +285,13 @@ void LaufeyHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
     g_pending_laufey_ids.pop();
     loader->RegisterBrowser(laufey_id, browser);
   }
+#if defined(_WIN32)
+  // External file drops: see LaufeyNativeDragFilePaths.
+  if (auto view = CefBrowserView::GetForBrowser(browser)) {
+    if (auto window = view->GetWindow())
+      LaufeyHookWindowDropTarget(window->GetWindowHandle());
+  }
+#endif
 }
 
 bool LaufeyHandler::OnBeforePopup(
@@ -184,10 +304,20 @@ bool LaufeyHandler::OnBeforePopup(
   CEF_REQUIRE_UI_THREAD();
   // `target="_blank"` / `window.open()` aren't seen by the page's Navigation
   // API listener. Cancel the popup and route http(s) destinations to the OS
-  // browser; return true to prevent the new browser from being created.
+  // browser, only when a user action started it (laufey_external_links.h);
+  // return true to prevent the new browser from being created.
   std::string url = target_url.ToString();
-  if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
-    LaufeyOpenExternalURL(url);
+  switch (DecideLaufeyPopup(url, user_gesture)) {
+    case LaufeyPopupDecision::kOpenInBrowser:
+      LaufeyOpenExternalURL(url);
+      break;
+    case LaufeyPopupDecision::kBlockedNoGesture:
+      std::cerr << "laufey: not opening " << url
+                << " in the browser: the page asked without a user gesture"
+                << std::endl;
+      break;
+    case LaufeyPopupDecision::kIgnored:
+      break;
   }
   return true;
 }
@@ -205,6 +335,8 @@ bool LaufeyHandler::DoClose(CefRefPtr<CefBrowser> browser) {
 
 void LaufeyHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
   CEF_REQUIRE_UI_THREAD();
+  file_drag_paths_.erase(browser->GetIdentifier());
+  file_drag_lookup_failed_.erase(browser->GetIdentifier());
 
   for (auto it = browser_list_.begin(); it != browser_list_.end(); ++it) {
     if ((*it)->IsSame(browser)) {
@@ -213,13 +345,26 @@ void LaufeyHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
     }
   }
   if (browser_list_.empty()) {
+    // A tray / menu-bar app keeps running with no window when it asked to
+    // (set_quit_on_last_window_closed(false), or an Accessory-policy macOS
+    // app, as the WebView backend); quit() ends the loop either way.
 #if defined(__APPLE__)
-    // macOS runs [NSApp run] (external_message_pump); stop that instead.
-    LaufeyQuitMainLoopMac();
+    bool end = laufey_common::ShouldQuitAfterLastWindowMac();
 #else
-    CefQuitMessageLoop();
+    bool end = laufey_common::ShouldEndLoopAfterLastWindow();
 #endif
+    if (end)
+      LaufeyQuitMainLoop();
   }
+}
+
+void LaufeyQuitMainLoop() {
+#if defined(__APPLE__)
+  // macOS runs [NSApp run] (external_message_pump); stop that instead.
+  LaufeyQuitMainLoopMac();
+#else
+  CefQuitMessageLoop();
+#endif
 }
 
 void LaufeyHandler::OnTitleChange(CefRefPtr<CefBrowser> browser,
@@ -238,6 +383,70 @@ void LaufeyHandler::OnTitleChange(CefRefPtr<CefBrowser> browser,
       window->SetTitle(title);
     }
   }
+}
+
+bool LaufeyHandler::OnDragEnter(CefRefPtr<CefBrowser> browser,
+                                CefRefPtr<CefDragData> dragData,
+                                DragOperationsMask /*mask*/) {
+  CEF_REQUIRE_UI_THREAD();
+  std::vector<std::string> paths;
+  if (dragData && dragData->IsFile()) {
+    std::vector<CefString> names;
+    // GetFilePaths: the full paths (GetFileNames is display names).
+    if (dragData->GetFilePaths(names)) {
+      for (const CefString& name : names) {
+        std::string path = name.ToString();
+        if (!path.empty() && paths.size() < LAUFEY_MAX_DROP_PATHS)
+          paths.push_back(std::move(path));
+      }
+    }
+  }
+  if (paths.empty())
+    file_drag_paths_.erase(browser->GetIdentifier());
+  else
+    file_drag_paths_[browser->GetIdentifier()] = std::move(paths);
+  return false;
+}
+
+void LaufeyHandler::OnFileDropMessage(CefRefPtr<CefBrowser> browser,
+                                      CefRefPtr<CefListValue> args) {
+  if (!args || args->GetSize() < 4)
+    return;
+  int phase = args->GetInt(0);
+  double x = args->GetDouble(1);
+  double y = args->GetDouble(2);
+  int count = args->GetInt(3);
+  if (phase < LAUFEY_DRAG_ENTER || phase > LAUFEY_DRAG_DROP || count < 0)
+    return;
+  int id = browser->GetIdentifier();
+  auto it = file_drag_paths_.find(id);
+  // Only a drag known to carry files counts: the browser process is where
+  // the paths come from, the page only says where the drag is. CEF calls
+  // OnDragEnter only for Alloy-style browsers, so for laufey's (Chrome
+  // style) the paths are read from the OS's drag data the first time the
+  // page reports a drag with files.
+  // Asked once per drag: a drag the OS has no paths for (no X source
+  // answers; each lookup can block this thread up to 1 s) is not asked again
+  // on every move, only once it has ended.
+  if (it == file_drag_paths_.end() && count > 0 && phase != LAUFEY_DRAG_LEAVE &&
+      !file_drag_lookup_failed_.count(id)) {
+    std::vector<std::string> native = LaufeyNativeDragFilePaths();
+    if (!native.empty())
+      it = file_drag_paths_.emplace(id, std::move(native)).first;
+    else
+      file_drag_lookup_failed_.insert(id);
+  }
+  if (phase == LAUFEY_DRAG_LEAVE || phase == LAUFEY_DRAG_DROP)
+    file_drag_lookup_failed_.erase(id);
+  if (it == file_drag_paths_.end())
+    return;
+  uint32_t wid = RuntimeLoader::GetInstance()->GetLaufeyIdForBrowser(browser);
+  if (wid == 0)
+    return;
+  std::vector<std::string> paths = it->second;
+  if (phase == LAUFEY_DRAG_LEAVE || phase == LAUFEY_DRAG_DROP)
+    file_drag_paths_.erase(it);
+  laufey_common::DispatchFileDrop(wid, phase, x, y, paths, paths.size());
 }
 
 void LaufeyHandler::OnDraggableRegionsChanged(
@@ -302,36 +511,41 @@ bool LaufeyHandler::OnJSDialog(CefRefPtr<CefBrowser> browser,
   std::string msg = message_text.ToString();
 
 #ifdef _WIN32
-  // Get the native window handle from CEF Views
+  // The window the dialog is modal to.
   HWND hwnd = nullptr;
   if (auto bv = CefBrowserView::GetForBrowser(browser)) {
     if (auto win = bv->GetWindow()) {
       hwnd = win->GetWindowHandle();
     }
   }
-
+  // ShowDialogWin brackets the modal with a ScopedNativeModalLoop, so CEF's
+  // tasks keep running while the dialog is open (this is TID_UI).
   if (dialog_type == JSDialogType::JSDIALOGTYPE_ALERT) {
-    std::wstring wmsg(msg.begin(), msg.end());
-    MessageBoxW(hwnd, wmsg.c_str(), L"Alert", MB_OK | MB_ICONINFORMATION);
+    laufey_common::ShowDialogWin(LAUFEY_DIALOG_ALERT, "Alert", msg, "", nullptr,
+                                 hwnd);
     callback->Continue(true, "");
     return true;
   }
   if (dialog_type == JSDialogType::JSDIALOGTYPE_CONFIRM) {
-    std::wstring wmsg(msg.begin(), msg.end());
-    int result = MessageBoxW(hwnd, wmsg.c_str(), L"Confirm",
-                             MB_OKCANCEL | MB_ICONQUESTION);
-    callback->Continue(result == IDOK, "");
+    int confirmed = laufey_common::ShowDialogWin(
+        LAUFEY_DIALOG_CONFIRM, "Confirm", msg, "", nullptr, hwnd);
+    callback->Continue(confirmed != 0, "");
     return true;
   }
   if (dialog_type == JSDialogType::JSDIALOGTYPE_PROMPT) {
-    std::wstring wmsg(msg.begin(), msg.end());
-    int result = MessageBoxW(hwnd, wmsg.c_str(), L"Prompt",
-                             MB_OKCANCEL | MB_ICONQUESTION);
-    callback->Continue(result == IDOK, default_prompt_text);
+    char* input = nullptr;
+    int confirmed = laufey_common::ShowDialogWin(
+        LAUFEY_DIALOG_PROMPT, "Prompt", msg, default_prompt_text.ToString(),
+        &input, hwnd);
+    std::string text = input ? input : "";
+    free(input);
+    callback->Continue(confirmed != 0, text);
     return true;
   }
 #elif defined(__APPLE__)
-  // macOS: use native NSAlert via helper in runtime_loader_mac.mm
+  // macOS: use native NSAlert via helper in runtime_loader_mac.mm. runModal
+  // is a nested loop on TID_UI: let CEF's tasks run inside it.
+  laufey_common::ScopedNativeModalLoop modal_loop;
   if (dialog_type == JSDialogType::JSDIALOGTYPE_ALERT) {
     ShowNativeJSDialog_Mac(0, msg, "");
     callback->Continue(true, "");
@@ -349,12 +563,32 @@ bool LaufeyHandler::OnJSDialog(CefRefPtr<CefBrowser> browser,
     return true;
   }
 #elif defined(__linux__)
-  // Linux: use GTK dialogs
+  // Linux: GTK dialogs, modal to the browser's window. Chromium's window is
+  // not a GtkWindow, so GTK's own modality doesn't reach it: the dialog is
+  // made transient for it on X11 (the window manager keeps it above and
+  // centered on its parent; main_linux.cc), and the browser view takes no
+  // input while it is up (both backends' display servers). gtk_dialog_run
+  // is a nested loop on TID_UI: let CEF's tasks run inside it.
+  laufey_common::ScopedNativeModalLoop modal_loop;
+  CefRefPtr<CefBrowserView> view = CefBrowserView::GetForBrowser(browser);
+  CefRefPtr<CefWindow> parent = view ? view->GetWindow() : nullptr;
+  unsigned long parent_xid = parent ? parent->GetWindowHandle() : 0;
+  auto run_modal = [&](GtkWidget* dlg) -> gint {
+    LaufeySetDialogTransientFor(dlg, parent_xid);
+    const bool was_enabled = view && view->IsEnabled();
+    if (was_enabled)
+      view->SetEnabled(false);
+    // Ended (as a cancel) when the app quits while it is up.
+    gint result = laufey_common::RunGtkDialog(dlg);
+    if (was_enabled)
+      view->SetEnabled(true);
+    return result;
+  };
   if (dialog_type == JSDialogType::JSDIALOGTYPE_ALERT) {
     GtkWidget* dlg =
         gtk_message_dialog_new(nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
                                GTK_BUTTONS_OK, "%s", msg.c_str());
-    gtk_dialog_run(GTK_DIALOG(dlg));
+    run_modal(dlg);
     gtk_widget_destroy(dlg);
     callback->Continue(true, "");
     return true;
@@ -363,7 +597,7 @@ bool LaufeyHandler::OnJSDialog(CefRefPtr<CefBrowser> browser,
     GtkWidget* dlg =
         gtk_message_dialog_new(nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION,
                                GTK_BUTTONS_OK_CANCEL, "%s", msg.c_str());
-    gint result = gtk_dialog_run(GTK_DIALOG(dlg));
+    gint result = run_modal(dlg);
     gtk_widget_destroy(dlg);
     callback->Continue(result == GTK_RESPONSE_OK, "");
     return true;
@@ -376,9 +610,11 @@ bool LaufeyHandler::OnJSDialog(CefRefPtr<CefBrowser> browser,
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
     GtkWidget* entry = gtk_entry_new();
     gtk_entry_set_text(GTK_ENTRY(entry), defaultText.c_str());
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_OK);
     gtk_container_add(GTK_CONTAINER(content), entry);
     gtk_widget_show(entry);
-    gint result = gtk_dialog_run(GTK_DIALOG(dlg));
+    gint result = run_modal(dlg);
     std::string resultText =
         (result == GTK_RESPONSE_OK) ? gtk_entry_get_text(GTK_ENTRY(entry)) : "";
     gtk_widget_destroy(dlg);
@@ -455,7 +691,7 @@ bool LaufeyHandler::OnProcessMessageReceived(
       if (callArgs && callArgs->GetSize() > 0 &&
           callArgs->GetType(0) == VTYPE_STRING) {
         std::string url = callArgs->GetString(0).ToString();
-        if (!url.empty()) {
+        if (IsAllowedExternalLinkUrl(url)) {
           LaufeyOpenExternalURL(url);
         }
       }
@@ -470,7 +706,19 @@ bool LaufeyHandler::OnProcessMessageReceived(
     }
 
     uint32_t wid = RuntimeLoader::GetInstance()->GetLaufeyIdForBrowser(browser);
-    RuntimeLoader::GetInstance()->OnJsCall(wid, call_id, method_path, callArgs);
+    // API 44: the calling document's origin, from the browser's view of the
+    // frame (not from the renderer's message).
+    RuntimeLoader::GetInstance()->OnJsCall(
+        wid, call_id, method_path, callArgs,
+        laufey_common::OriginOfUrl(frame->GetURL().ToString()));
+    return true;
+  }
+
+  if (name == "laufey_file_drop") {
+    // From the observer the renderer injects into the main frame only; drop
+    // anything else, as for laufey_call.
+    if (frame && frame->IsMain())
+      OnFileDropMessage(browser, message->GetArgumentList());
     return true;
   }
 
@@ -486,12 +734,270 @@ bool LaufeyHandler::OnProcessMessageReceived(
   return false;
 }
 
+bool LaufeyHandleAlreadyRunningAppRelaunch() {
+  std::cerr << "laufey: another launch of this app was ignored (it shares this "
+               "instance's web data directory)"
+            << std::endl;
+  return true;
+}
+
+#if !defined(__APPLE__)
+namespace {
+
+// Brings the app to the front for a forwarded launch: the first (oldest)
+// window that isn't hidden. CEF UI thread. (macOS: ActivateAppMac.)
+void ActivateAppCef(void*) {
+  for (const CefRefPtr<CefBrowser>& browser :
+       RuntimeLoader::GetInstance()->GetAllBrowsers()) {
+    CefRefPtr<CefBrowserView> view = CefBrowserView::GetForBrowser(browser);
+    CefRefPtr<CefWindow> window = view ? view->GetWindow() : nullptr;
+    if (!window || !window->IsVisible())
+      continue;
+    if (window->IsMinimized())
+      window->Restore();
+    window->Activate();
+    return;
+  }
+}
+
+}  // namespace
+#endif  // !defined(__APPLE__)
+
+void LaufeyInstallSecondInstanceHooks() {
+#if defined(__APPLE__)
+  // [NSApp run] drains the main dispatch queue (see main_mac.mm).
+  laufey_common::InstallSecondInstanceHooksMac();
+#else
+  laufey_common::SecondInstanceUiHooks hooks;
+  hooks.post = [](void*, void (*task)(void*), void* data) {
+    CefPostTask(TID_UI, base::BindOnce([](void (*t)(void*), void* d) { t(d); },
+                                       task, data));
+  };
+  hooks.activate = ActivateAppCef;
+  laufey_common::SetSecondInstanceUiHooks(hooks);
+#endif
+}
+
+void LaufeyClearSecondInstanceHooks() {
+  laufey_common::SetSecondInstanceUiHooks({});
+}
+
+void LaufeyReportCefInitializeFailure(const std::string& root_cache_path) {
+  if (CefGetExitCode() == CEF_RESULT_CODE_NORMAL_EXIT_PROCESS_NOTIFIED) {
+    std::cerr << "laufey: another instance is already running with the web "
+                 "data directory \""
+              << root_cache_path << "\"; exiting" << std::endl;
+  }
+}
+
 void LaufeyApp::OnRegisterCustomSchemes(
     CefRawPtr<CefSchemeRegistrar> registrar) {
-  registrar->AddCustomScheme(
-      LAUFEY_APP_SCHEME, CEF_SCHEME_OPTION_STANDARD | CEF_SCHEME_OPTION_SECURE |
-                             CEF_SCHEME_OPTION_CORS_ENABLED |
-                             CEF_SCHEME_OPTION_FETCH_ENABLED);
+  laufey_schemes::RegisterAll(registrar);
+}
+
+void LaufeyApp::OnBeforeChildProcessLaunch(
+    CefRefPtr<CefCommandLine> command_line) {
+  laufey_schemes::ForwardToChild(command_line);
+}
+
+// --- DevTools gating (API 40) ---------------------------------------------
+
+namespace {
+// The switches that expose a DevTools endpoint on the browser process.
+const char* const kRemoteDebuggingSwitches[] = {
+    "remote-debugging-port", "remote-debugging-pipe",
+    "remote-debugging-address", "remote-debugging-io-pipes",
+    "auto-open-devtools-for-tabs"};
+}  // namespace
+
+bool LaufeyIsDevToolsCommand(int command_id) {
+  switch (command_id) {
+    case IDC_DEV_TOOLS:
+    case IDC_DEV_TOOLS_CONSOLE:
+    case IDC_DEV_TOOLS_DEVICES:
+    case IDC_DEV_TOOLS_INSPECT:
+    case IDC_DEV_TOOLS_TOGGLE:
+    case IDC_CONTENT_CONTEXT_INSPECTELEMENT:
+    case IDC_CONTENT_CONTEXT_INSPECTBACKGROUNDPAGE:
+    case IDC_CONTENT_CONTEXT_INSPECTELEMENT_WITH_DEVTOOLS:
+    case IDC_CONTENT_CONTEXT_INSPECTELEMENT_WITH_GEMINI:
+      return true;
+  }
+  return false;
+}
+
+void LaufeyApplyInspectableToCommandLine(
+    CefRefPtr<CefCommandLine> command_line) {
+  if (laufey_common::LaunchInspectable())
+    return;
+  for (const char* sw : kRemoteDebuggingSwitches) {
+    if (command_line->HasSwitch(sw))
+      command_line->RemoveSwitch(sw);
+  }
+}
+
+void LaufeyStripDeepLinkSwitches(CefRefPtr<CefCommandLine> command_line) {
+  const std::vector<std::string> strip =
+      laufey_common::DeepLinkSwitchesToStrip(laufey_common::ProcessArgs(), {});
+  for (const std::string& name : strip) {
+    if (command_line->HasSwitch(name)) {
+      std::cerr << "laufey: ignoring --" << name
+                << " on the command line of a deep-link launch" << std::endl;
+      command_line->RemoveSwitch(name);
+    }
+  }
+}
+
+void LaufeyApplyNetworkQuietDefaults(CefRefPtr<CefCommandLine> command_line) {
+  auto value = [&](const char* name) {
+    return command_line->HasSwitch(name)
+               ? command_line->GetSwitchValue(name).ToString()
+               : std::string();
+  };
+  const std::string disable = value("disable-features");
+  const std::string merged = laufey_common::MergeQuietDisabledFeatures(
+      disable, value("enable-features"));
+  if (merged != disable) {
+    if (command_line->HasSwitch("disable-features"))
+      command_line->RemoveSwitch("disable-features");
+    command_line->AppendSwitchWithValue("disable-features", merged);
+  }
+  if (!command_line->HasSwitch("gaia-url")) {
+    command_line->AppendSwitchWithValue("gaia-url",
+                                        laufey_common::kCefQuietGaiaUrl);
+  }
+  // The component updater, which --disable-background-networking leaves
+  // running: a minute after launch it checks update.googleapis.com and
+  // downloads components from edgedl.me.gvt1.com. An app that configures
+  // it (--component-updater=...) keeps it.
+  if (!command_line->HasSwitch("component-updater"))
+    command_line->AppendSwitch("disable-component-update");
+}
+
+#if defined(__linux__)
+void LaufeyKeepLocalSpellcheckDictionaries(const std::string& root_cache_path) {
+  CefRefPtr<CefRequestContext> context = CefRequestContext::GetGlobalContext();
+  if (!context || root_cache_path.empty())
+    return;
+  std::vector<std::string> files;
+  if (DIR* dir = opendir((root_cache_path + "/Dictionaries").c_str())) {
+    while (struct dirent* entry = readdir(dir))
+      files.push_back(entry->d_name);
+    closedir(dir);
+  }
+  std::vector<std::string> languages;
+  CefRefPtr<CefValue> pref = context->GetPreference("spellcheck.dictionaries");
+  if (pref && pref->GetType() == VTYPE_LIST) {
+    CefRefPtr<CefListValue> list = pref->GetList();
+    for (size_t i = 0; i < list->GetSize(); ++i) {
+      if (list->GetType(i) == VTYPE_STRING)
+        languages.push_back(list->GetString(i).ToString());
+    }
+  }
+  const std::vector<std::string> listed = languages;
+  // The single-language pref (its default is the UI language), which
+  // Chromium moves into an empty list when the spellchecker starts: done
+  // here instead, so the language is checked like the others.
+  CefRefPtr<CefValue> single = context->GetPreference("spellcheck.dictionary");
+  if (single && single->GetType() == VTYPE_STRING &&
+      !single->GetString().empty()) {
+    if (languages.empty())
+      languages.push_back(single->GetString().ToString());
+    CefRefPtr<CefValue> empty = CefValue::Create();
+    empty->SetString("");
+    CefString error;
+    if (!context->SetPreference("spellcheck.dictionary", empty, error)) {
+      std::cerr << "laufey: spellcheck.dictionary: " << error.ToString()
+                << std::endl;
+    }
+  }
+  const std::vector<std::string> kept =
+      laufey_common::LocalHunspellDictionaries(languages, files);
+  if (kept == listed)
+    return;
+  CefRefPtr<CefListValue> list = CefListValue::Create();
+  for (size_t i = 0; i < kept.size(); ++i)
+    list->SetString(i, kept[i]);
+  CefRefPtr<CefValue> value = CefValue::Create();
+  value->SetList(list);
+  CefString error;
+  if (!context->SetPreference("spellcheck.dictionaries", value, error)) {
+    std::cerr << "laufey: spellcheck.dictionaries: " << error.ToString()
+              << std::endl;
+  }
+}
+#endif
+
+bool LaufeyDevToolsReachable() {
+  if (laufey_common::LaunchInspectable())
+    return true;
+  // Off: reachable only if a remote-debugging switch got through anyway.
+  CefRefPtr<CefCommandLine> cl = CefCommandLine::GetGlobalCommandLine();
+  if (!cl)
+    return false;
+  for (const char* sw : kRemoteDebuggingSwitches) {
+    if (cl->HasSwitch(sw))
+      return true;
+  }
+  return false;
+}
+
+bool LaufeyHandler::OnShowPermissionPrompt(
+    CefRefPtr<CefBrowser> /*browser*/, uint64_t /*prompt_id*/,
+    const CefString& requesting_origin, uint32_t requested_permissions,
+    CefRefPtr<CefPermissionPromptCallback> callback) {
+  // Chromium's Local Network Access prompt (CEF 136 named it
+  // LOCAL_NETWORK_ACCESS, CEF 145 split it into LOCAL_NETWORK and
+  // LOOPBACK_NETWORK). The CEF host has no prompt UI, so an unanswered one
+  // holds the page's request forever.
+  constexpr uint32_t kLocalNetwork = CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS |
+                                     CEF_PERMISSION_TYPE_LOCAL_NETWORK |
+                                     CEF_PERMISSION_TYPE_LOOPBACK_NETWORK;
+  switch (laufey_common::DecideLocalNetworkPrompt(
+      requesting_origin.ToString(), requested_permissions, kLocalNetwork,
+      laufey_schemes::Declared())) {
+    case laufey_common::LocalNetworkPromptDecision::kAccept:
+      callback->Continue(CEF_PERMISSION_RESULT_ACCEPT);
+      return true;
+    case laufey_common::LocalNetworkPromptDecision::kDeny:
+      callback->Continue(CEF_PERMISSION_RESULT_DENY);
+      return true;
+    case laufey_common::LocalNetworkPromptDecision::kDefault:
+      break;
+  }
+  return false;
+}
+
+bool LaufeyHandler::OnChromeCommand(
+    CefRefPtr<CefBrowser> /*browser*/, int command_id,
+    cef_window_open_disposition_t /*disposition*/) {
+  // Handled (= dropped) only while DevTools are off.
+  return !laufey_common::LaunchInspectable() &&
+         LaufeyIsDevToolsCommand(command_id);
+}
+
+void LaufeyHandler::OnBeforeContextMenu(
+    CefRefPtr<CefBrowser> /*browser*/, CefRefPtr<CefFrame> /*frame*/,
+    CefRefPtr<CefContextMenuParams> /*params*/, CefRefPtr<CefMenuModel> model) {
+  if (laufey_common::LaunchInspectable() || !model)
+    return;
+  for (size_t i = model->GetCount(); i > 0; i--) {
+    int id = model->GetCommandIdAt(i - 1);
+    if (LaufeyIsDevToolsCommand(id))
+      model->RemoveAt(i - 1);
+  }
+  // Drop a separator left dangling at the end.
+  size_t count = model->GetCount();
+  if (count > 0 && model->GetTypeAt(count - 1) == MENUITEMTYPE_SEPARATOR)
+    model->RemoveAt(count - 1);
+}
+
+bool LaufeyHandler::OnContextMenuCommand(
+    CefRefPtr<CefBrowser> /*browser*/, CefRefPtr<CefFrame> /*frame*/,
+    CefRefPtr<CefContextMenuParams> /*params*/, int command_id,
+    EventFlags /*event_flags*/) {
+  return !laufey_common::LaunchInspectable() &&
+         LaufeyIsDevToolsCommand(command_id);
 }
 
 void LaufeyApp::OnContextInitialized() {
@@ -505,7 +1011,9 @@ void LaufeyApp::OnContextInitialized() {
   if (!g_runtime_path.empty()) {
     if (!RuntimeLoader::GetInstance()->Load(g_runtime_path)) {
       std::cerr << "Failed to load runtime, exiting" << std::endl;
-      CefQuitMessageLoop();
+      // macOS runs [NSApp run], which CefQuitMessageLoop doesn't end: the
+      // process stayed up with no window. LaufeyQuitMainLoop ends either.
+      LaufeyQuitMainLoop();
       return;
     }
     // Defer Start() to the next message loop iteration. OnContextInitialized

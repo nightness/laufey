@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 
 #include "include/cef_request.h"
 #include "include/cef_response.h"
+#include "laufey_scheme_registry.h"
 #include "runtime_loader.h"
 
 namespace {
@@ -27,6 +29,39 @@ std::string FlattenHeaders(const CefRequest::HeaderMap& headers) {
   return out;
 }
 
+// Split a Content-Type header value ("text/html; charset=utf-8") into its
+// MIME type ("text/html") and charset ("utf-8"; empty if absent).
+void SplitContentType(const std::string& content_type, std::string* mime_type,
+                      std::string* charset) {
+  auto trim = [](std::string s) {
+    size_t first = s.find_first_not_of(" \t");
+    size_t last = s.find_last_not_of(" \t");
+    return first == std::string::npos ? std::string()
+                                      : s.substr(first, last - first + 1);
+  };
+  size_t semi = content_type.find(';');
+  *mime_type = trim(content_type.substr(0, semi));
+  charset->clear();
+  while (semi != std::string::npos) {
+    size_t next = content_type.find(';', semi + 1);
+    std::string param = trim(content_type.substr(semi + 1, next - semi - 1));
+    size_t eq = param.find('=');
+    if (eq != std::string::npos) {
+      std::string key = trim(param.substr(0, eq));
+      std::transform(key.begin(), key.end(), key.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (key == "charset") {
+        std::string value = trim(param.substr(eq + 1));
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+          value = value.substr(1, value.size() - 2);
+        }
+        *charset = value;
+      }
+    }
+    semi = next;
+  }
+}
+
 }  // namespace
 
 bool LaufeySchemeHandler::Open(CefRefPtr<CefRequest> request,
@@ -41,6 +76,8 @@ bool LaufeySchemeHandler::Open(CefRefPtr<CefRequest> request,
 
   // Buffer the request body up front. CEF makes the full POST data available
   // here, so the runtime's ReadRequestBody pulls become non-blocking copies.
+  // A body past kMaxRequestBodyBytes cancels the request before it reaches
+  // the runtime (the page sees a network error) instead of being held whole.
   CefRefPtr<CefPostData> post_data = request->GetPostData();
   if (post_data) {
     CefPostData::ElementVector elements;
@@ -49,6 +86,16 @@ bool LaufeySchemeHandler::Open(CefRefPtr<CefRequest> request,
       size_t count = element->GetBytesCount();
       if (count == 0)
         continue;
+      if (!laufey_common::RequestBodyFits(request_body_.size(), count)) {
+        std::cerr << "laufey: the request body of " << method_ << " " << url_
+                  << " is larger than "
+                  << (laufey_common::kMaxRequestBodyBytes >> 20)
+                  << " MiB; failing the request" << std::endl;
+        request_body_.clear();
+        request_body_.shrink_to_fit();
+        handle_request = true;
+        return false;  // cancel now: the page's request fails
+      }
       size_t offset = request_body_.size();
       request_body_.resize(offset + count);
       element->GetBytes(count, request_body_.data() + offset);
@@ -62,6 +109,7 @@ bool LaufeySchemeHandler::Open(CefRefPtr<CefRequest> request,
   // Hand ownership of an extra reference to the runtime. Released in
   // FinishResponse(). Keeps the handler alive while the runtime streams.
   this->AddRef();
+  dispatched_ = true;
   RuntimeLoader::GetInstance()->DispatchSchemeRequest(window_id_, this, method_,
                                                       url_, flat_headers);
   return true;
@@ -74,28 +122,48 @@ void LaufeySchemeHandler::GetResponseHeaders(CefRefPtr<CefResponse> response,
   response->SetStatus(status_);
 
   CefResponse::HeaderMap header_map;
-  std::string mime_type;
+  std::string content_type;
   for (const auto& [name, value] : response_headers_) {
     if (name == "content-type") {
-      // CefResponse exposes mime type separately; the full content-type
-      // (incl. charset) still round-trips via SetMimeType.
-      mime_type = value;
+      content_type = value;
     }
     header_map.insert({name, value});
   }
   response->SetHeaderMap(header_map);
-  if (!mime_type.empty()) {
+  if (!content_type.empty()) {
+    // CefResponse takes the MIME type and charset separately, and Chromium
+    // does not recognize a MIME type with parameters: "text/html;
+    // charset=utf-8" as the MIME type loads as an empty document.
+    std::string mime_type, charset;
+    SplitContentType(content_type, &mime_type, &charset);
     response->SetMimeType(mime_type);
+    if (!charset.empty()) {
+      response->SetCharset(charset);
+    }
   }
 
   // Streaming: length unknown until FinishResponse.
   response_length = -1;
 }
 
+// Bytes held for a page that isn't reading before the response fails
+// (Chromium stops calling Read while the renderer doesn't consume). The cap
+// of the WebView2 and WebKitGTK backends; the runtime's write never blocks.
+// Backpressure keeps the queue near kSchemeResponseHighWater, so only a
+// single write larger than this reaches it.
+constexpr size_t kMaxQueuedResponseBytes = 64 * 1024 * 1024;
+// net::ERR_FAILED: what a failed read reports to Chromium.
+constexpr int kNetErrFailed = -2;
+
 bool LaufeySchemeHandler::Read(void* data_out, int bytes_to_read,
                                int& bytes_read,
                                CefRefPtr<CefResourceReadCallback> callback) {
   std::lock_guard<std::mutex> lock(mutex_);
+
+  if (failed_) {
+    bytes_read = kNetErrFailed;
+    return false;
+  }
 
   if (!response_body_.empty()) {
     size_t n =
@@ -133,6 +201,12 @@ void LaufeySchemeHandler::Cancel() {
   // Wake any parked read so it reports EOF.
   if (to_continue)
     to_continue->Continue(0);
+  // Tell the runtime (on_cancel), unless it already finished the exchange.
+  // Cancel runs on the IO thread Open ran on, so `dispatched_` is settled.
+  if (dispatched_) {
+    cancel_gate_.Cancel(
+        [this] { RuntimeLoader::GetInstance()->DispatchSchemeCancel(this); });
+  }
 }
 
 intptr_t LaufeySchemeHandler::ReadRequestBody(uint8_t* buf, size_t cap) {
@@ -184,19 +258,36 @@ void LaufeySchemeHandler::Begin(int status, const char* headers,
 intptr_t LaufeySchemeHandler::WriteResponse(const uint8_t* buf, size_t len) {
   CefRefPtr<CefResourceReadCallback> to_continue;
   int to_report = 0;
+  bool overflow = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (cancelled_)
+    if (cancelled_ || failed_)
       return -1;
-    response_body_.insert(response_body_.end(), buf, buf + len);
-    // Satisfy a parked Read by copying into its output buffer.
-    if (read_callback_ && pending_data_ && !response_body_.empty()) {
-      size_t n =
-          std::min(static_cast<size_t>(pending_cap_), response_body_.size());
-      std::copy(response_body_.begin(), response_body_.begin() + n,
-                static_cast<uint8_t*>(pending_data_));
-      response_body_.erase(response_body_.begin(), response_body_.begin() + n);
-      to_report = static_cast<int>(n);
+    // Backpressure (API 44): the page is this far behind; take nothing and
+    // let the runtime write the same bytes again later.
+    if (response_body_.size() >= laufey_common::kSchemeResponseHighWater)
+      return 0;
+    if (response_body_.size() + len > kMaxQueuedResponseBytes) {
+      // The page isn't reading: fail the response (its read rejects)
+      // instead of holding an unbounded body.
+      overflow = true;
+      failed_ = true;
+      response_body_.clear();
+      to_report = kNetErrFailed;
+    } else {
+      response_body_.insert(response_body_.end(), buf, buf + len);
+      // Satisfy a parked Read by copying into its output buffer.
+      if (read_callback_ && pending_data_ && !response_body_.empty()) {
+        size_t n =
+            std::min(static_cast<size_t>(pending_cap_), response_body_.size());
+        std::copy(response_body_.begin(), response_body_.begin() + n,
+                  static_cast<uint8_t*>(pending_data_));
+        response_body_.erase(response_body_.begin(),
+                             response_body_.begin() + n);
+        to_report = static_cast<int>(n);
+      }
+    }
+    if (read_callback_ && (overflow || to_report > 0)) {
       to_continue = read_callback_;
       read_callback_ = nullptr;
       pending_data_ = nullptr;
@@ -204,18 +295,29 @@ intptr_t LaufeySchemeHandler::WriteResponse(const uint8_t* buf, size_t len) {
   }
   if (to_continue)
     to_continue->Continue(to_report);
-  return static_cast<intptr_t>(len);
+  return overflow ? -1 : static_cast<intptr_t>(len);
 }
 
 void LaufeySchemeHandler::FinishResponse() {
+  // No on_cancel from now on (and one in progress has returned).
+  cancel_gate_.Finish();
   CefRefPtr<CefResourceReadCallback> to_continue;
+  CefRefPtr<CefCallback> to_cancel;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     finished_ = true;
     to_continue = read_callback_;
     read_callback_ = nullptr;
     pending_data_ = nullptr;
+    // Finished without a head: Open is still waiting for Begin, which never
+    // comes, so the request would hang. There is no response: fail it.
+    if (!began_) {
+      to_cancel = open_callback_;
+      open_callback_ = nullptr;
+    }
   }
+  if (to_cancel)
+    to_cancel->Cancel();
   // A parked read with no remaining body: report EOF.
   if (to_continue)
     to_continue->Continue(0);

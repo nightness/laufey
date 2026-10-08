@@ -7,6 +7,7 @@
 // notification observer re-applies them on theme changes.
 
 #include "laufey_backend_common.h"
+#include "laufey_ui_tasks.h"
 
 #import <AppKit/AppKit.h>
 
@@ -279,11 +280,7 @@ bool GetTrayIconBoundsMac(uint32_t tray_id, int* x, int* y, int* width,
                                                     toView:nil]];
     ok = true;
   };
-  if ([NSThread isMainThread]) {
-    work();
-  } else {
-    dispatch_sync(dispatch_get_main_queue(), work);
-  }
+  RunOnMainSync(work);
   if (!ok) return false;
   // Convert to top-left origin to match get_window_position. The menu bar
   // lives on the primary screen, whose frame origin is (0,0) bottom-left.

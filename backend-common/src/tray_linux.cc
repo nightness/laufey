@@ -11,13 +11,16 @@
 // Ayatana fork and on ones with the legacy library, and must still
 // start on systems with neither; the two flavors are ABI-compatible for
 // the handful of symbols used here (the fork kept names and
-// signatures). When no library can be loaded, CreateTrayIconLinux
-// returns 0 and the other functions no-op.
+// signatures). When no library can be loaded, or the session has no tray
+// host to show the icon (no StatusNotifierWatcher and no XEmbed tray: stock
+// GNOME), CreateTrayIconLinux returns 0, says why once on stderr, and the
+// other functions no-op. platform_features() reports the same reason.
 
 #include <dlfcn.h>
 #include <gtk/gtk.h>
 
 #include "laufey_backend_common.h"
+#include "laufey_platform_features.h"
 
 #include <atomic>
 #include <cstdio>
@@ -47,6 +50,9 @@ struct AppIndicatorApi {
   void (*set_menu)(AppIndicator* self, GtkMenu* menu);
   void (*set_icon_full)(AppIndicator* self, const gchar* icon_name,
                         const gchar* icon_desc);
+  // Optional (absent from very old libappindicator builds): the title,
+  // which StatusNotifier hosts show as the icon's hover text.
+  void (*set_title)(AppIndicator* self, const gchar* title);
 };
 
 // Loads the appindicator library once; nullptr if unavailable. Safe to
@@ -82,6 +88,8 @@ const AppIndicatorApi* GetAppIndicatorApi() {
         dlsym(lib, "app_indicator_set_menu"));
     api.set_icon_full = reinterpret_cast<decltype(api.set_icon_full)>(
         dlsym(lib, "app_indicator_set_icon_full"));
+    api.set_title = reinterpret_cast<decltype(api.set_title)>(
+        dlsym(lib, "app_indicator_set_title"));
     return api.app_indicator_new && api.set_status && api.set_menu &&
            api.set_icon_full;
   }();
@@ -123,7 +131,23 @@ void OnGtkMain(Fn&& fn) {
 
 }  // namespace
 
+bool AppIndicatorLibraryAvailableLinux() {
+  return GetAppIndicatorApi() != nullptr;
+}
+
 uint32_t CreateTrayIconLinux() {
+  // No host means an icon no one can see (and, without the menu, an app no
+  // one can reach): refuse it, with the reason, instead of a dead id.
+  PlatformFeatures features;
+  ProbeTray(&features);
+  if (!TrayAvailable(features)) {
+    static std::once_flag logged;
+    std::string reason = TrayUnavailableReason(features);
+    std::call_once(logged, [&] {
+      std::fprintf(stderr, "laufey: tray icon refused: %s\n", reason.c_str());
+    });
+    return 0;
+  }
   const AppIndicatorApi* api = GetAppIndicatorApi();
   if (!api) return 0;
   uint32_t tray_id =
@@ -190,9 +214,18 @@ void SetTrayIconDarkLinux(uint32_t /*tray_id*/, const void* /*png_bytes*/,
   // for API symmetry only; same here.
 }
 
-void SetTrayTooltipLinux(uint32_t /*tray_id*/,
-                           const char* /*tooltip_or_null*/) {
-  // The AppIndicator / StatusNotifier protocol has no tooltip concept.
+void SetTrayTooltipLinux(uint32_t tray_id, const char* tooltip_or_null) {
+  // AppIndicator has no tooltip of its own; StatusNotifier hosts (Plasma,
+  // the GNOME AppIndicator extension) show the indicator's title on hover.
+  const AppIndicatorApi* api = GetAppIndicatorApi();
+  if (!api || !api->set_title) return;
+  std::string title = tooltip_or_null ? tooltip_or_null : "";
+  OnGtkMain([api, tray_id, title] {
+    std::lock_guard<std::mutex> lock(LinuxTrayMutex());
+    auto it = LinuxTrayMap().find(tray_id);
+    if (it == LinuxTrayMap().end() || !it->second.indicator) return;
+    api->set_title(it->second.indicator, title.c_str());
+  });
 }
 
 void SetTrayMenuLinux(uint32_t tray_id, laufey_value_t* menu_template,

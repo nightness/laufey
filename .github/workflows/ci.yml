@@ -2,10 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, denext/integration]
     tags: ["v*"]
   pull_request:
     branches: [main]
+  # Nightly, so flakes and runner-image drift show up between merges.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+# Read-only by default; a job that needs more (the release) asks for it.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,11 +23,11 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: rustfmt, clippy
-      - uses: denoland/setup-deno@v2
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.x
 
@@ -50,9 +58,9 @@ jobs:
     name: cargo test (capi)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: test
       # Only the capi crate has unit-testable logic (pure conversions /
@@ -60,6 +68,265 @@ jobs:
       # backends require display servers, so we don't run their tests in CI.
       - run: cargo test -p laufey --lib
       - run: cargo test -p laufey --doc
+      # backend-common's app data directory resolver (plain C++, no deps).
+      - name: backend-common data_dir_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/data_dir_test.cc backend-common/src/data_dir.cc \
+            backend-common/src/launch_config.cc \
+            -o "$RUNNER_TEMP/data_dir_test"
+          "$RUNNER_TEMP/data_dir_test"
+      # backend-common's launch file reader (plain C++, no deps; validates
+      # values with data_dir.cc's rules).
+      - name: backend-common launch_config_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/launch_config_test.cc \
+            backend-common/src/launch_config.cc backend-common/src/data_dir.cc \
+            -o "$RUNNER_TEMP/launch_config_test"
+          "$RUNNER_TEMP/launch_config_test"
+      # The origin a bridge call carries and the launch file's bridge pin.
+      - name: backend-common bridge_origin_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/bridge_origin_test.cc \
+            backend-common/src/launch_config.cc backend-common/src/data_dir.cc \
+            -o "$RUNNER_TEMP/bridge_origin_test"
+          "$RUNNER_TEMP/bridge_origin_test"
+      # The host's command line: options stop at "--", a packaged app ignores
+      # --runtime, a deep-link launch drops its command-line switches.
+      - name: backend-common launch_args_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/launch_args_test.cc \
+            backend-common/src/launch_args.cc \
+            backend-common/src/launch_config.cc backend-common/src/data_dir.cc \
+            -o "$RUNNER_TEMP/launch_args_test"
+          "$RUNNER_TEMP/launch_args_test"
+      # backend-common's single-instance lock: framing, limits, naming, and a
+      # real Unix-socket lock (stale socket, simultaneous acquire). ctest runs
+      # it on every OS in build-webview.
+      - name: backend-common single_instance_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -pthread \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/single_instance_test.cc \
+            backend-common/src/single_instance.cc \
+            backend-common/src/single_instance_posix.cc \
+            backend-common/src/launch_config.cc backend-common/src/data_dir.cc \
+            -o "$RUNNER_TEMP/single_instance_test"
+          "$RUNNER_TEMP/single_instance_test"
+
+      # The CEF host's network-quiet defaults: the features it disables, an
+      # app's own --enable-features winning, the Hunspell files it keeps.
+      - name: backend-common cef_network_quiet_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/cef_network_quiet_test.cc \
+            backend-common/src/cef_network_quiet.cc \
+            -o "$RUNNER_TEMP/cef_network_quiet_test"
+          "$RUNNER_TEMP/cef_network_quiet_test"
+
+      # The native check on URLs the page asks the reserved open-external
+      # bridge call to open (header-only; ctest also runs it per backend).
+      - name: backend-common external_links_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/external_links_test.cc \
+            -o "$RUNNER_TEMP/external_links_test"
+          "$RUNNER_TEMP/external_links_test"
+      # UTF-8 for text from a JavaScript engine (header-only; ctest also runs
+      # it per backend, with the Windows WideToUtf8 checks on Windows).
+      - name: backend-common utf8_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/utf8_test.cc \
+            -o "$RUNNER_TEMP/utf8_test"
+          "$RUNNER_TEMP/utf8_test"
+      # The dialog paths show page text in-process and start no program: no
+      # process-spawning or shell API in them (the Windows prompt used to
+      # interpolate the page's text into a PowerShell command line). The
+      # winit prompt's unit tests check the argv it hands osascript / zenity;
+      # this keeps the APIs from coming back.
+      - name: dialog paths call no shell or process API
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='_popen|popen\(|system\(|CreateProcess|ShellExecute|WinExec|powershell|cmd\.exe|std::process::Command'
+          files=(backend-common/src/dialog_win.cc backend-common/src/dialog_mac.mm
+                 backend-common/src/dialog_linux.cc)
+          if grep -nE "$pattern" "${files[@]}"; then
+            echo "a dialog path calls a shell / process API" >&2
+            exit 1
+          fi
+          # The winit prompt's Linux half (prompt.rs `mod linux`) runs
+          # kdialog / zenity, but as the program itself with the strings as
+          # argv: never through a shell.
+          awk '/^mod linux \{/,/^}/' backend-winit-common/src/prompt.rs > "$RUNNER_TEMP/prompt_linux.rs"
+          test -s "$RUNNER_TEMP/prompt_linux.rs"
+          if grep -nE '"(/bin/)?(ba|da|z)?sh"|"-c"|popen\(|system\(' "$RUNNER_TEMP/prompt_linux.rs"; then
+            echo "the winit Linux prompt goes through a shell" >&2
+            exit 1
+          fi
+          # The winit prompt's Windows half (prompt.rs `mod win`) likewise.
+          awk '/^mod win \{/,/^}/' backend-winit-common/src/prompt.rs > "$RUNNER_TEMP/prompt_win.rs"
+          test -s "$RUNNER_TEMP/prompt_win.rs"
+          if grep -nE "$pattern" "$RUNNER_TEMP/prompt_win.rs"; then
+            echo "the winit Windows prompt calls a shell / process API" >&2
+            exit 1
+          fi
+
+  # backend-winit-common's unit tests (click counting, frame offsets, resize
+  # reporting, file-drop batching, window-API bookkeeping). Pure logic, no
+  # display, but several are per-OS (cfg-gated), so every desktop OS runs them.
+  test-winit-common:
+    name: cargo test (backend-winit-common) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: test-winit-common
+          key: ${{ matrix.os }}
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev xvfb
+      # Linux: under Xvfb, so the in-process GTK dialogs (the prompt /
+      # confirm / alert path where neither kdialog nor zenity is installed,
+      # as on Fedora) run end to end (prompt.rs gtk_dialogs_end_to_end).
+      - name: cargo test (Linux, Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a cargo test -p laufey-backend-winit-common --lib
+      - name: cargo test
+        if: runner.os != 'Linux'
+        run: cargo test -p laufey-backend-winit-common --lib
+
+  # The cross-thread rendezvous behind the synchronous UI-thread calls
+  # (backend-common/include/laufey_sync_call.h: cef_invoke_sync,
+  # gtk_invoke_sync, GtkRunSync, WinIoInit) and the passkey ceremony's
+  # timeout thread, under ThreadSanitizer: a notify after the waiter may have
+  # destroyed its condition variable is reported as a data race on the first
+  # call it happens to, where a plain run only hangs now and then.
+  tsan:
+    name: ThreadSanitizer (backend-common)
+    runs-on: ubuntu-24.04
+    env:
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The runner kernel randomizes mmap with 32 bits, which ThreadSanitizer's
+      # shadow memory layout doesn't support ("unexpected memory mapping").
+      - name: Allow ThreadSanitizer's memory layout
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: sync_call_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -fsanitize=thread -pthread \
+            -Ibackend-common/include \
+            backend-common/tests/sync_call_test.cc -o "$RUNNER_TEMP/sync_call_test"
+          "$RUNNER_TEMP/sync_call_test"
+      # The bridge's call table: concurrent adds and takes.
+      - name: js_calls_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -fsanitize=thread -pthread \
+            -Ibackend-common/include \
+            backend-common/tests/js_calls_test.cc -o "$RUNNER_TEMP/js_calls_test"
+          "$RUNNER_TEMP/js_calls_test"
+      - name: passkey_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -fsanitize=thread -pthread \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/passkey_test.cc backend-common/src/passkey.cc \
+            backend-common/src/single_instance.cc \
+            backend-common/src/single_instance_posix.cc \
+            backend-common/src/launch_config.cc backend-common/src/data_dir.cc \
+            -o "$RUNNER_TEMP/passkey_test"
+          "$RUNNER_TEMP/passkey_test"
+      # The UI-thread task dispatcher (Dispatch / the loop / Close racing) and
+      # the auth session's one-session slot and exactly-once result.
+      - name: auth_main_thread_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -fsanitize=thread -pthread \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/auth_main_thread_test.cc \
+            backend-common/src/auth_session.cc \
+            backend-common/src/single_instance.cc \
+            backend-common/src/single_instance_posix.cc \
+            backend-common/src/launch_config.cc backend-common/src/data_dir.cc \
+            -o "$RUNNER_TEMP/auth_main_thread_test"
+          "$RUNNER_TEMP/auth_main_thread_test"
+      # The WebKitGTK response body stream: a writer thread against a reader
+      # on a GMainContext.
+      - name: scheme_body_stream_test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+          c++ -std=c++17 -Wall -Wextra -Werror -Wno-unused-parameter -O1 -g \
+            -fsanitize=thread -pthread \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/scheme_body_stream_test.cc \
+            backend-common/src/scheme_body_stream_linux.cc \
+            $(pkg-config --cflags --libs gio-2.0) \
+            -o "$RUNNER_TEMP/scheme_body_stream_test"
+          "$RUNNER_TEMP/scheme_body_stream_test"
+      - name: single_instance_test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -fsanitize=thread -pthread \
+            -Ibackend-common/include -Icapi/include \
+            backend-common/tests/single_instance_test.cc \
+            backend-common/src/single_instance.cc \
+            backend-common/src/single_instance_posix.cc \
+            backend-common/src/launch_config.cc backend-common/src/data_dir.cc \
+            -o "$RUNNER_TEMP/single_instance_test"
+          "$RUNNER_TEMP/single_instance_test"
+
+  # The Linux clipboard without focus, for real: ext-data-control-v1 against
+  # a headless wlroots compositor (sway 1.11 / wlroots 0.19 from Ubuntu
+  # 26.04; the runner images' sway predates the protocol), and the X11
+  # CLIPBOARD client laufey uses on mutter against Xvfb, each with a second
+  # client in the test (an owner that never answers, a reader that never
+  # reads, reads over max_bytes, INCR, the session lock). Neither may skip
+  # here: exit 77 fails the step.
+  clipboard-linux:
+    name: clipboard (headless sway + Xvfb)
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config libgtk-3-dev \
+            libwayland-dev libxcb1-dev sway xvfb xauth dbus
+      - name: Build the clipboard tests
+        run: |
+          cmake -G Ninja -S backend-common -B build-clipboard \
+            -DCMAKE_BUILD_TYPE=Debug -DLAUFEY_BUILD_TESTS=ON
+          ninja -C build-clipboard laufey_clipboard_wayland_test \
+            laufey_clipboard_x11_test laufey_exit_guard_test \
+            laufey_shortcuts_portal_test
+      - name: clipboard_wayland_test (headless sway)
+        run: scripts/headless-sway.sh build-clipboard/laufey_clipboard_wayland_test
+      - name: clipboard_x11_test (Xvfb)
+        run: build-clipboard/laufey_clipboard_x11_test
+      - name: exit_guard_test
+        run: build-clipboard/laufey_exit_guard_test
+      - name: shortcuts_portal_test
+        run: build-clipboard/laufey_shortcuts_portal_test
 
   build-winit:
     name: winit / ${{ matrix.target }}
@@ -77,9 +344,9 @@ jobs:
           - { target: x86_64-apple-darwin, os: macos-15-intel }
           - { target: aarch64-apple-darwin, os: macos-14 }
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: winit
           # rust-cache keys on runner.os+arch only ("Linux-x64"), not the
@@ -100,7 +367,7 @@ jobs:
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
-        run: choco install make -y
+        run: choco install make --version=4.4.1 -y --no-progress
 
       - run: make winit
 
@@ -116,7 +383,7 @@ jobs:
             tar czf laufey-winit-${{ matrix.target }}.tar.gz -C staging .
           fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: laufey-winit-${{ matrix.target }}
           path: |
@@ -127,7 +394,7 @@ jobs:
   # Drives the *same* backend-agnostic native_e2e_runtime under each backend:
   #   Layer 0 (all): in-process readback + event-callback + clipboard + menu/
   #                  tray click round-trips (via the test_click_menu_item hook).
-  #   Layer 1 (Linux, cef): D-Bus StatusNotifier/dbusmenu observer.
+  #   Layer 1 (Linux, cef): D-Bus StatusNotifier/dbusmenu observer (run below).
   #
   # macOS exercises all three backends (both native-chrome codebases) end to
   # end. Non-macOS legs are included only where they pass reliably; the rest are
@@ -135,12 +402,13 @@ jobs:
   #   - winit / linux : the winit backend doesn't support Linux menus and panics
   #                     building a muda menu with no GTK init.
   #   - webview / linux: WebKitGTK/Xlib isn't thread-safe under the worker-thread
-  #                      runtime (xcb_xlib_threads_sequence_lost).
-  #   - cef|webview / windows: CEF's Windows dist extraction and the WebView2
-  #                            run are flaky in this job; need hands-on debugging.
+  #                      runtime (xcb_xlib_threads_sequence_lost); only the
+  #                      custom-scheme request-body round trip runs there.
   native-e2e:
     name: native-e2e / ${{ matrix.backend }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Backstop; each e2e step below has its own, much shorter, timeout.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -150,11 +418,18 @@ jobs:
           - { os: macos-14, backend: cef }
           - { os: windows-latest, backend: winit }
           - { os: windows-latest, backend: webview }
+          - { os: windows-latest, backend: cef }
           - { os: ubuntu-22.04, backend: cef }
+          # The Layer-0 battery is excluded on webview/linux (see above); the
+          # storage e2e and the request-body round trip run there.
+          - { os: ubuntu-22.04, backend: webview, layer0_excluded: true }
+          # arm64: WebView2 on Windows on Arm, CEF on Linux arm64.
+          - { os: windows-11-arm, backend: webview }
+          - { os: ubuntu-22.04-arm, backend: cef }
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: native-e2e
           key: ${{ matrix.os }}-${{ matrix.backend }}
@@ -162,7 +437,7 @@ jobs:
       # CEF fetches a large prebuilt binary distribution; cache it.
       - name: Cache CEF
         if: matrix.backend == 'cef'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor/cef
           key: cef-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
@@ -181,12 +456,16 @@ jobs:
             libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-0 \
             libwayland-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
 
+      # openbox: a window manager under Xvfb for the window-API and HiDPI
+      # steps; xdotool + x11-utils: real X input and window geometry;
+      # xdg-utils: the registered URL scheme opened with xdg-open.
       - name: Install dependencies (Linux, webview)
         if: runner.os == 'Linux' && matrix.backend == 'webview'
         run: |
           sudo apt-get update
           sudo apt-get install -y make cmake ninja-build pkg-config xvfb dbus-x11 \
-            libwebkit2gtk-4.1-dev libgtk-3-dev
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            openbox xdotool x11-utils xdg-utils
 
       - name: Install dependencies (Linux, cef)
         if: runner.os == 'Linux' && matrix.backend == 'cef'
@@ -197,7 +476,8 @@ jobs:
             libatk1.0-dev libatk-bridge2.0-dev libcups2-dev libdrm-dev libgtk-3-dev \
             libgbm-dev libasound2-dev libpango1.0-dev libcairo2-dev libxcomposite-dev \
             libxdamage-dev libxrandr-dev libxkbcommon-dev libdbus-1-dev libxext-dev \
-            libxfixes-dev libayatana-appindicator3-1
+            libxfixes-dev libayatana-appindicator3-1 \
+            openbox xdotool x11-utils xdg-utils
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -207,9 +487,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          choco install make ninja -y
+          # Pinned versions (the community packages carry their downloads' checksums).
+          choco install make --version=4.4.1 -y --no-progress
+          choco install ninja --version=1.13.2 -y --no-progress
           if [ "${{ matrix.backend }}" = "webview" ]; then
-            nuget install Microsoft.Web.WebView2 -OutputDirectory packages
+            # The WebView2 SDK at a pinned version, checked against its
+            # SHA-256 before use (nuget.org's flat container; the .nupkg is a zip).
+            WV2_VERSION=1.0.4258.31
+            WV2_SHA256=56f7f4b8bf9aee4b8efefbbdd4f67d5f74ebd1b100ed0806da71bf76af481aa9
+            curl -fsSL --retry 3 -o wv2.zip "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$WV2_VERSION/microsoft.web.webview2.$WV2_VERSION.nupkg"
+            echo "$WV2_SHA256  wv2.zip" | sha256sum -c -
+            powershell -NoProfile -Command "Expand-Archive -Path wv2.zip -DestinationPath packages/Microsoft.Web.WebView2.$WV2_VERSION"
+            rm wv2.zip
           fi
 
       # Build the Rust runtime/driver BEFORE msvc-dev-cmd: cargo's own toolchain
@@ -219,14 +508,23 @@ jobs:
         shell: bash
         run: |
           cargo build --release -p native_e2e_runtime
+          if [ "${{ matrix.backend }}" != "winit" ]; then
+            cargo build --release -p storage_e2e_runtime
+            cargo build --release -p single_instance_e2e_runtime
+          fi
           if [ "${{ runner.os }}" = "Linux" ]; then
             cargo build --release -p native_e2e_driver
           fi
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         if: runner.os == 'Windows' && matrix.backend != 'winit'
+        with:
+          # windows-11-arm: an ARM64 toolchain, so CMake links the arm64
+          # WebView2 loader (as in build-webview).
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
 
       - name: Build backend
+        if: ${{ !(runner.os == 'Windows' && matrix.backend == 'cef') }}
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ] && [ "${{ matrix.backend }}" = "webview" ]; then
@@ -235,19 +533,349 @@ jobs:
             make ${{ matrix.backend }}
           fi
 
+      # As in build-cef: run make from the default shell (pwsh), where the
+      # Windows tar extracts the CEF dist. Under Git bash, GNU tar reads the
+      # "D:/..." archive path as a remote host and the extraction fails.
+      - name: Build backend (Windows, cef)
+        if: runner.os == 'Windows' && matrix.backend == 'cef'
+        run: make cef
+
+      # Every e2e step has a timeout: a backend that hangs would otherwise
+      # hold the runner for the 6-hour job limit. native-e2e-run.sh's own
+      # watchdog (5 min) fires first and prints the hung process's stacks.
       - name: Layer 0 — readback / events / clipboard / menu+tray clicks
+        if: ${{ !matrix.layer0_excluded }}
+        timeout-minutes: 10
         shell: bash
+        # On Linux this session has no tray host (no StatusNotifierWatcher,
+        # no XEmbed tray), so the tray is refused with a reason (API 45). The
+        # appindicator dlopen path is gated by Layer 1 (LAUFEY_E2E_REQUIRE_TRAY,
+        # issue #63).
         env:
-          # On the cef/linux leg the Ayatana runtime lib is installed above, so
-          # a tray id of 0 means the dlopen path regressed to a stub — fail
-          # instead of reporting N/A (issue #63).
-          LAUFEY_E2E_REQUIRE_TRAY: ${{ (runner.os == 'Linux' && matrix.backend == 'cef') && '1' || '' }}
+          # CEF's renderer and GPU processes run in Chromium's sandbox
+          # (sandbox_checks.rs); on Windows behind CEF's bootstrap.exe.
+          LAUFEY_E2E_EXPECT_SANDBOX: ${{ matrix.backend == 'cef' && '1' || '' }}
         run: scripts/native-e2e-run.sh ${{ matrix.backend }}
 
-      # Layer 1 (Linux D-Bus StatusNotifier/dbusmenu observer) is built above
-      # (compile-checked on real Linux) but not run here yet: the cef leg now
-      # creates a real appindicator tray (runtime lib installed above), so
-      # running the driver there is the next step once it's been proven green.
+      # POST/PUT/PATCH bodies (text, binary, >1 MB, empty) from the page reach
+      # the app:// scheme handler intact, and never-ending responses stream to
+      # fetch / EventSource / XHR and stop when cancelled. Part of Layer 0 on
+      # the other legs.
+      - name: Custom-scheme request bodies and streaming responses
+        if: ${{ matrix.layer0_excluded }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --scheme-body
+
+      # The custom-scheme page's fetch and WebSocket to a loopback server
+      # (lna_checks.rs). Part of Layer 0 on the other legs, where CEF also
+      # checks that a page on any other origin stays blocked.
+      - name: Local Network Access — custom-scheme page to loopback
+        if: ${{ matrix.layer0_excluded }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --lna
+
+      # API 44: a launch file pinning "bridgeOrigins" gives the bridge to the
+      # pinned origin only; calls carry the calling document's origin.
+      - name: Bridge origin pin (launch file)
+        if: matrix.backend != 'winit'
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --bridge-origin
+
+      # The CEF host makes no network request of its own: Chromium's net log
+      # over a launch, the app page and 75 s of idle (past the component
+      # updater's first check at 60 s) shows no host but loopback
+      # (network_quiet_checks.rs, scripts/netlog-hosts.py).
+      - name: No network requests of its own (cef)
+        if: matrix.backend == 'cef'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          LAUFEY_E2E_QUIET_SECS: "75"
+          LAUFEY_E2E_NETLOG_OUT: ${{ runner.temp }}/network-quiet-netlog.json
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --network-quiet
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure() && matrix.backend == 'cef'
+        with:
+          name: network-quiet-netlog-${{ matrix.os }}
+          path: ${{ runner.temp }}/network-quiet-netlog.json
+          if-no-files-found: ignore
+
+      # Layer 1 (Linux, cef): the D-Bus StatusNotifier/dbusmenu observer
+      # plays the desktop shell, checks the real appindicator tray from
+      # outside, fires a dbusmenu Event that must reach the app's on_click,
+      # and fails unless the whole battery passed under it.
+      - name: Layer 1 — D-Bus tray / menu observer (Linux, cef)
+        if: runner.os == 'Linux' && matrix.backend == 'cef'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          LAUFEY_E2E_REQUIRE_TRAY: "1"
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --layer1
+
+      # API 45 (Linux): platform features in this headless session. No tray
+      # host, so the tray is refused with a reason; CEF picks
+      # --password-store=basic on its own (no one could answer a keyring
+      # prompt here) instead of waiting for the key.
+      - name: Platform features (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          LAUFEY_E2E_EXPECT_TRAY_HOST: "0"
+          LAUFEY_E2E_EXPECT_COOKIES: ${{ matrix.backend == 'cef' && 'basic' || '' }}
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --platform
+
+      # API 47: title bar preferences on every leg. macOS: the buttons on
+      # the left; Windows: on the right; Linux: the battery serves the
+      # private bus's xdg-desktop-portal Settings and moves the buttons (the
+      # change handler must see it).
+      - name: Title bar preferences
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --title-bar
+
+      # API 47: the secure store answers within its timeout (Linux: the
+      # private bus may have no provider, or a keyring no one can unlock:
+      # unavailable with a reason; macOS: the round trip in the login
+      # keychain); NULL elsewhere.
+      - name: Secure store
+        timeout-minutes: 10
+        shell: bash
+        env:
+          LAUFEY_E2E_EXPECT_SECRET: ${{ runner.os == 'macOS' && matrix.backend != 'winit' && 'ok' || '' }}
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --secret-store
+
+      # API 47 (Linux): the file chooser report agrees with the portal's
+      # interfaces, and a real dialog closes with cancel_file_dialog.
+      - name: File chooser (Linux)
+        if: runner.os == 'Linux' && matrix.backend != 'winit'
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --file-chooser
+
+      # API 45 (Linux, cef): no tray host at first. The tray is refused with
+      # a reason, then the observer starts a StatusNotifierWatcher, which the
+      # backend must see (it follows NameOwnerChanged) before the Layer 1
+      # checks run on the next tray.
+      - name: Late tray host — refused, then seen (Linux, cef)
+        if: runner.os == 'Linux' && matrix.backend == 'cef'
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --late-tray-host
+
+      # Window state, constraints, screens, title bar and backdrops (API 38)
+      # on their own, on every leg. On Linux under a window manager
+      # (openbox): maximize / minimize / fullscreen must apply, not N/A.
+      - name: Window API — state, constraints, screens (a WM on Linux)
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --window-api
+
+      # App lifetime (API 38): keep-alive with no window, then quit() ending
+      # the event loop. Ends the process, so it runs on its own. Every leg,
+      # webview/linux included (no clipboard involved).
+      - name: App lifetime — keep-alive and quit
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --lifetime
+
+      # Drag and drop, native file dialogs and the rich clipboard (API 39):
+      # drops through the test hook, real OS dialogs driven by the test hook,
+      # clipboard text / HTML / PNG / formats / change events. Every leg,
+      # webview/linux included (every call hops to the GTK thread). See
+      # docs/e2e-testing.md §17.
+      - name: I/O — drag and drop, file dialogs, clipboard
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --io
+
+      # Global shortcuts, launch at login and DevTools (API 40): register /
+      # list / unregister, a conflict with a second process holding the same
+      # shortcut, a real key press on Windows, the login entry turned on and
+      # off (and the OS artefact checked), DevTools open / close / toggle; then
+      # the DevTools checks again with LAUFEY_INSPECTABLE=0 (nothing opens).
+      # Every leg; Winit reports N/A. See docs/e2e-testing.md.
+      - name: System — global shortcuts, launch at login, DevTools
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --system
+
+      - name: System — DevTools disabled (LAUFEY_INSPECTABLE=0)
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --devtools-off
+
+      # Menus and notifications (API 41): an app-menu accelerator through the
+      # backend's own dispatch (and a real Ctrl+Shift+F9 on Windows), the
+      # context-menu close callback, notification responses buffered until a
+      # handler registers, live action / body clicks, schedule / list /
+      # cancel round trips, a real ActionInvoked from a stand-in notification
+      # server on Linux and the toast COM activator on Windows. Every leg;
+      # Winit reports N/A. See docs/e2e-testing.md.
+      - name: Menus and notifications
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --menus-notifications
+
+      # UI-thread tasks and auth sessions (API 42): tasks run on the OS's own
+      # UI thread and are refused after quit(); auth sessions answer
+      # not_supported off macOS, and on macOS run a real ephemeral
+      # ASWebAuthenticationSession round trip, busy, cancel (test hook,
+      # window close, the consent prompt). Every leg; ends with quit(). See
+      # docs/e2e-testing.md.
+      - name: UI-thread tasks and auth sessions
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --auth-thread
+
+      # The first window of a fresh launch (launch_checks.rs): on screen, its
+      # page visible and drawing a frame within 2 s, and outerWidth /
+      # outerHeight read as the window's; a non-activating window's page
+      # visible and drawing frames too; a hidden window left hidden. On macOS
+      # another process's window covers the screen first, as an editor or a
+      # terminal would when the app is started from it. Every leg; Winit has
+      # no page and reports N/A for those checks.
+      - name: Launch visibility — first window on screen, frames drawn
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --launch-visibility
+
+      # An Xorg session labelled Wayland (GDM's autologin into XFCE or i3:
+      # XDG_SESSION_TYPE=wayland, $DISPLAY only, no Wayland socket). The
+      # backend must follow the display that is there: the first window
+      # appears and draws (CEF opened none when Chromium's Ozone hint
+      # followed XDG_SESSION_TYPE), and platform features report an x11
+      # session (the XEmbed tray is looked for there).
+      - name: Xorg session labelled wayland — a window appears (Linux)
+        if: runner.os == 'Linux' && matrix.backend != 'winit'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          XDG_SESSION_TYPE: wayland
+          WAYLAND_DISPLAY: ""
+          LAUFEY_E2E_EXPECT_SESSION: x11
+        run: |
+          scripts/native-e2e-run.sh ${{ matrix.backend }} --launch-visibility
+          scripts/native-e2e-run.sh ${{ matrix.backend }} --platform
+
+      # The cold-start toast click (Windows): COM starts the app from the
+      # activator registration the step above wrote, and the click reaches
+      # the response handler as the launch.
+      - name: Notifications — cold-start click (Windows)
+        if: runner.os == 'Windows' && matrix.backend != 'winit'
+        timeout-minutes: 10
+        shell: pwsh
+        run: scripts/notification-coldstart-e2e.ps1 ${{ matrix.backend }}
+
+      # The cold-start notification click on Linux: D-Bus starts the app from
+      # its service file for org.freedesktop.Application.ActivateAction (what
+      # gnome-shell and KDE's portal send for a click) and the click reaches
+      # the response handler as the launch. Under Xvfb and a private session
+      # bus with the stand-in notification server (no portal there: the
+      # freedesktop transport; real desktops: docs/notifications.md).
+      - name: Notifications — cold-start click (Linux)
+        if: runner.os == 'Linux' && matrix.backend != 'winit'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          mock="$(ls webview/build/backend-common/laufey_mock_notification_server \
+            cef/build/backend-common/laufey_mock_notification_server \
+            cef/build/laufey_mock_notification_server 2>/dev/null | head -1 || true)"
+          [ -n "$mock" ] || { echo "no laufey_mock_notification_server built"; exit 1; }
+          export XDG_DATA_HOME="$(mktemp -d)" LAUFEY_E2E_ENTRY_WAIT=0
+          xvfb-run -a dbus-run-session -- bash -c \
+            "$mock & sleep 1; scripts/notification-coldstart-e2e.sh ${{ matrix.backend }}"
+
+      # Per-app web storage (LAUFEY_APP_ID / LAUFEY_DATA_DIR): persistence
+      # across relaunches, isolation between apps, unchanged defaults. See
+      # docs/app-data.md.
+      - name: Storage — per-app persistence / isolation
+        if: matrix.backend != 'winit'
+        timeout-minutes: 15
+        shell: bash
+        run: scripts/storage-e2e-run.sh ${{ matrix.backend }}
+
+      # How an app ends: quit(), the last window closing and exit_app (API
+      # 46) each end the process (no hang), with their exit code, and what
+      # the page stored just before survives into the next launch. See
+      # docs/backends.md, "How an app ends".
+      - name: Exit — every path ends the process and keeps the profile
+        if: matrix.backend != 'winit'
+        timeout-minutes: 15
+        shell: bash
+        run: scripts/exit-e2e-run.sh ${{ matrix.backend }} 3
+
+      # Single-instance lock + argument forwarding (second_instance), the
+      # arguments a runtime sees at a cold start, and on macOS files opened
+      # through LaunchServices (open_url). See docs/deep-links.md. Winit has
+      # no single-instance lock.
+      - name: Single instance / opened files
+        if: matrix.backend != 'winit'
+        timeout-minutes: 15
+        shell: bash
+        run: scripts/single-instance-e2e-run.sh ${{ matrix.backend }}
+
+      # SIGTERM / SIGINT / SIGHUP end the Linux app through its own quit
+      # (runtime shut down; CEF: CefShutdown, not Chromium's session-end
+      # _exit; WebKitGTK: the web storage flush, not the default kill):
+      # status 0 within seconds, no process left, what the page stored read
+      # back by the next launch, CEF's exit_type "Normal", no core or crash
+      # report. Then with a GTK dialog up (Deno's uncaught-error alert, a
+      # confirm): the quit ends it as a cancel instead of waiting for it.
+      - name: Termination signals (Linux)
+        if: runner.os == 'Linux' && matrix.backend != 'winit'
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          scripts/signal-exit-e2e-run.sh ${{ matrix.backend }}
+          scripts/signal-exit-e2e-run.sh ${{ matrix.backend }} --dialog alert SIGTERM SIGINT
+          scripts/signal-exit-e2e-run.sh ${{ matrix.backend }} --dialog confirm SIGTERM
+
+      # HiDPI: the window-API battery at a device scale factor of 2 (Linux:
+      # CEF --force-device-scale-factor=2, WebKitGTK GDK_SCALE=2; Windows:
+      # the display's own scale, raised first). Sizes and positions must stay
+      # in DIPs, the page's devicePixelRatio and the reported scales must be
+      # the factor, and the window system must have the window at that many
+      # physical pixels. macOS runners have one 1x display and no way to add
+      # a 2x one without a person, so it runs on Linux and Windows. Last in
+      # the job: the Windows display stays scaled.
+      - name: Raise the display scale (Windows)
+        id: scale
+        if: runner.os == 'Windows' && matrix.backend != 'winit'
+        shell: pwsh
+        run: scripts/windows-display-scale.ps1 -Percent 200
+
+      - name: HiDPI
+        if: runner.os == 'Linux' || (runner.os == 'Windows' && matrix.backend != 'winit' && steps.scale.outputs.scale != '1')
+        timeout-minutes: 10
+        shell: bash
+        env:
+          LAUFEY_E2E_EXPECT_SCALE: ${{ runner.os == 'Windows' && steps.scale.outputs.scale || '2' }}
+        run: scripts/native-e2e-run.sh ${{ matrix.backend }} --hidpi
+
+      # A backend that crashed mid-run leaves only "exited before reporting
+      # an overall result"; print the crash report it left (any e2e step).
+      - name: Crash reports (macOS)
+        if: failure() && runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          # ReportCrash writes the report a few seconds after the process
+          # dies; give it time before concluding there is none.
+          for _ in $(seq 1 30); do
+            ls ~/Library/Logs/DiagnosticReports/*.ips >/dev/null 2>&1 && break
+            sleep 2
+          done
+          # The exception and the crashed + main threads' backtraces; a
+          # whole report is too long for the log.
+          # No report (a check failed without a crash) is not a failure of
+          # this step: under pipefail a bare ls with no match would make it one.
+          { ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null || echo "no crash report" >&2; } |
+            head -3 |
+            while read -r f; do python3 scripts/print-crash-report.py "$f"; done
 
   build-webview:
     name: webview / ${{ matrix.target }}
@@ -271,13 +899,16 @@ jobs:
           - { target: x86_64-apple-darwin, os: macos-15-intel }
           - { target: aarch64-apple-darwin, os: macos-14 }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev
+          # xvfb + dbus: ctest's clipboard_x11_test starts its own Xvfb and a
+          # private bus.
+          # gnome-keyring: secret_store_dbus_test's real Secret Service.
+          sudo apt-get install -y cmake ninja-build pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev xvfb dbus gnome-keyring
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -287,10 +918,19 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          choco install make ninja -y
-          nuget install Microsoft.Web.WebView2 -OutputDirectory packages
+          # Pinned versions (the community packages carry their downloads' checksums).
+          choco install make --version=4.4.1 -y --no-progress
+          choco install ninja --version=1.13.2 -y --no-progress
+          # The WebView2 SDK at a pinned version, checked against its
+          # SHA-256 before use (nuget.org's flat container; the .nupkg is a zip).
+          WV2_VERSION=1.0.4258.31
+          WV2_SHA256=56f7f4b8bf9aee4b8efefbbdd4f67d5f74ebd1b100ed0806da71bf76af481aa9
+          curl -fsSL --retry 3 -o wv2.zip "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$WV2_VERSION/microsoft.web.webview2.$WV2_VERSION.nupkg"
+          echo "$WV2_SHA256  wv2.zip" | sha256sum -c -
+          powershell -NoProfile -Command "Expand-Archive -Path wv2.zip -DestinationPath packages/Microsoft.Web.WebView2.$WV2_VERSION"
+          rm wv2.zip
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         if: runner.os == 'Windows'
         with:
           # Match the MSVC toolchain to the runner arch so cl.exe targets ARM64
@@ -306,6 +946,17 @@ jobs:
             make webview
           fi
 
+      # backend-common's C++ unit tests (scheme registry) — built alongside
+      # the backend, run here. No display needed.
+      # macOS: laufey_secret_store_mac_test must find a usable login
+      # keychain here, and checks `security find-generic-password -w` too.
+      - name: Unit tests (ctest)
+        shell: bash
+        env:
+          LAUFEY_SECRET_TEST_REQUIRE: ${{ runner.os == 'macOS' && '1' || '' }}
+          LAUFEY_SECRET_TEST_SECURITY_CLI: ${{ runner.os == 'macOS' && '1' || '' }}
+        run: ctest --test-dir webview/build --output-on-failure
+
       - name: Package
         shell: bash
         run: |
@@ -317,20 +968,112 @@ jobs:
             tar czf laufey-webview-${{ matrix.target }}.tar.gz -C webview/build laufey_webview
           fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: laufey-webview-${{ matrix.target }}
           path: |
             laufey-webview-${{ matrix.target }}.tar.gz
             laufey-webview-${{ matrix.target }}.zip
 
+  # The Linux CEF host's three sandbox modes (docs/backends.md, "The Chromium
+  # sandbox"), on one Ubuntu 24.04 runner: user namespaces allowed
+  # (namespace); restricted by AppArmor with chrome-sandbox installed root
+  # 4755 (setuid); restricted with a helper that isn't setuid (off: the host
+  # turns the sandbox off instead of Chromium aborting). Each run checks the
+  # host's `laufey: sandbox: <mode>` line and, from outside, the renderers.
+  sandbox-modes-linux:
+    name: native-e2e / cef sandbox modes / ubuntu-24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: sandbox-modes-linux
+
+      - name: Cache CEF
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/cef
+          key: cef-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('Makefile') }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make cmake ninja-build pkg-config xvfb dbus-x11 \
+            libx11-dev libxi-dev libglib2.0-dev libnss3-dev libnspr4-dev \
+            libatk1.0-dev libatk-bridge2.0-dev libcups2-dev libdrm-dev libgtk-3-dev \
+            libgbm-dev libasound2-dev libpango1.0-dev libcairo2-dev libxcomposite-dev \
+            libxdamage-dev libxrandr-dev libxkbcommon-dev libdbus-1-dev libxext-dev \
+            libxfixes-dev
+
+      - name: Build
+        run: |
+          make cef
+          cargo build --release -p native_e2e_runtime
+
+      - name: namespace (unprivileged user namespaces allowed)
+        timeout-minutes: 10
+        env:
+          LAUFEY_E2E_EXPECT_SANDBOX_MODE: namespace
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          scripts/native-e2e-run.sh cef --sandbox
+
+      - name: setuid (user namespaces restricted, chrome-sandbox root 4755)
+        timeout-minutes: 10
+        env:
+          LAUFEY_E2E_EXPECT_SANDBOX_MODE: setuid
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo chown root:root cef/build/Release/chrome-sandbox
+          sudo chmod 4755 cef/build/Release/chrome-sandbox
+          scripts/native-e2e-run.sh cef --sandbox
+
+      - name: off (user namespaces restricted, helper not setuid)
+        timeout-minutes: 10
+        env:
+          LAUFEY_E2E_EXPECT_SANDBOX: "0"
+          LAUFEY_E2E_EXPECT_SANDBOX_MODE: "off"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo chmod 0755 cef/build/Release/chrome-sandbox
+          scripts/native-e2e-run.sh cef --sandbox
+
+      # An app that requires the sandbox (LAUFEY_REQUIRE_SANDBOX, or
+      # "requireSandbox" in its launch file) refuses to start where it would
+      # be off, before CEF or the runtime loads; where it is on it starts.
+      - name: off, required (the host refuses to start)
+        timeout-minutes: 5
+        run: |
+          set +e
+          LAUFEY_REQUIRE_SANDBOX=1 LAUFEY_RUNTIME_PATH="$PWD/target/release/libnative_e2e_runtime.so" \
+            timeout 60 xvfb-run -a cef/build/Release/laufey > require.log 2>&1
+          status=$?
+          set -e
+          cat require.log
+          [ "$status" = 78 ] || { echo "FAIL exit status $status, expected 78"; exit 1; }
+          grep -q '^laufey: sandbox: off (' require.log
+          grep -q '^laufey: this app requires the Chromium sandbox' require.log
+          ! grep -q '^\[e2e\]' require.log || { echo "FAIL the runtime ran"; exit 1; }
+
+      - name: namespace, required (starts)
+        timeout-minutes: 10
+        env:
+          LAUFEY_E2E_EXPECT_SANDBOX_MODE: namespace
+          LAUFEY_REQUIRE_SANDBOX: "1"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          scripts/native-e2e-run.sh cef --sandbox
+
   e2e-cef-linux:
     name: e2e / cef / x86_64-unknown-linux-gnu (Xvfb)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: e2e-cef-linux
 
@@ -346,7 +1089,7 @@ jobs:
             libxkbcommon-dev libdbus-1-dev libxext-dev libxfixes-dev
 
       - name: Cache CEF vendor
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor/cef
           key: cef-ubuntu-latest-${{ runner.arch }}-${{ hashFiles('Makefile') }}
@@ -403,7 +1146,7 @@ jobs:
           # CEF-on-Windows-ARM64 needs the windowsarm64 dist + arch-matched MSVC
           # setup and is tracked as a separate follow-up (issue #42).
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -422,18 +1165,28 @@ jobs:
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
-        run: choco install make ninja -y
+        run: |
+          choco install make --version=4.4.1 -y --no-progress
+          choco install ninja --version=1.13.2 -y --no-progress
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         if: runner.os == 'Windows'
 
       - name: Cache CEF
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor/cef
           key: cef-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
 
       - run: make cef
+
+      # The host runs a headless launch (`run <script>`: a forked worker, the
+      # full-app updater's helper) to its end, past the bounded wait a
+      # windowed app's runtime gets (backend-common/tests/
+      # headless_launch_test.cc). It never loads CEF: no display needed.
+      - name: Headless launch test (ctest)
+        shell: bash
+        run: ctest --test-dir cef/build -R '^laufey_headless_launch_test$' --no-tests=error --output-on-failure
 
       - name: Package
         shell: bash
@@ -447,7 +1200,7 @@ jobs:
             tar czf laufey-cef-${{ matrix.target }}.tar.gz -C cef/build/Release .
           fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: laufey-cef-${{ matrix.target }}
           path: |
@@ -456,12 +1209,25 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-winit, build-webview, build-cef]
+    # Every check gates the release, not only the builds whose artifacts it
+    # publishes.
+    needs:
+      [
+        lint,
+        test,
+        test-winit-common,
+        tsan,
+        native-e2e,
+        e2e-cef-linux,
+        build-winit,
+        build-webview,
+        build-cef,
+      ]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify tag matches capi crate version
         run: |
@@ -472,7 +1238,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -485,7 +1251,7 @@ jobs:
           sha256sum "${files[@]}" > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       - name: Publish laufey crate to crates.io
         working-directory: capi
@@ -497,7 +1263,7 @@ jobs:
         run: cargo publish
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: artifacts/*
           generate_release_notes: true
