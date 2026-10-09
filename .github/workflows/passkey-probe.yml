@@ -1,0 +1,46 @@
+name: passkey cancel probe (experiment)
+
+on:
+  push:
+    branches: [fix/denext14-passkey-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+      - name: Build
+        shell: cmd
+        run: cl /nologo /EHsc /std:c++17 /O2 .github\exp\passkey_cancel_probe.cc /Fe:probe.exe user32.lib
+      - name: Probe
+        shell: pwsh
+        run: |
+          $cases = @(
+            @('timeout-only', '0'), @('timeout-only', '0'),
+            @('cancel-before', '0'), @('cancel-before', '0'), @('cancel-before', '0'),
+            @('cancel-at', '0'), @('cancel-at', '0'), @('cancel-at', '0'),
+            @('cancel-at', '20'), @('cancel-at', '20'), @('cancel-at', '20'),
+            @('cancel-at', '100'), @('cancel-at', '100'), @('cancel-at', '100'),
+            @('cancel-at', '300'), @('cancel-at', '300'),
+            @('cancel-at', '1000'), @('cancel-at', '1000'),
+            @('cancel-at', '2000'), @('cancel-at', '2000'), @('cancel-at', '2000'),
+            @('cancel-repeat', '0'), @('cancel-repeat', '0'), @('cancel-repeat', '0'),
+            @('cancel-repeat', '2000'), @('cancel-repeat', '2000')
+          )
+          foreach ($c in $cases) {
+            $out = & .\probe.exe $c[0] $c[1]
+            Write-Output "$out (exit $LASTEXITCODE)"
+            Start-Sleep -Seconds 3
+          }
