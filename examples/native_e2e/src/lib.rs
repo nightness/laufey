@@ -3217,6 +3217,61 @@ async fn passkey_checks(window_id: u32) {
     }
     eprintln!("[e2e] INFO the held passkey slot freed after {later:?} ms");
   }
+  // WebView2 runs the request and the close as UI-thread tasks in the order
+  // they were asked for; CEF closes a browser asynchronously, so there the
+  // close can overtake the request.
+  if cfg!(target_os = "windows") && backend == "webview" && freed {
+    passkey_early_cancel_checks().await;
+  }
+}
+
+/// WebView2: a request whose window closes at once. The close cancels the OS
+/// operation (WebAuthNCancelCurrentOperation) a moment after the worker
+/// thread starts it, before webauthn.dll has registered the cancellation id;
+/// such a cancel is answered S_OK and dropped, and with nobody at the dialog
+/// the call doesn't end at its own timeout either, so a single cancel left
+/// the slot held for good (windows-11-arm, now and then, when the first
+/// request's 2 s cancel landed that early). laufey repeats the cancel until
+/// the call returns, so the slot frees.
+async fn passkey_early_cancel_checks() {
+  let w = Window::new(240, 160).title("native-e2e-passkey-close");
+  tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+  // The request is queued to the UI thread before the close, so the
+  // ceremony starts (and its worker calls the OS) just before the window's
+  // WM_DESTROY cancels it.
+  let pending =
+    laufey::passkey_get(w.id(), &passkey_get_options("example.com", 60_000));
+  w.close();
+  let env = passkey_answer("passkey get whose window closes", pending).await;
+  check(
+    &format!(
+      "passkey get whose window closes at once -> cancelled (got {})",
+      passkey_code(&env)
+    ),
+    passkey_code(&env) == "cancelled",
+  );
+  let started = std::time::Instant::now();
+  let mut freed = false;
+  while started.elapsed() < std::time::Duration::from_secs(15) {
+    let env = passkey_answer(
+      "passkey get after an early cancel",
+      laufey::passkey_get(0, &passkey_get_options("example.com", 1000)),
+    )
+    .await;
+    if !env.contains("already in progress") {
+      freed = true;
+      break;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+  }
+  check(
+    &format!(
+      "the passkey slot frees after a cancel that reached the OS early \
+       (after {} ms)",
+      started.elapsed().as_millis()
+    ),
+    freed,
+  );
 }
 
 /// Report the overall result and exit immediately (see "shutdown" above).
