@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   probe:
+    if: false
     name: probe / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -46,6 +47,7 @@ jobs:
           }
 
   exit-loop:
+    if: false
     name: exit loop / webview / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -95,4 +97,55 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: exit-loop-${{ matrix.os }}
+          path: exit-logs
+
+  deno-exit-loop:
+    name: deno exit area loop / ${{ matrix.backend }} / windows-latest
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [webview, cef]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Brainwires/deno
+          ref: fix/denext14-windows-exit-diag
+          sparse-checkout: .github/denext-runtime
+          path: deno
+      - name: Download the denext.13 runtime (Brainwires/deno run 37720814135)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 37720814135 -R Brainwires/deno -n runtime-x86_64-pc-windows-msvc -D dl
+          find dl -name "*.zip" | head
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.9.7
+      - name: Exit area x3
+        run: |
+          archive=$(find "$PWD/dl" -name "*-${{ matrix.backend }}.zip" | head -1)
+          echo "archive: $archive"
+          rc=0
+          for i in 1 2 3; do
+            echo "=== round $i"
+            TARGET=x86_64-pc-windows-msvc ARCHIVE="$archive" BACKEND=${{ matrix.backend }} \
+              WORK_DIR="$RUNNER_TEMP/e2e-$i" E2E_OUT="$RUNNER_TEMP/out-$i" E2E_AREAS=exit \
+              bash deno/.github/denext-runtime/e2e/e2e.sh || rc=1
+          done
+          exit $rc
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p exit-logs
+          for i in 1 2 3; do cp -r "$RUNNER_TEMP/e2e-$i/w/logs" "exit-logs/round-$i" 2>/dev/null || true; done
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deno-exit-loop-${{ matrix.backend }}
           path: exit-logs
