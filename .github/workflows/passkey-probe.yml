@@ -100,6 +100,7 @@ jobs:
           path: exit-logs
 
   deno-exit-loop:
+    if: false
     name: deno exit area loop / ${{ matrix.backend }} / windows-latest
     runs-on: windows-latest
     strategy:
@@ -149,3 +150,22 @@ jobs:
         with:
           name: deno-exit-loop-${{ matrix.backend }}
           path: exit-logs
+
+  deno-e2e-harness:
+    name: deno e2e harness tests (Brainwires/deno fix/denext14-windows-exit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Brainwires/deno
+          ref: fix/denext14-windows-exit
+          sparse-checkout: |
+            .github/denext-runtime
+            .github/workflows
+          sparse-checkout-cone-mode: false
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.9.7
+      - run: git log --oneline -1
+      # The e2e-harness job's command (denext_runtime.yml).
+      - run: deno test -A --no-check --no-config --no-lock .github/denext-runtime/e2e/lib/
