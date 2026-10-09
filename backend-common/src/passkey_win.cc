@@ -43,7 +43,9 @@ constexpr HRESULT kTimeout = static_cast<HRESULT>(0x800705B4L);        // ERROR_
 constexpr DWORD kStructVersion1 = 1;
 
 // Extra time the OS gets beyond our own deadline, so the timeout is always
-// ours (reported as `timeout`) and the OS limit is only a backstop.
+// ours (reported as `timeout`) and the OS limit is only a backstop. It is
+// not one where nobody answers the dialog (a CI runner): the call then runs
+// past it until cancelled.
 constexpr DWORD kOsTimeoutSlackMs = 10000;
 
 struct WebAuthnApi {
@@ -446,13 +448,19 @@ void PasskeyStartWin(std::shared_ptr<PasskeyCeremony> ceremony,
   ceremony->SetWindowKey(hwnd);
 
   // A cancellation id lets a timeout or a closing window end the OS dialog.
+  // A cancel that reaches the OS before the call below has registered the
+  // id is dropped (S_OK, yet the call goes on), and the call doesn't honour
+  // its own timeout when nobody answers the dialog, so the canceller repeats
+  // until the call returns (kPasskeyCancelRepeatMs).
   auto cancellation_id = std::make_shared<GUID>();
   bool cancellable = api.get_cancellation_id && api.cancel_current_operation &&
                      SUCCEEDED(api.get_cancellation_id(cancellation_id.get()));
   if (cancellable) {
-    ceremony->SetCanceller([cancellation_id] {
-      Api().cancel_current_operation(cancellation_id.get());
-    });
+    ceremony->SetCanceller(
+        [cancellation_id] {
+          Api().cancel_current_operation(cancellation_id.get());
+        },
+        kPasskeyCancelRepeatMs);
   }
 
   DWORD timeout = ceremony->has_timeout() ? ceremony->timeout_ms()

@@ -5,6 +5,7 @@
 
 #include "laufey_passkey.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -673,6 +674,7 @@ void PasskeyCeremony::Finish(const std::string& envelope) {
 
 void PasskeyCeremony::Abort(const char* code, const std::string& message) {
   std::function<void()> cancel;
+  uint32_t repeat_ms = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (delivered_ || finished_)
@@ -682,6 +684,7 @@ void PasskeyCeremony::Abort(const char* code, const std::string& message) {
     if (canceller_ && !cancel_ran_) {
       cancel_ran_ = true;
       cancel = std::move(canceller_);
+      repeat_ms = cancel_repeat_ms_;
     }
     canceller_ = nullptr;
   }
@@ -689,11 +692,12 @@ void PasskeyCeremony::Abort(const char* code, const std::string& message) {
   // Ask the OS to stop first; the slot stays held until it reports back
   // (Finish), so a new request can't race the dying one.
   if (cancel)
-    cancel();
+    RunCanceller(std::move(cancel), repeat_ms);
   Deliver(PasskeyErrorEnvelope(code, message));
 }
 
-void PasskeyCeremony::SetCanceller(std::function<void()> cancel) {
+void PasskeyCeremony::SetCanceller(std::function<void()> cancel,
+                                   uint32_t repeat_ms) {
   bool run_now = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -704,10 +708,40 @@ void PasskeyCeremony::SetCanceller(std::function<void()> cancel) {
       run_now = true;
     } else {
       canceller_ = std::move(cancel);
+      cancel_repeat_ms_ = repeat_ms;
     }
   }
   if (run_now && cancel)
-    cancel();
+    RunCanceller(std::move(cancel), repeat_ms);
+}
+
+void PasskeyCeremony::RunCanceller(std::function<void()> cancel,
+                                   uint32_t repeat_ms) {
+  cancel();
+  if (repeat_ms == 0)
+    return;
+  // Windows WebAuthn returns S_OK for a cancel that reaches it before the
+  // operation has registered its cancellation id, drops it, and then never
+  // ends the call (nobody at the dialog: it doesn't honour its own
+  // dwTimeoutMilliseconds either), so the slot would stay held for good.
+  // Cancel again until the OS reports back. The thread holds a reference,
+  // so cv_ outlives every wait on it.
+  std::shared_ptr<PasskeyCeremony> self = weak_from_this().lock();
+  if (!self)
+    return;
+  std::thread([self, cancel = std::move(cancel), repeat_ms] {
+    auto give_up = std::chrono::steady_clock::now() +
+                   std::chrono::milliseconds(kPasskeyCancelRepeatLimitMs);
+    std::unique_lock<std::mutex> lock(self->mutex_);
+    while (std::chrono::steady_clock::now() < give_up) {
+      if (self->cv_.wait_for(lock, std::chrono::milliseconds(repeat_ms),
+                             [&] { return self->finished_; }))
+        return;
+      lock.unlock();
+      cancel();
+      lock.lock();
+    }
+  }).detach();
 }
 
 void PasskeyCeremony::SetWindowKey(const void* key) {

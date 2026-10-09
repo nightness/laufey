@@ -257,6 +257,11 @@ The timeout is the options' `timeout`, 60 s when none is given (as
 (`WebAuthNCancelCurrentOperation` with the request's cancellation id) and when
 the owner window is destroyed; the OS gets 10 s more as a backstop, so the
 result is always `timeout` / `cancelled` from laufey, not a race with the OS.
+The OS answers a cancel that arrives before the call has registered its
+cancellation id with `S_OK` and drops it, and where nobody answers the dialog
+the call runs past its own timeout too, so laufey repeats the cancel every 250
+ms until the call returns (for at most 60 s); one request runs at a time, so the
+next one waits for that.
 
 Errors: `NTE_USER_CANCELLED` and `ERROR_CANCELLED` → `cancelled`;
 `ERROR_TIMEOUT` → `timeout`; `NTE_NOT_SUPPORTED` → `not_supported`; otherwise by

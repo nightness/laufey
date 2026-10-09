@@ -780,6 +780,62 @@ static void TestCancellerInstalledAfterAbort() {
   EXPECT(cancels == 1 && CountOf(r) == 1);
 }
 
+// An OS that drops the cancels which arrive before its operation is
+// registered (Windows WebAuthn answers them S_OK and the call goes on, past
+// its own timeout when nobody is at the dialog): a canceller installed with a
+// repeat interval runs again until the OS reports back, so the slot frees.
+// Here the first cancel is dropped and the second one ends the operation.
+static void TestDroppedCancelIsRepeated() {
+  Recorder r;
+  std::atomic<int> cancels{0};
+  auto c = PasskeyBegin(LAUFEY_PASSKEY_GET, kClerkGet, Record, &r);
+  EXPECT(c);
+  std::weak_ptr<PasskeyCeremony> weak = c;
+  // The "OS": a thread that ends the operation once a cancel reaches it
+  // after the first.
+  std::thread os([weak, &cancels] {
+    for (int i = 0; i < 400; ++i) {
+      if (cancels.load() >= 2) {
+        if (auto self = weak.lock())
+          self->Finish(PasskeyErrorEnvelope("cancelled", "x"));
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  });
+  c->SetCanceller([&] { ++cancels; }, 20);
+  c->StartTimeout(50);
+  for (int i = 0; i < 300 && PasskeyBusyForTesting(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  os.join();
+  EXPECT(CountOf(r) == 1 && HasCode(LastOf(r), "timeout"));
+  EXPECT(cancels >= 2);
+  EXPECT(!PasskeyBusyForTesting());
+  // Once the OS has reported back, the repeats stop (one may have been on
+  // its way while it did).
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  int after = cancels.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT(cancels.load() == after);
+
+  // Installed after the abort (the OS call started late): the same.
+  Recorder r2;
+  std::atomic<int> cancels2{0};
+  auto c2 = PasskeyBegin(LAUFEY_PASSKEY_GET, kClerkGet, Record, &r2);
+  EXPECT(c2);
+  c2->Abort("timeout", "t");
+  c2->SetCanceller([&] { ++cancels2; }, 20);
+  for (int i = 0; i < 300 && cancels2.load() < 3; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT(cancels2 >= 3 && PasskeyBusyForTesting());
+  c2->Finish(PasskeyErrorEnvelope("cancelled", "x"));
+  EXPECT(!PasskeyBusyForTesting());
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  after = cancels2.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT(cancels2.load() == after && CountOf(r2) == 1);
+}
+
 static void TestTimeout() {
   Recorder r;
   std::atomic<int> cancels{0};
@@ -925,6 +981,7 @@ int main() {
   TestAbortKeepsSlotUntilFinish();
   TestCancellerInstalledAfterAbort();
   TestTimeout();
+  TestDroppedCancelIsRepeated();
   TestTimeoutRacesFinish();
   TestWindowClosing();
   TestDroppedCeremonyStillAnswers();

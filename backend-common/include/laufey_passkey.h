@@ -65,6 +65,11 @@ constexpr uint32_t kPasskeyMaxTimeoutMs = 600000;
 // The timeout used where the OS needs one and the options carry none
 // (Windows; matches @clerk/electron-passkeys).
 constexpr uint32_t kPasskeyDefaultTimeoutMs = 60000;
+// A canceller installed with a repeat interval (Windows: an
+// early WebAuthNCancelCurrentOperation is dropped) runs again this often
+// until the OS operation ends, for at most kPasskeyCancelRepeatLimitMs.
+constexpr uint32_t kPasskeyCancelRepeatMs = 250;
+constexpr uint32_t kPasskeyCancelRepeatLimitMs = 60000;
 
 // --- Error codes (the @clerk/electron-passkeys set) --------------------------
 
@@ -222,9 +227,13 @@ class PasskeyCeremony : public std::enable_shared_from_this<PasskeyCeremony> {
   // the OS operation ends, and keep the slot until Finish. No-op once a
   // result was delivered.
   void Abort(const char* code, const std::string& message);
-  // How to cancel the OS operation (called at most once, from Abort, on
-  // whatever thread aborts). Installed after an Abort, it runs at once.
-  void SetCanceller(std::function<void()> cancel);
+  // How to cancel the OS operation (called from Abort, on whatever thread
+  // aborts). Installed after an Abort, it runs at once. With `repeat_ms` 0
+  // it runs once. Otherwise it runs again every `repeat_ms`, from a thread
+  // of its own, until Finish (or kPasskeyCancelRepeatLimitMs): for an OS
+  // that silently drops a cancel which arrives before the operation is
+  // registered, and then never ends it (Windows WebAuthn).
+  void SetCanceller(std::function<void()> cancel, uint32_t repeat_ms = 0);
   // The native window the ceremony is anchored to (NSWindow* / HWND), for
   // PasskeyWindowClosing.
   void SetWindowKey(const void* key);
@@ -238,6 +247,8 @@ class PasskeyCeremony : public std::enable_shared_from_this<PasskeyCeremony> {
 
  private:
   void Deliver(const std::string& envelope);
+  // Runs `cancel` now and, with `repeat_ms`, again until Finish.
+  void RunCanceller(std::function<void()> cancel, uint32_t repeat_ms);
 
   const uint32_t kind_;
   const laufey_passkey_result_fn callback_;
@@ -252,6 +263,7 @@ class PasskeyCeremony : public std::enable_shared_from_this<PasskeyCeremony> {
   bool aborted_ = false;
   bool cancel_ran_ = false;
   std::function<void()> canceller_;
+  uint32_t cancel_repeat_ms_ = 0;
   const void* window_key_ = nullptr;
 };
 
