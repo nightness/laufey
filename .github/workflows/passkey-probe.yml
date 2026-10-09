@@ -44,3 +44,55 @@ jobs:
             Write-Output "$out (exit $LASTEXITCODE)"
             Start-Sleep -Seconds 3
           }
+
+  exit-loop:
+    name: exit loop / webview / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: native-e2e
+          key: ${{ matrix.os }}-webview
+      - name: Install dependencies (Windows)
+        shell: bash
+        run: |
+          choco install make --version=4.4.1 -y --no-progress
+          choco install ninja --version=1.13.2 -y --no-progress
+          WV2_VERSION=1.0.4258.31
+          WV2_SHA256=56f7f4b8bf9aee4b8efefbbdd4f67d5f74ebd1b100ed0806da71bf76af481aa9
+          curl -fsSL --retry 3 -o wv2.zip "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$WV2_VERSION/microsoft.web.webview2.$WV2_VERSION.nupkg"
+          echo "$WV2_SHA256  wv2.zip" | sha256sum -c -
+          powershell -NoProfile -Command "Expand-Archive -Path wv2.zip -DestinationPath packages/Microsoft.Web.WebView2.$WV2_VERSION"
+          rm wv2.zip
+      - name: Build runtime
+        shell: bash
+        run: cargo build --release -p storage_e2e_runtime
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Build backend
+        shell: bash
+        run: WEBVIEW2_ROOT="$(pwd)/$(ls -d packages/Microsoft.Web.WebView2.* | head -1)" make webview
+      - name: Exit loop
+        timeout-minutes: 60
+        shell: bash
+        env:
+          KEEP_SCRATCH: "1"
+        run: scripts/exit-e2e-run.sh webview 40 exit quit
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: cp -r "$(cygpath -u "$TEMP")/laufey-exit-e2e/logs" exit-logs || true
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: exit-loop-${{ matrix.os }}
+          path: exit-logs
